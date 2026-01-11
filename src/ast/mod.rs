@@ -72,7 +72,7 @@ pub enum Stmt {
         body: Box<Expr>,
     },
     MatchStatement(Box<Expr>),
-    ForLoopStatement(Box::new(ForLoop>)),
+    ForLoopStatement(Box<ForLoop>),
 }
 
 impl fmt::Display for Type {
