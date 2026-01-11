@@ -8,10 +8,7 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self {
-            tokens,
-            current: 0,
-        }
+        Self { tokens, current: 0 }
     }
 
     pub fn parse(&mut self) -> Result<Vec<Stmt>, String> {
@@ -79,7 +76,11 @@ impl Parser {
 
         let expr = self.parse_expression()?;
 
-        Ok(Stmt::FunctionDefinition { name, params, body: Box::new(expr) })
+        Ok(Stmt::FunctionDefinition {
+            name,
+            params,
+            body: Box::new(expr),
+        })
     }
 
     fn parse_expression(&mut self) -> Result<Expr, String> {
@@ -113,7 +114,10 @@ impl Parser {
                 Ok(PipelineStep::FunctionCall(name))
             }
         } else {
-            Err(format!("expected function name in pipeline, found {}", self.peek()))
+            Err(format!(
+                "expected function name in pipeline, found {}",
+                self.peek()
+            ))
         }
     }
 
@@ -149,7 +153,12 @@ impl Parser {
             self.advance();
             Ok(())
         } else {
-            Err(format!("{} at {}, found {}", message, self.peek().line, self.peek()))
+            Err(format!(
+                "{} at {}, found {}",
+                message,
+                self.peek().line,
+                self.peek()
+            ))
         }
     }
 

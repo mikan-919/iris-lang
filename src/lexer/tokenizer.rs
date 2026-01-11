@@ -50,6 +50,14 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     tokens.push(Token::new(TokenKind::Comma, self.line, self.column));
                 }
+                '|' => {
+                    self.advance();
+                    tokens.push(Token::new(TokenKind::Pipe, self.line, self.column));
+                }
+                '@' => {
+                    self.advance();
+                    tokens.push(Token::new(TokenKind::At, self.line, self.column));
+                }
                 '-' => {
                     self.advance();
                     if self.peek() == Some('>') {
@@ -70,11 +78,40 @@ impl<'a> Lexer<'a> {
                 }
                 ':' => {
                     self.advance();
-                    if self.peek() == Some(':') {
-                        self.advance();
-                        tokens.push(Token::new(TokenKind::Next, self.line, self.column));
-                    } else {
-                        self.error("unexpected ':'");
+                    match self.peek() {
+                        Some(':') => {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::Next, self.line, self.column));
+                        }
+                        Some('~') => {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::Await, self.line, self.column));
+                        }
+                        Some('^') => {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::Try, self.line, self.column));
+                        }
+                        Some('!') => {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::Force, self.line, self.column));
+                        }
+                        Some('?') => {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::Catch, self.line, self.column));
+                        }
+                        Some('|') => {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::Or, self.line, self.column));
+                        }
+                        Some('>') => {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::Tag, self.line, self.column));
+                        }
+                        Some('&') => {
+                            self.advance();
+                            tokens.push(Token::new(TokenKind::Join, self.line, self.column));
+                        }
+                        _ => self.error("unexpected ':'"),
                     }
                 }
                 '0'..='9' => {
@@ -90,6 +127,7 @@ impl<'a> Lexer<'a> {
                     let kind = match ident.as_str() {
                         "let" => TokenKind::Let,
                         "fn" => TokenKind::Fn,
+                        "export" => TokenKind::Export,
                         _ => TokenKind::Identifier(ident),
                     };
                     tokens.push(Token::new(kind, self.line, self.column));
@@ -181,5 +219,51 @@ mod tests {
         assert_eq!(tokens[2].kind, TokenKind::Bind);
         assert_eq!(tokens[3].kind, TokenKind::Integer(10));
         assert_eq!(tokens[4].kind, TokenKind::Next);
+    }
+
+    #[test]
+    fn test_all_backbone_operators() {
+        let code = "=: :: :~ :^ :! :? :| :> :&";
+        let mut lexer = Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let kinds: Vec<_> = tokens
+            .iter()
+            .map(|t| &t.kind)
+            .filter(|k| !matches!(k, TokenKind::EOF))
+            .collect();
+        assert_eq!(
+            kinds,
+            &[
+                &TokenKind::Bind,
+                &TokenKind::Next,
+                &TokenKind::Await,
+                &TokenKind::Try,
+                &TokenKind::Force,
+                &TokenKind::Catch,
+                &TokenKind::Or,
+                &TokenKind::Tag,
+                &TokenKind::Join,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_export_keyword() {
+        let mut lexer = Lexer::new("export fn add");
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Export);
+        assert_eq!(tokens[1].kind, TokenKind::Fn);
+        assert_eq!(tokens[2].kind, TokenKind::Identifier("add".to_string()));
+    }
+
+    #[test]
+    fn test_pipe_and_at() {
+        let mut lexer = Lexer::new("item@list | pattern");
+        let tokens = lexer.tokenize();
+        assert_eq!(tokens[0].kind, TokenKind::Identifier("item".to_string()));
+        assert_eq!(tokens[1].kind, TokenKind::At);
+        assert_eq!(tokens[2].kind, TokenKind::Identifier("list".to_string()));
+        assert_eq!(tokens[3].kind, TokenKind::Pipe);
+        assert_eq!(tokens[4].kind, TokenKind::Identifier("pattern".to_string()));
     }
 }
