@@ -23,6 +23,13 @@ pub enum Literal {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineStep {
     FunctionCall(String),
+    AsyncCall(String),
+    ErrorPropagate,
+    Force,
+    ErrorRescue(Box<Expr>),
+    Fallback(Box<Expr>),
+    BorrowReference(String),
+    TupleMerge(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,7 +63,7 @@ impl fmt::Display for Expr {
             Expr::Pipeline { initial, steps } => {
                 write!(f, "{}", initial)?;
                 for step in steps {
-                    write!(f, " :: {}", step)?;
+                    write!(f, " {}", step)?;
                 }
                 Ok(())
             }
@@ -77,6 +84,13 @@ impl fmt::Display for PipelineStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PipelineStep::FunctionCall(name) => write!(f, "{}()", name),
+            PipelineStep::AsyncCall(name) => write!(f, ":~ {}()", name),
+            PipelineStep::ErrorPropagate => write!(f, ":^"),
+            PipelineStep::Force => write!(f, ":!"),
+            PipelineStep::ErrorRescue(expr) => write!(f, ":? {}", expr),
+            PipelineStep::Fallback(expr) => write!(f, ":| {}", expr),
+            PipelineStep::BorrowReference(name) => write!(f, ":> {}", name),
+            PipelineStep::TupleMerge(expr) => write!(f, ":& {}", expr),
         }
     }
 }
