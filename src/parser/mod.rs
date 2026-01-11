@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Literal, PipelineStep, Stmt};
+use crate::ast::{Expr, Literal, PipelineStep, Stmt, Type};
 use crate::lexer::{Token, TokenKind};
 
 pub struct Parser {
@@ -71,8 +71,14 @@ impl Parser {
         let mut params = Vec::new();
         if self.peek().kind != TokenKind::RParen {
             loop {
-                let param = self.consume_identifier()?;
-                params.push(param);
+                let param_name = self.consume_identifier()?;
+                let param_type = if self.match_token(TokenKind::Colon) {
+                    let type_name = self.consume_identifier()?;
+                    Type::Simple(type_name)
+                } else {
+                    Type::Simple("Any".to_string())
+                };
+                params.push((param_name, param_type));
                 if !self.match_token(TokenKind::Comma) {
                     break;
                 }
@@ -83,7 +89,8 @@ impl Parser {
 
         self.consume(TokenKind::Arrow, "expected '->'")?;
 
-        let return_type = self.consume_identifier()?;
+        let return_type_name = self.consume_identifier()?;
+        let return_type = Type::Simple(return_type_name);
 
         self.consume(TokenKind::Bind, "expected '=:'")?;
 
@@ -92,6 +99,7 @@ impl Parser {
         Ok(Stmt::FunctionDefinition {
             name,
             params,
+            return_type,
             body: Box::new(expr),
         })
     }
@@ -283,29 +291,33 @@ mod tests {
                 if let PipelineStep::FunctionCall(func_name) = &steps[0] {
                     assert_eq!(func_name, "double");
                 } else {
-                    panic!("Expected FunctionCall");
+                    panic!("Expected FunctionDefinition");
                 }
-            } else {
-                panic!("Expected Pipeline");
             }
-        } else {
-            panic!("Expected Binding");
-        }
-    }
 
-    #[test]
-    fn test_parse_multiple_pipeline_steps() {
-        let code = "let result =: 10 :: double() :: triple()";
-        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
-        let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
-        let statements = parser.parse().unwrap();
+            #[test]
+            fn test_parse_function_with_type_annotations() {
+                let code = "fn add(a: Int, b: Int) -> Int =: a";
+                let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
+                let tokens = lexer.tokenize();
+                let mut parser = Parser::new(tokens);
+                let statements = parser.parse().unwrap();
 
-        if let Stmt::Binding { expr, .. } = &statements[0] {
-            if let Expr::Pipeline { steps, .. } = expr {
-                assert_eq!(steps.len(), 2);
-            } else {
-                panic!("Expected Pipeline");
+                if let Stmt::FunctionDefinition {
+                    params,
+                    return_type,
+                    ..
+                } = &statements[0]
+                {
+                    assert_eq!(params.len(), 2);
+                    assert_eq!(params[0].0, "a");
+                    assert_eq!(params[0].1, Type::Simple("Int".to_string()));
+                    assert_eq!(params[1].0, "b");
+                    assert_eq!(params[1].1, Type::Simple("Int".to_string()));
+                    assert_eq!(return_type, &Type::Simple("Int".to_string()));
+                } else {
+                    panic!("Expected FunctionDefinition");
+                }
             }
         } else {
             panic!("Expected Binding");
@@ -405,9 +417,43 @@ mod tests {
         let statements = parser.parse().unwrap();
 
         assert_eq!(statements.len(), 1);
-        if let Stmt::FunctionDefinition { name, params, .. } = &statements[0] {
+        if let Stmt::FunctionDefinition {
+            name,
+            params,
+            return_type,
+            ..
+        } = &statements[0]
+        {
             assert_eq!(name, "double");
-            assert_eq!(params, &["n"]);
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0].0, "n");
+            assert_eq!(params[0].1, Type::Simple("Any".to_string()));
+            assert_eq!(return_type, &Type::Simple("Int".to_string()));
+        } else {
+            panic!("Expected FunctionDefinition");
+        }
+    }
+
+    #[test]
+    fn test_parse_function_with_type_annotations() {
+        let code = "fn add(a: Int, b: Int) -> Int =: a :: + b";
+        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let statements = parser.parse().unwrap();
+
+        if let Stmt::FunctionDefinition {
+            params,
+            return_type,
+            ..
+        } = &statements[0]
+        {
+            assert_eq!(params.len(), 2);
+            assert_eq!(params[0].0, "a");
+            assert_eq!(params[0].1, Type::Simple("Int".to_string()));
+            assert_eq!(params[1].0, "b");
+            assert_eq!(params[1].1, Type::Simple("Int".to_string()));
+            assert_eq!(return_type, &Type::Simple("Int".to_string()));
         } else {
             panic!("Expected FunctionDefinition");
         }

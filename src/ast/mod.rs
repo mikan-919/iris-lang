@@ -1,6 +1,11 @@
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Type {
+    Simple(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
     Identifier(String),
@@ -40,9 +45,18 @@ pub enum Stmt {
     },
     FunctionDefinition {
         name: String,
-        params: Vec<String>,
+        params: Vec<(String, Type)>,
+        return_type: Type,
         body: Box<Expr>,
     },
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Simple(name) => write!(f, "{}", name),
+        }
+    }
 }
 
 impl fmt::Display for Expr {

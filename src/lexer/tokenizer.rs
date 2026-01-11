@@ -111,6 +111,12 @@ impl<'a> Lexer<'a> {
                             self.advance();
                             tokens.push(Token::new(TokenKind::Join, self.line, self.column));
                         }
+                        None | Some(' ') | Some('\t') | Some('\n') => {
+                            tokens.push(Token::new(TokenKind::Colon, self.line, self.column));
+                        }
+                        Some(ch) if ch.is_alphabetic() || ch == '_' => {
+                            tokens.push(Token::new(TokenKind::Colon, self.line, self.column));
+                        }
                         _ => self.error("unexpected ':'"),
                     }
                 }
