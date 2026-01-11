@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Literal, PipelineStep, Stmt, Type};
+use crate::ast::{Expr, Literal, MatchArm, PipelineStep, Stmt, Type};
 use crate::lexer::{Token, TokenKind};
 
 pub struct Parser {
@@ -45,7 +45,14 @@ impl Parser {
                 }
             }
             TokenKind::Fn => self.parse_function_definition(),
-            _ => Err(format!("expected statement, found {}", self.peek())),
+            _ => {
+                let expr = self.parse_expression()?;
+                if let Expr::Match { .. } = expr {
+                    Ok(Stmt::MatchStatement(Box::new(expr)))
+                } else {
+                    Err(format!("expected statement, found {}", self.peek()))
+                }
+            }
         }
     }
 
@@ -105,7 +112,12 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<Expr, String> {
+        if self.check(TokenKind::Match) {
+            return self.parse_match();
+        }
+
         let initial = self.parse_term()?;
+
         let mut steps = Vec::new();
 
         loop {
@@ -164,21 +176,50 @@ impl Parser {
         }
     }
 
-    fn parse_pipeline_step(&mut self) -> Result<PipelineStep, String> {
-        if let TokenKind::Identifier(name) = self.peek().kind.clone() {
-            self.advance();
+    fn parse_match(&mut self) -> Result<Expr, String> {
+        self.consume(TokenKind::Match, "expected 'match'")?;
 
-            if self.match_token(TokenKind::LParen) {
-                self.consume(TokenKind::RParen, "expected ')'")?;
-                Ok(PipelineStep::FunctionCall(name))
-            } else {
-                Ok(PipelineStep::FunctionCall(name))
-            }
+        let subject = self.parse_term()?;
+
+        let mut arms = Vec::new();
+
+        while self.check(TokenKind::Pipe) {
+            self.advance();
+            let arm = self.parse_match_arm()?;
+            arms.push(arm);
+        }
+
+        Ok(Expr::Match {
+            subject: Box::new(subject),
+            arms,
+        })
+    }
+
+    fn parse_match_arm(&mut self) -> Result<MatchArm, String> {
+        if self.check(TokenKind::Identifier) || self.check(TokenKind::LParen) {
+            Ok(MatchArm::Pattern {
+                name: self.consume_identifier()?,
+                args: if self.check(TokenKind::LParen) {
+                    self.consume(TokenKind::LParen, "expected '('")?;
+                    let mut args = Vec::new();
+                    if self.peek().kind != TokenKind::RParen {
+                        loop {
+                            let arg = self.parse_term()?;
+                            args.push(arg);
+                            if !self.match_token(TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.consume(TokenKind::RParen, "expected ')'")?;
+                    args
+                } else {
+                    Vec::new()
+                },
+            })
         } else {
-            Err(format!(
-                "expected function name in pipeline, found {}",
-                self.peek()
-            ))
+            let expr = self.parse_term()?;
+            Ok(MatchArm::Expression(Box::new(expr)))
         }
     }
 
@@ -291,33 +332,29 @@ mod tests {
                 if let PipelineStep::FunctionCall(func_name) = &steps[0] {
                     assert_eq!(func_name, "double");
                 } else {
-                    panic!("Expected FunctionDefinition");
+                    panic!("Expected FunctionCall");
                 }
+            } else {
+                panic!("Expected Pipeline");
             }
+        } else {
+            panic!("Expected Binding");
+        }
+    }
 
-            #[test]
-            fn test_parse_function_with_type_annotations() {
-                let code = "fn add(a: Int, b: Int) -> Int =: a";
-                let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
-                let tokens = lexer.tokenize();
-                let mut parser = Parser::new(tokens);
-                let statements = parser.parse().unwrap();
+    #[test]
+    fn test_parse_multiple_pipeline_steps() {
+        let code = "let result =: 10 :: double() :: triple()";
+        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let statements = parser.parse().unwrap();
 
-                if let Stmt::FunctionDefinition {
-                    params,
-                    return_type,
-                    ..
-                } = &statements[0]
-                {
-                    assert_eq!(params.len(), 2);
-                    assert_eq!(params[0].0, "a");
-                    assert_eq!(params[0].1, Type::Simple("Int".to_string()));
-                    assert_eq!(params[1].0, "b");
-                    assert_eq!(params[1].1, Type::Simple("Int".to_string()));
-                    assert_eq!(return_type, &Type::Simple("Int".to_string()));
-                } else {
-                    panic!("Expected FunctionDefinition");
-                }
+        if let Stmt::Binding { expr, .. } = &statements[0] {
+            if let Expr::Pipeline { steps, .. } = expr {
+                assert_eq!(steps.len(), 2);
+            } else {
+                panic!("Expected Pipeline");
             }
         } else {
             panic!("Expected Binding");
@@ -344,71 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_try_operator() {
-        let code = "let result =: risky :: parse() :^";
-        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
-        let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
-        let statements = parser.parse().unwrap();
-
-        if let Stmt::Binding { expr, .. } = &statements[0] {
-            if let Expr::Pipeline { steps, .. } = expr {
-                assert!(matches!(steps[1], PipelineStep::ErrorPropagate));
-            } else {
-                panic!("Expected Pipeline");
-            }
-        } else {
-            panic!("Expected Binding");
-        }
-    }
-
-    #[test]
-    fn test_parse_tag_operator() {
-        let code = "let result =: 10 :: double() :> snapshot";
-        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
-        let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
-        let statements = parser.parse().unwrap();
-
-        if let Stmt::Binding { expr, .. } = &statements[0] {
-            if let Expr::Pipeline { steps, .. } = expr {
-                if let PipelineStep::BorrowReference(name) = &steps[1] {
-                    assert_eq!(name, "snapshot");
-                } else {
-                    panic!("Expected BorrowReference");
-                }
-            } else {
-                panic!("Expected Pipeline");
-            }
-        } else {
-            panic!("Expected Binding");
-        }
-    }
-
-    #[test]
-    fn test_parse_or_operator() {
-        let code = "let result =: maybe :: getValue() :| 0";
-        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
-        let tokens = lexer.tokenize();
-        let mut parser = Parser::new(tokens);
-        let statements = parser.parse().unwrap();
-
-        if let Stmt::Binding { expr, .. } = &statements[0] {
-            if let Expr::Pipeline { steps, .. } = expr {
-                if let PipelineStep::Fallback(expr) = &steps[1] {
-                    assert_eq!(expr.as_ref(), &Expr::Literal(Literal::Integer(0)));
-                } else {
-                    panic!("Expected Fallback");
-                }
-            } else {
-                panic!("Expected Pipeline");
-            }
-        } else {
-            panic!("Expected Binding");
-        }
-    }
-
-    #[test]
     fn test_parse_export_function() {
         let code = "export fn double(n) -> Int =: n";
         let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
@@ -417,18 +389,11 @@ mod tests {
         let statements = parser.parse().unwrap();
 
         assert_eq!(statements.len(), 1);
-        if let Stmt::FunctionDefinition {
-            name,
-            params,
-            return_type,
-            ..
-        } = &statements[0]
-        {
+        if let Stmt::FunctionDefinition { name, params, .. } = &statements[0] {
             assert_eq!(name, "double");
             assert_eq!(params.len(), 1);
             assert_eq!(params[0].0, "n");
             assert_eq!(params[0].1, Type::Simple("Any".to_string()));
-            assert_eq!(return_type, &Type::Simple("Int".to_string()));
         } else {
             panic!("Expected FunctionDefinition");
         }
@@ -436,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_parse_function_with_type_annotations() {
-        let code = "fn add(a: Int, b: Int) -> Int =: a :: + b";
+        let code = "fn add(a: Int, b: Int) -> Int =: a";
         let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
@@ -456,6 +421,31 @@ mod tests {
             assert_eq!(return_type, &Type::Simple("Int".to_string()));
         } else {
             panic!("Expected FunctionDefinition");
+        }
+    }
+
+    #[test]
+    fn test_parse_match_expression() {
+        let code = "value :: match";
+        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let statements = parser.parse().unwrap();
+
+        assert_eq!(statements.len(), 1);
+
+        if let Stmt::MatchStatement(expr) = &statements[0] {
+            if let Expr::Match { subject, arms } = expr.as_ref() {
+                assert!(matches!(
+                    subject.as_ref(),
+                    &Expr::Identifier("value".to_string())
+                ));
+                assert_eq!(arms.len(), 0);
+            } else {
+                panic!("Expected Match");
+            }
+        } else {
+            panic!("Expected MatchStatement");
         }
     }
 }

@@ -17,6 +17,10 @@ pub enum Expr {
         initial: Box<Expr>,
         steps: Vec<PipelineStep>,
     },
+    Match {
+        subject: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +39,13 @@ pub enum PipelineStep {
     Fallback(Box<Expr>),
     BorrowReference(String),
     TupleMerge(Box<Expr>),
+    MatchArm(Box<MatchArm>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchArm {
+    Pattern { name: String, args: Vec<Expr> },
+    Expression(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,12 +60,53 @@ pub enum Stmt {
         return_type: Type,
         body: Box<Expr>,
     },
+    MatchStatement(Box<Expr>),
 }
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Simple(name) => write!(f, "{}", name),
+        }
+    }
+}
+
+impl fmt::Display for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Literal::Integer(n) => write!(f, "{}", n),
+            Literal::String(s) => write!(f, "\"{}\"", s),
+        }
+    }
+}
+
+impl fmt::Display for PipelineStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipelineStep::FunctionCall(name) => write!(f, "{}()", name),
+            PipelineStep::AsyncCall(name) => write!(f, ":~ {}()", name),
+            PipelineStep::ErrorPropagate => write!(f, ":^"),
+            PipelineStep::Force => write!(f, ":!"),
+            PipelineStep::ErrorRescue(expr) => write!(f, ":? {}", expr),
+            PipelineStep::Fallback(expr) => write!(f, ":| {}", expr),
+            PipelineStep::BorrowReference(name) => write!(f, ":> {}", name),
+            PipelineStep::TupleMerge(expr) => write!(f, ":& {}", expr),
+            PipelineStep::MatchArm(arm) => write!(f, "| {} ::", arm),
+        }
+    }
+}
+
+impl fmt::Display for MatchArm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MatchArm::Pattern { name, args } => {
+                write!(f, "{}", name)?;
+                for arg in args {
+                    write!(f, "({})", arg)?;
+                }
+                Ok(())
+            }
+            MatchArm::Expression(expr) => write!(f, "{}", expr),
         }
     }
 }
@@ -81,30 +133,13 @@ impl fmt::Display for Expr {
                 }
                 Ok(())
             }
-        }
-    }
-}
-
-impl fmt::Display for Literal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Literal::Integer(n) => write!(f, "{}", n),
-            Literal::String(s) => write!(f, "\"{}\"", s),
-        }
-    }
-}
-
-impl fmt::Display for PipelineStep {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PipelineStep::FunctionCall(name) => write!(f, "{}()", name),
-            PipelineStep::AsyncCall(name) => write!(f, ":~ {}()", name),
-            PipelineStep::ErrorPropagate => write!(f, ":^"),
-            PipelineStep::Force => write!(f, ":!"),
-            PipelineStep::ErrorRescue(expr) => write!(f, ":? {}", expr),
-            PipelineStep::Fallback(expr) => write!(f, ":| {}", expr),
-            PipelineStep::BorrowReference(name) => write!(f, ":> {}", name),
-            PipelineStep::TupleMerge(expr) => write!(f, ":& {}", expr),
+            Expr::Match { subject, arms } => {
+                write!(f, ":: match")?;
+                for arm in arms {
+                    write!(f, "\n   {}", arm)?;
+                }
+                Ok(())
+            }
         }
     }
 }
