@@ -21,6 +21,7 @@ pub enum Expr {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    ForLoop(Box<ForLoop>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,12 +41,22 @@ pub enum PipelineStep {
     BorrowReference(String),
     TupleMerge(Box<Expr>),
     MatchArm(Box<MatchArm>),
+    ForLoop(Box<ForLoop>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchArm {
     Pattern { name: String, args: Vec<Expr> },
     Expression(Box<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForLoop {
+    pub subject: Box<Expr>,
+    pub item: String,
+    pub collection: Box<Expr>,
+    pub body: Box<Expr>,
+    pub is_threading: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +72,7 @@ pub enum Stmt {
         body: Box<Expr>,
     },
     MatchStatement(Box<Expr>),
+    ForLoopStatement(Box::new(ForLoop>)),
 }
 
 impl fmt::Display for Type {
@@ -92,6 +104,11 @@ impl fmt::Display for PipelineStep {
             PipelineStep::BorrowReference(name) => write!(f, ":> {}", name),
             PipelineStep::TupleMerge(expr) => write!(f, ":& {}", expr),
             PipelineStep::MatchArm(arm) => write!(f, "| {} ::", arm),
+            PipelineStep::ForLoop(for_loop) => write!(
+                f,
+                " :: for {}@{} :: {}",
+                for_loop.item, for_loop.collection, for_loop.body
+            ),
         }
     }
 }
@@ -108,6 +125,12 @@ impl fmt::Display for MatchArm {
             }
             MatchArm::Expression(expr) => write!(f, "{}", expr),
         }
+    }
+}
+
+impl fmt::Display for ForLoop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{} :: {}", self.item, self.collection, self.body)
     }
 }
 
@@ -140,6 +163,7 @@ impl fmt::Display for Expr {
                 }
                 Ok(())
             }
+            Expr::ForLoop(for_loop) => write!(f, "{}", for_loop),
         }
     }
 }

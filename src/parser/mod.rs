@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Literal, MatchArm, PipelineStep, Stmt, Type};
+use crate::ast::{Expr, ForLoop, Literal, MatchArm, PipelineStep, Stmt, Type};
 use crate::lexer::{Token, TokenKind};
 
 pub struct Parser {
@@ -45,6 +45,10 @@ impl Parser {
                 }
             }
             TokenKind::Fn => self.parse_function_definition(),
+            TokenKind::For => {
+                let for_loop = self.parse_for_loop()?;
+                Ok(Stmt::ForLoopStatement(Box::new(for_loop)))
+            }
             _ => {
                 let expr = self.parse_expression()?;
                 if let Expr::Match { .. } = expr {
@@ -124,8 +128,17 @@ impl Parser {
             match self.peek().kind {
                 TokenKind::Next => {
                     self.advance();
-                    let step = self.parse_pipeline_step()?;
-                    steps.push(step);
+                    if let TokenKind::Identifier(name) = self.peek().kind.clone() {
+                        self.advance();
+                        self.consume(TokenKind::LParen, "expected '('")?;
+                        self.consume(TokenKind::RParen, "expected ')'")?;
+                        steps.push(PipelineStep::FunctionCall(name));
+                    } else {
+                        return Err(format!(
+                            "expected function name after ::, found {}",
+                            self.peek()
+                        ));
+                    }
                 }
                 TokenKind::Await => {
                     self.advance();
@@ -162,6 +175,10 @@ impl Parser {
                     let expr = self.parse_term()?;
                     steps.push(PipelineStep::TupleMerge(Box::new(expr)));
                 }
+                TokenKind::Pipe => {
+                    let arm = self.parse_match_arm()?;
+                    steps.push(PipelineStep::MatchArm(Box::new(arm)));
+                }
                 _ => break,
             }
         }
@@ -174,6 +191,40 @@ impl Parser {
                 steps,
             })
         }
+    }
+
+    fn parse_for_loop(&mut self) -> Result<Expr, String> {
+        self.consume(TokenKind::For, "expected 'for'")?;
+
+        let subject = self.parse_term()?;
+
+        self.consume(TokenKind::At, "expected '@'")?;
+
+        let collection = self.parse_term()?;
+
+        let is_threading = self.peek().kind != TokenKind::Pipe;
+
+        let item = if !is_threading {
+            self.advance();
+            let item_name = self.consume_identifier()?;
+            self.consume(TokenKind::LParen, "expected '(' after item name")?;
+            self.consume(TokenKind::RParen, "expected ')' after item name")?;
+            item_name
+        } else {
+            "self".to_string()
+        };
+
+        self.consume(TokenKind::Pipe, "expected '|' in for loop")?;
+
+        let body = self.parse_term()?;
+
+        Ok(Expr::ForLoop(Box::new(ForLoop {
+            subject: Box::new(subject),
+            item,
+            collection: Box::new(collection),
+            body: Box::new(body),
+            is_threading,
+        })))
     }
 
     fn parse_match(&mut self) -> Result<Expr, String> {
@@ -235,22 +286,7 @@ impl Parser {
             }
             TokenKind::Identifier(name) => {
                 self.advance();
-                if self.match_token(TokenKind::LParen) {
-                    let mut args = Vec::new();
-                    if self.peek().kind != TokenKind::RParen {
-                        loop {
-                            let arg = self.parse_term()?;
-                            args.push(arg);
-                            if !self.match_token(TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    self.consume(TokenKind::RParen, "expected ')'")?;
-                    Ok(Expr::FunctionCall { name, args })
-                } else {
-                    Ok(Expr::Identifier(name))
-                }
+                Ok(Expr::Identifier(name))
             }
             _ => Err(format!("expected term, found {}", self.peek())),
         }
@@ -425,8 +461,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_match_expression() {
-        let code = "value :: match";
+    fn test_parse_threading_for_loop() {
+        let code = "canvas :: for shape@shapes :: draw(shape)";
         let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
         let tokens = lexer.tokenize();
         let mut parser = Parser::new(tokens);
@@ -434,18 +470,119 @@ mod tests {
 
         assert_eq!(statements.len(), 1);
 
-        if let Stmt::MatchStatement(expr) = &statements[0] {
-            if let Expr::Match { subject, arms } = expr.as_ref() {
-                assert!(matches!(
-                    subject.as_ref(),
-                    &Expr::Identifier("value".to_string())
-                ));
+        if let Stmt::ForLoopStatement(expr) = &statements[0] {
+            if let Expr::ForLoop(for_loop) = expr.as_ref() {
+                assert!(for_loop.is_threading);
+                assert_eq!(for_loop.item, "shape");
+                assert!(matches!(for_loop.subject.as_ref(), &Expr::Identifier("canvas".to_string())));
+                assert!(matches!(for_loop.collection.as_ref(), &Expr::Identifier("shapes".to_string())));
+                assert!(matches!(for_loop.body.as_ref(), &Expr::Identifier("draw".to_string())));
+            } else {
+                panic!("Expected ForLoop");
+            }
+        } else {
+            panic!("Expected ForLoopStatement");
+        }
+    }
+
+    #[test]
+    fn test_parse_exploding_for_loop() {
+        let code = "users :: for user :: process(user)";
+        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let statements = parser.parse().unwrap();
+
+        assert_eq!(statements.len(), 1);
+
+        if let Stmt::ForLoopStatement(expr) = &statements[0] {
+            if let Expr::ForLoop(for_loop) = expr.as_ref() {
+                assert!(!for_loop.is_threading);
+                assert_eq!(for_loop.item, "user");
+                assert!(matches!(for_loop.subject.as_ref(), &Expr::Identifier("users".to_string())));
+                assert!(matches!(for_loop.collection.as_ref(), &Expr::Identifier("user".to_string())));
+                assert!(matches!(for_loop.body.as_ref(), &Expr::Identifier("process".to_string())));
+            } else {
+                panic!("Expected ForLoop");
+            }
+        } else {
+            panic!("Expected ForLoopStatement");
+        }
+    }
                 assert_eq!(arms.len(), 0);
             } else {
                 panic!("Expected Match");
             }
         } else {
             panic!("Expected MatchStatement");
+        }
+    }
+
+    #[test]
+    fn test_parse_threading_for_loop() {
+        let code = "canvas :: for shape@shapes :: draw(shape)";
+        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let statements = parser.parse().unwrap();
+
+        assert_eq!(statements.len(), 1);
+
+        if let Stmt::ForLoopStatement(expr) = &statements[0] {
+            if let Expr::ForLoop(for_loop) = expr.as_ref() {
+                assert!(for_loop.is_threading);
+                assert_eq!(for_loop.item, "shape");
+                assert!(matches!(
+                    for_loop.subject.as_ref(),
+                    &Expr::Identifier("canvas".to_string())
+                ));
+                assert!(matches!(
+                    for_loop.collection.as_ref(),
+                    &Expr::Identifier("shapes".to_string())
+                ));
+                assert!(matches!(
+                    for_loop.body.as_ref(),
+                    &Expr::Identifier("draw".to_string())
+                ));
+            } else {
+                panic!("Expected ForLoop");
+            }
+        } else {
+            panic!("Expected ForLoopStatement");
+        }
+    }
+
+    #[test]
+    fn test_parse_exploding_for_loop() {
+        let code = "users :: for user :: process(user)";
+        let mut lexer = crate::lexer::tokenizer::Lexer::new(code);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let statements = parser.parse().unwrap();
+
+        assert_eq!(statements.len(), 1);
+
+        if let Stmt::ForLoopStatement(expr) = &statements[0] {
+            if let Expr::ForLoop(for_loop) = expr.as_ref() {
+                assert!(!for_loop.is_threading);
+                assert_eq!(for_loop.item, "user");
+                assert!(matches!(
+                    for_loop.subject.as_ref(),
+                    &Expr::Identifier("users".to_string())
+                ));
+                assert!(matches!(
+                    for_loop.collection.as_ref(),
+                    &Expr::Identifier("users".to_string())
+                ));
+                assert!(matches!(
+                    for_loop.body.as_ref(),
+                    &Expr::Identifier("process".to_string())
+                ));
+            } else {
+                panic!("Expected ForLoop");
+            }
+        } else {
+            panic!("Expected ForLoopStatement");
         }
     }
 }
