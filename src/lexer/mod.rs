@@ -1,5 +1,8 @@
 pub mod tokenizer;
 
+#[cfg(test)]
+mod tokenizer_tests;
+
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
