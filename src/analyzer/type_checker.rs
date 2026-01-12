@@ -63,6 +63,7 @@ impl TypeChecker {
             }
             Stmt::FunctionDefinition {
                 name,
+                is_exported: _,
                 params,
                 return_type,
                 body,
@@ -306,6 +307,26 @@ impl TypeChecker {
             }
             PipelineStep::ForLoop(_) => {
                 Err("For loop type checking not yet implemented".to_string())
+            }
+            PipelineStep::ArithmeticBinaryOp { op: _, right } => {
+                let right_type = self.infer_expr(right)?;
+                let normalized_input = input_type.normalize();
+                let normalized_right = right_type.normalize();
+
+                if !types_compatible(&normalized_input, &Type::Int) {
+                    return Err(format!(
+                        "Arithmetic left operand must be Int, got {}",
+                        input_type
+                    ));
+                }
+                if !types_compatible(&normalized_right, &Type::Int) {
+                    return Err(format!(
+                        "Arithmetic right operand must be Int, got {}",
+                        right_type
+                    ));
+                }
+
+                Ok(Type::Int)
             }
         }
     }

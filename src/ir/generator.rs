@@ -1,5 +1,5 @@
 use crate::ast::{Expr, PipelineStep, Stmt};
-use crate::ir::{BasicBlock, IrInstruction, Variable};
+use crate::ir::{BasicBlock, IrFunction, IrInstruction, IrModule, Variable};
 
 pub fn generate_ir(stmt: &Stmt) -> BasicBlock {
     let mut block = BasicBlock::new();
@@ -88,6 +88,48 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
         }
         _ => (String::new(), instructions),
     }
+}
+
+pub fn generate_ir_for_function(stmt: &Stmt) -> Result<IrFunction, String> {
+    if let Stmt::FunctionDefinition {
+        name,
+        is_exported,
+        params,
+        return_type,
+        body,
+    } = stmt
+    {
+        let (result_reg, mut instructions) = generate_expr_ir(body);
+
+        instructions.push(IrInstruction::Return { reg: result_reg });
+
+        let block = BasicBlock {
+            label: Some("entry".to_string()),
+            instructions,
+        };
+
+        Ok(IrFunction {
+            name: name.clone(),
+            is_exported: *is_exported,
+            params: params.clone(),
+            return_type: return_type.clone(),
+            block,
+        })
+    } else {
+        Err("Expected FunctionDefinition".to_string())
+    }
+}
+
+pub fn generate_ir_all(stmts: &[Stmt]) -> Result<IrModule, String> {
+    let mut module = IrModule::new();
+
+    for stmt in stmts {
+        if matches!(stmt, Stmt::FunctionDefinition { .. }) {
+            module.functions.push(generate_ir_for_function(stmt)?);
+        }
+    }
+
+    Ok(module)
 }
 
 #[cfg(test)]

@@ -39,7 +39,7 @@ impl Parser {
             TokenKind::Export => {
                 self.advance();
                 if self.check(TokenKind::Fn) {
-                    self.parse_function_definition()
+                    self.parse_function_definition(true)
                 } else {
                     Err(format!(
                         "expected 'fn' after 'export', found {}",
@@ -47,7 +47,7 @@ impl Parser {
                     ))
                 }
             }
-            TokenKind::Fn => self.parse_function_definition(),
+            TokenKind::Fn => self.parse_function_definition(false),
             TokenKind::For => {
                 self.advance();
                 let for_loop = self.parse_for_loop()?;
@@ -69,7 +69,7 @@ impl Parser {
         Ok(Stmt::Binding { name, expr })
     }
 
-    fn parse_function_definition(&mut self) -> Result<Stmt, String> {
+    fn parse_function_definition(&mut self, is_exported: bool) -> Result<Stmt, String> {
         self.consume(TokenKind::Fn, "expected 'fn'")?;
 
         let name = self.consume_identifier()?;
@@ -106,6 +106,7 @@ impl Parser {
 
         Ok(Stmt::FunctionDefinition {
             name,
+            is_exported,
             params,
             return_type,
             body: Box::new(expr),
@@ -134,6 +135,23 @@ impl Parser {
                         self.consume(TokenKind::LParen, "expected '('")?;
                         self.consume(TokenKind::RParen, "expected ')'")?;
                         steps.push(PipelineStep::FunctionCall(name));
+                    } else if matches!(
+                        self.peek().kind,
+                        TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash
+                    ) {
+                        let op = match self.peek().kind {
+                            TokenKind::Plus => crate::ast::BinaryOp::Add,
+                            TokenKind::Minus => crate::ast::BinaryOp::Sub,
+                            TokenKind::Star => crate::ast::BinaryOp::Mul,
+                            TokenKind::Slash => crate::ast::BinaryOp::Div,
+                            _ => unreachable!(),
+                        };
+                        self.advance();
+                        let right_operand = self.parse_term()?;
+                        steps.push(PipelineStep::ArithmeticBinaryOp {
+                            op,
+                            right: Box::new(right_operand),
+                        });
                     } else {
                         return Err(format!(
                             "expected function name or 'for' after ::, found {}",

@@ -58,13 +58,25 @@ impl<'a> Lexer<'a> {
                     self.advance();
                     tokens.push(Token::new(TokenKind::At, self.line, self.column));
                 }
+                '+' => {
+                    self.advance();
+                    tokens.push(Token::new(TokenKind::Plus, self.line, self.column));
+                }
+                '*' => {
+                    self.advance();
+                    tokens.push(Token::new(TokenKind::Star, self.line, self.column));
+                }
+                '/' => {
+                    self.advance();
+                    tokens.push(Token::new(TokenKind::Slash, self.line, self.column));
+                }
                 '-' => {
                     self.advance();
                     if self.peek() == Some('>') {
                         self.advance();
                         tokens.push(Token::new(TokenKind::Arrow, self.line, self.column));
                     } else {
-                        self.error("unexpected '-'");
+                        tokens.push(Token::new(TokenKind::Minus, self.line, self.column));
                     }
                 }
                 '=' => {
