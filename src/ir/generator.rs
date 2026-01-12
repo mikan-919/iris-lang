@@ -1,4 +1,4 @@
-use crate::ast::{Expr, Stmt};
+use crate::ast::{Expr, PipelineStep, Stmt};
 use crate::ir::{BasicBlock, IrInstruction, Variable};
 
 pub fn generate_ir(stmt: &Stmt) -> BasicBlock {
@@ -40,6 +40,55 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
             });
             (reg, instructions)
         }
+        Expr::Pipeline { initial, steps } => {
+            let (mut current_reg, initial_instrs) = generate_expr_ir(initial);
+            instructions.extend(initial_instrs);
+
+            for step in steps {
+                match step {
+                    PipelineStep::FunctionCall(func_name) => {
+                        let result_reg = format!("t{}", instructions.len());
+                        instructions.push(IrInstruction::Call {
+                            func_name: func_name.clone(),
+                            args: vec![current_reg.clone()],
+                            target: result_reg.clone(),
+                        });
+                        current_reg = result_reg;
+                    }
+                    PipelineStep::Force => {
+                        let branch_true = format!("bb_panic_{}", instructions.len());
+                        let branch_false = format!("bb_continue_{}", instructions.len());
+
+                        instructions.push(IrInstruction::Branch {
+                            cond: current_reg.clone(),
+                            true_block: branch_true,
+                            false_block: branch_false,
+                        });
+
+                        instructions.push(IrInstruction::Panic {
+                            msg: "Force unwrap failed: value is None".to_string(),
+                        });
+                    }
+                    PipelineStep::ErrorPropagate => {
+                        let branch_true = format!("bb_return_err_{}", instructions.len());
+                        let branch_false = format!("bb_continue_{}", instructions.len());
+
+                        instructions.push(IrInstruction::Branch {
+                            cond: current_reg.clone(),
+                            true_block: branch_true,
+                            false_block: branch_false,
+                        });
+
+                        instructions.push(IrInstruction::Return {
+                            reg: current_reg.clone(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            (current_reg, instructions)
+        }
         _ => (String::new(), instructions),
     }
 }
@@ -47,7 +96,7 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::Literal;
+    use crate::ast::{Expr, Literal, PipelineStep};
 
     #[test]
     fn test_generate_ir_for_let_binding() {
@@ -73,5 +122,130 @@ mod tests {
         } else {
             panic!("Expected Assign as second instruction");
         }
+    }
+
+    #[test]
+    fn test_pipeline_function_call() {
+        let stmt = Stmt::Binding {
+            name: "result".to_string(),
+            expr: Expr::Pipeline {
+                initial: Box::new(Expr::Literal(Literal::Integer(10))),
+                steps: vec![PipelineStep::FunctionCall("double".to_string())],
+            },
+        };
+
+        let block = generate_ir(&stmt);
+
+        assert!(block.instructions.len() >= 3);
+
+        if let IrInstruction::LoadConst { reg, value } = &block.instructions[0] {
+            assert_eq!(reg, "t0");
+            assert!(matches!(value, Expr::Literal(Literal::Integer(10))));
+        } else {
+            panic!("Expected LoadConst for initial value");
+        }
+
+        if let IrInstruction::Call {
+            func_name,
+            args,
+            target,
+        } = &block.instructions[1]
+        {
+            assert_eq!(func_name, "double");
+            assert_eq!(args, &vec!["t0".to_string()]);
+            assert_eq!(target, "t1");
+        } else {
+            panic!("Expected Call instruction for pipeline step");
+        }
+
+        if let IrInstruction::Assign { var, reg } = &block.instructions[2] {
+            assert_eq!(var.0, "result");
+            assert_eq!(reg, "t1");
+        } else {
+            panic!("Expected Assign instruction");
+        }
+    }
+
+    #[test]
+    fn test_pipeline_force_operator() {
+        let stmt = Stmt::Binding {
+            name: "result".to_string(),
+            expr: Expr::Pipeline {
+                initial: Box::new(Expr::Identifier("maybe_value".to_string())),
+                steps: vec![PipelineStep::Force],
+            },
+        };
+
+        let block = generate_ir(&stmt);
+
+        assert!(block.instructions.len() >= 2);
+
+        let has_branch = block
+            .instructions
+            .iter()
+            .any(|instr| matches!(instr, IrInstruction::Branch { .. }));
+        let has_panic = block
+            .instructions
+            .iter()
+            .any(|instr| matches!(instr, IrInstruction::Panic { .. }));
+
+        assert!(has_branch, "Expected Branch instruction for Force operator");
+        assert!(has_panic, "Expected Panic instruction for Force operator");
+    }
+
+    #[test]
+    fn test_pipeline_try_operator() {
+        let stmt = Stmt::Binding {
+            name: "result".to_string(),
+            expr: Expr::Pipeline {
+                initial: Box::new(Expr::Identifier("maybe_result".to_string())),
+                steps: vec![PipelineStep::ErrorPropagate],
+            },
+        };
+
+        let block = generate_ir(&stmt);
+
+        assert!(block.instructions.len() >= 1);
+
+        let has_branch = block
+            .instructions
+            .iter()
+            .any(|instr| matches!(instr, IrInstruction::Branch { .. }));
+        let has_return = block
+            .instructions
+            .iter()
+            .any(|instr| matches!(instr, IrInstruction::Return { .. }));
+
+        assert!(has_branch, "Expected Branch instruction for Try operator");
+        assert!(has_return, "Expected Return instruction for Try operator");
+    }
+
+    #[test]
+    fn test_complex_pipeline_with_multiple_steps() {
+        let stmt = Stmt::Binding {
+            name: "result".to_string(),
+            expr: Expr::Pipeline {
+                initial: Box::new(Expr::Literal(Literal::Integer(10))),
+                steps: vec![
+                    PipelineStep::FunctionCall("double".to_string()),
+                    PipelineStep::FunctionCall("increment".to_string()),
+                ],
+            },
+        };
+
+        let block = generate_ir(&stmt);
+
+        assert!(block.instructions.len() >= 4);
+
+        let call_count = block
+            .instructions
+            .iter()
+            .filter(|instr| matches!(instr, IrInstruction::Call { .. }))
+            .count();
+
+        assert_eq!(
+            call_count, 2,
+            "Expected 2 Call instructions for 2 pipeline steps"
+        );
     }
 }
