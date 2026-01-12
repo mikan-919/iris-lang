@@ -85,6 +85,30 @@ impl BasicBlock {
     }
 }
 
+pub use crate::ast::BinaryOp;
+
+#[derive(Debug, Clone)]
+pub struct IrFunction {
+    pub name: String,
+    pub is_exported: bool,
+    pub params: Vec<(String, Type)>,
+    pub return_type: Type,
+    pub block: BasicBlock,
+}
+
+#[derive(Debug, Clone)]
+pub struct IrModule {
+    pub functions: Vec<IrFunction>,
+}
+
+impl IrModule {
+    pub fn new() -> Self {
+        Self {
+            functions: Vec::new(),
+        }
+    }
+}
+
 pub mod generator;
 
 #[cfg(test)]
