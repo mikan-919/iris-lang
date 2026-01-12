@@ -23,7 +23,7 @@ impl WasmGenerator {
         let mut types = TypeSection::new();
         for func in &ir_module.functions {
             let type_idx = self.encode_function_type(&mut types, func)?;
-            self.type_indices.insert(func.name.clone(), type_idx as u32);
+            self.type_indices.insert(func.name.clone(), type_idx);
         }
         module.section(&types);
 
@@ -67,7 +67,7 @@ impl WasmGenerator {
         let result_type = self.type_to_valtype(&func.return_type)?;
         let results = vec![result_type];
 
-        let type_idx = types.len() as u32;
+        let type_idx = types.len();
         types.function(param_types, results);
         Ok(type_idx)
     }
