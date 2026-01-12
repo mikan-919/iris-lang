@@ -135,6 +135,23 @@ impl Parser {
                         self.consume(TokenKind::LParen, "expected '('")?;
                         self.consume(TokenKind::RParen, "expected ')'")?;
                         steps.push(PipelineStep::FunctionCall(name));
+                    } else if matches!(
+                        self.peek().kind,
+                        TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash
+                    ) {
+                        let op = match self.peek().kind {
+                            TokenKind::Plus => crate::ast::BinaryOp::Add,
+                            TokenKind::Minus => crate::ast::BinaryOp::Sub,
+                            TokenKind::Star => crate::ast::BinaryOp::Mul,
+                            TokenKind::Slash => crate::ast::BinaryOp::Div,
+                            _ => unreachable!(),
+                        };
+                        self.advance();
+                        let right_operand = self.parse_term()?;
+                        steps.push(PipelineStep::ArithmeticBinaryOp {
+                            op,
+                            right: Box::new(right_operand),
+                        });
                     } else {
                         return Err(format!(
                             "expected function name or 'for' after ::, found {}",
