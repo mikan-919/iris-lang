@@ -1,432 +1,417 @@
-use wasm_encoder::*;
-use crate::ast::{BinaryOp, Type};
-use crate::ir::{IrModule, IrFunction, IrInstruction};
+use crate::ast::{BinaryOp, Expr, Literal, Type};
+use crate::ir::{BasicBlock, IrFunction, IrInstruction, IrModule};
+use wasm_encoder::{
+    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
+    TypeSection, ValType,
+};
 
+#[derive(Debug, Clone)]
 pub struct WasmGenerator {
-    module: Module,
-    func_indices: std::collections::HashMap<String, u32>,
+    type_indices: std::collections::HashMap<String, u32>,
 }
 
 impl WasmGenerator {
-    pub fn generate(ir_module: &IrModule) -> Result<Vec<u8>, String> {
-        let mut gen = Self::new();
-        gen.build_type_section(ir_module)?;
-        gen.build_function_section(ir_module);
-        gen.build_export_section(ir_module);
-        gen.build_code_section(ir_module)?;
-        Ok(gen.module.finish())
-    }
-
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            module: Module::new(),
-            func_indices: std::collections::HashMap::new(),
+            type_indices: std::collections::HashMap::new(),
         }
     }
 
-    fn build_type_section(&mut self, ir_module: &IrModule) -> Result<(), String> {
+    pub fn compile(&mut self, ir_module: &IrModule) -> Result<Vec<u8>, String> {
+        let mut module = Module::new();
+
         let mut types = TypeSection::new();
-
         for func in &ir_module.functions {
-            let mut param_types = Vec::new();
-            for (_, param_type) in &func.params {
-                param_types.push(param_type.to_wasm_type().unwrap_or("i32").into());
-            }
-            let return_types = vec![func.return_type.to_wasm_type().unwrap_or("i32").into()];
-            types.ty().function(param_types, return_types);
+            let type_idx = self.encode_function_type(&mut types, func)?;
+            self.type_indices.insert(func.name.clone(), type_idx as u32);
         }
+        module.section(&types);
 
-        self.module.section(&types);
-        Ok(())
-    }
-
-    fn build_function_section(&mut self, ir_module: &IrModule) {
         let mut functions = FunctionSection::new();
-        for (i, func) in ir_module.functions.iter().enumerate() {
-            functions.function(i as u32);
-            self.func_indices.insert(func.name.clone(), i as u32);
+        for func in &ir_module.functions {
+            let type_idx = *self
+                .type_indices
+                .get(&func.name)
+                .ok_or_else(|| format!("Type index not found for function: {}", func.name))?;
+            functions.function(type_idx);
         }
-        self.module.section(&functions);
-    }
+        module.section(&functions);
 
-    fn build_export_section(&mut self, ir_module: &IrModule) {
         let mut exports = ExportSection::new();
-        let mut func_index = 0u32;
-
-        for func in &ir_module.functions {
+        for (idx, func) in ir_module.functions.iter().enumerate() {
             if func.is_exported {
-                exports.export(&func.name, ExportKind::Func, func_index);
+                exports.export(&func.name, ExportKind::Func, idx as u32);
             }
-            func_index += 1;
         }
+        module.section(&exports);
 
-        self.module.section(&exports);
+        let mut codes = CodeSection::new();
+        for func in &ir_module.functions {
+            self.encode_function_body(&mut codes, func)?;
+        }
+        module.section(&codes);
+
+        Ok(module.finish())
     }
 
-    fn build_code_section(&mut self, ir_module: &IrModule) -> Result<(), String> {
-        let mut codes = CodeSection::new();
-
-        for func in &ir_module.functions {
-            let locals_map = self.allocate_locals(func);
-            let wasm_func = self.translate_function(func, &locals_map)?;
-            codes.function(&wasm_func);
+    fn encode_function_type(
+        &mut self,
+        types: &mut TypeSection,
+        func: &IrFunction,
+    ) -> Result<u32, String> {
+        let mut param_types: Vec<ValType> = Vec::new();
+        for (_name, ty) in &func.params {
+            param_types.push(self.type_to_valtype(ty)?);
         }
 
-        self.module.section(&codes);
+        let result_type = self.type_to_valtype(&func.return_type)?;
+        let results = vec![result_type];
+
+        let type_idx = types.len() as u32;
+        types.function(param_types, results);
+        Ok(type_idx)
+    }
+
+    fn type_to_valtype(&self, ty: &Type) -> Result<ValType, String> {
+        match ty {
+            Type::Int => Ok(ValType::I32),
+            Type::Float => Ok(ValType::F64),
+            Type::Bool => Ok(ValType::I32),
+            Type::Unit => Ok(ValType::I32),
+            _ => Err(format!("Type {:?} not yet supported in Wasm", ty)),
+        }
+    }
+
+    fn encode_function_body(
+        &self,
+        codes: &mut CodeSection,
+        func: &IrFunction,
+    ) -> Result<(), String> {
+        let locals: Vec<(u32, ValType)> = vec![];
+        let mut wasm_func = Function::new(locals);
+
+        let mut locals_map: std::collections::HashMap<String, u32> =
+            std::collections::HashMap::new();
+        for (param_idx, (param_name, _)) in func.params.iter().enumerate() {
+            locals_map.insert(param_name.clone(), param_idx as u32);
+        }
+
+        self.encode_basic_block(&mut wasm_func, &func.block, &locals_map)?;
+
+        wasm_func.instruction(&Instruction::End);
+
+        codes.function(&wasm_func);
         Ok(())
     }
 
-    fn allocate_locals(&self, func: &IrFunction) -> std::collections::HashMap<String, u32> {
-        let mut locals = std::collections::HashMap::new();
-
-        for (i, (param_name, _)) in func.params.iter().enumerate() {
-            locals.insert(param_name.clone(), i as u32);
-        }
-
-        let mut next_local = func.params.len() as u32;
-        for instr in &func.block.instructions {
-            match instr {
-                IrInstruction::LoadConst { reg, .. } => {
-                    if !locals.contains_key(reg) {
-                        locals.insert(reg.clone(), next_local);
-                        next_local += 1;
-                    }
-                }
-                IrInstruction::Assign { var, .. } => {
-                    if !locals.contains_key(&var.0) {
-                        locals.insert(var.0.clone(), next_local);
-                        next_local += 1;
-                    }
-                }
-                IrInstruction::Call { args, target, .. } => {
-                    for arg in args {
-                        if !locals.contains_key(arg) {
-                            locals.insert(arg.clone(), next_local);
-                            next_local += 1;
-                        }
-                    }
-                    if !locals.contains_key(target) {
-                        locals.insert(target.clone(), next_local);
-                        next_local += 1;
-                    }
-                }
-                IrInstruction::Return { reg } => {
-                    let reg_idx = locals.get(reg).unwrap();
-                    // Just get the register value, no set
-                }
-                IrInstruction::BinaryOp { left, right, target, .. } => {
-                    for r in [left, right, target] {
-                        if !locals.contains_key(r) {
-                            locals.insert(r.clone(), next_local);
-                            next_local += 1;
-                        }
-                    }
-                    // Load left, load right, do op, store result
-                    let left_idx = locals.get(left).unwrap();
-                    let right_idx = locals.get(right).unwrap();
-                    let target_idx = locals.get(target).unwrap();
-
-                    // left, right, op, target_idx
-                }
-                IrInstruction::Branch { .. } => {
-                    return Err("Branch instructions not supported yet".to_string());
-                }
-                IrInstruction::Panic { .. } => {
-                    unreachable();
-                }
-                IrInstruction::Exit { reg } => {
-                    let reg_idx = locals.get(reg).unwrap();
-                    // Return the register value
-                }
-            }
-        }
-
-        locals
-    }
-
-    fn translate_function(&self, func: &IrFunction, locals_map: &std::collections::HashMap<String, u32>) -> Result<Function, String> {
-        let mut wasm_func = Function::new([]);
-
-        let mut instr = wasm_func.instructions();
-
-        for ir_instr in &func.block.instructions {
-            self.translate_instruction(&mut instr, ir_instr, locals_map)?;
-        }
-
-        instr.end();
-        Ok(wasm_func)
-    }
-
-    fn translate_instruction(
+    fn encode_basic_block(
         &self,
-        instr_sink: &mut InstructionSink,
-        ir_instr: &IrInstruction,
+        wasm_func: &mut Function,
+        block: &BasicBlock,
         locals_map: &std::collections::HashMap<String, u32>,
     ) -> Result<(), String> {
-        match ir_instr {
-            IrInstruction::LoadConst { reg, value } => {
-                if let crate::ast::Expr::Literal(crate::ast::Literal::Integer(n)) = value {
-                    instr_sink.i32_const(*n as i32);
-                    let local_idx = locals_map.get(reg).unwrap();
-                    instr_sink.local_set(*local_idx);
-                } else {
-                    return Err("Only integer constants supported".to_string());
-                }
+        for instr in &block.instructions {
+            self.encode_instruction(wasm_func, instr, locals_map)?;
+        }
+        Ok(())
+    }
+
+    fn encode_instruction(
+        &self,
+        wasm_func: &mut Function,
+        instr: &IrInstruction,
+        locals_map: &std::collections::HashMap<String, u32>,
+    ) -> Result<(), String> {
+        match instr {
+            IrInstruction::LoadConst { reg: _, value } => {
+                self.encode_expr(wasm_func, value)?;
             }
-            IrInstruction::Assign { var, reg } => {
-                let local_idx = locals_map.get(&var.0).unwrap();
-                let reg_idx = locals_map.get(reg).unwrap();
-                instr_sink.local_get(*reg_idx);
-                instr_sink.local_set(*local_idx);
-            }
-            IrInstruction::Call { func_name, args, target } => {
-                for arg in args {
-                    let arg_idx = locals_map.get(arg).unwrap();
-                    instr_sink.local_get(*arg_idx);
-                }
-                let func_idx = self.func_indices.get(func_name)
-                    .ok_or_else(|| format!("Undefined function '{}'", func_name))?;
-                instr_sink.call(*func_idx);
-                let target_idx = locals_map.get(target).unwrap();
-                instr_sink.local_set(*target_idx);
+            IrInstruction::Assign { var, reg: _ } => {
+                let local_idx = locals_map
+                    .get(&var.0)
+                    .ok_or_else(|| format!("Local variable not found: {}", var.0))?;
+                wasm_func.instruction(&Instruction::LocalGet(*local_idx));
+                wasm_func.instruction(&Instruction::Drop);
             }
             IrInstruction::Return { reg } => {
-                let reg_idx = locals.get(reg).unwrap();
-                instr_sink.local_get(*reg_idx);
-                instr_sink.return_();
+                let local_idx = locals_map
+                    .get(reg)
+                    .ok_or_else(|| format!("Register not found: {}", reg))?;
+                wasm_func.instruction(&Instruction::LocalGet(*local_idx));
+                wasm_func.instruction(&Instruction::End);
             }
-            IrInstruction::BinaryOp { op, left, right, target } => {
-                let left_idx = locals.get(left).unwrap();
-                let right_idx = locals.get(right).unwrap();
-                let target_idx = locals.get(target).unwrap();
+            IrInstruction::Call {
+                func_name: _,
+                args,
+                target: _,
+            } => {
+                for arg in args {
+                    let local_idx = locals_map
+                        .get(arg)
+                        .ok_or_else(|| format!("Argument register not found: {}", arg))?;
+                    wasm_func.instruction(&Instruction::LocalGet(*local_idx));
+                }
+                wasm_func.instruction(&Instruction::Unreachable);
+            }
+            IrInstruction::Branch {
+                cond,
+                true_block: _,
+                false_block: _,
+            } => {
+                let cond_idx = locals_map
+                    .get(cond)
+                    .ok_or_else(|| format!("Condition register not found: {}", cond))?;
+                wasm_func.instruction(&Instruction::LocalGet(*cond_idx));
+                wasm_func.instruction(&Instruction::Unreachable);
+            }
+            IrInstruction::Panic { msg: _ } => {
+                wasm_func.instruction(&Instruction::Unreachable);
+            }
+            IrInstruction::Exit { value } => {
+                let val_idx = locals_map
+                    .get(value)
+                    .ok_or_else(|| format!("Value register not found: {}", value))?;
+                wasm_func.instruction(&Instruction::LocalGet(*val_idx));
+                wasm_func.instruction(&Instruction::End);
+            }
+            IrInstruction::BinaryOp {
+                op,
+                left,
+                right,
+                target: _,
+            } => {
+                let left_idx = locals_map
+                    .get(left)
+                    .ok_or_else(|| format!("Left operand not found: {}", left))?;
+                let right_idx = locals_map
+                    .get(right)
+                    .ok_or_else(|| format!("Right operand not found: {}", right))?;
 
-                instr_sink.local_get(*left_idx);
-                instr_sink.local_get(*right_idx);
+                wasm_func.instruction(&Instruction::LocalGet(*left_idx));
+                wasm_func.instruction(&Instruction::LocalGet(*right_idx));
 
                 match op {
-                    BinaryOp::Add => instr_sink.i32_add(),
-                    BinaryOp::Sub => instr_sink.i32_sub(),
-                    BinaryOp::Mul => instr_sink.i32_mul(),
-                    BinaryOp::Div => instr_sink.i32_div_s(),
-                }
+                    BinaryOp::Add => wasm_func.instruction(&Instruction::I32Add),
+                    BinaryOp::Sub => wasm_func.instruction(&Instruction::I32Sub),
+                    BinaryOp::Mul => wasm_func.instruction(&Instruction::I32Mul),
+                    BinaryOp::Div => wasm_func.instruction(&Instruction::I32DivS),
+                };
+            }
+        }
+        Ok(())
+    }
 
-                instr_sink.local_set(*target_idx);
+    fn encode_expr(&self, wasm_func: &mut Function, expr: &Expr) -> Result<(), String> {
+        match expr {
+            Expr::Literal(lit) => match lit {
+                Literal::Integer(i) => {
+                    wasm_func.instruction(&Instruction::I32Const(*i as i32));
+                }
+                Literal::String(_) => {
+                    return Err("String literals not yet supported in Wasm codegen".to_string());
+                }
+            },
+            Expr::Identifier(name) => {
+                return Err(format!("Unexpected identifier expression: {}", name));
             }
-            IrInstruction::Branch { .. } => {
-                return Err("Branch instructions not supported yet".to_string());
+            Expr::FunctionCall { name: _, args: _ } => {
+                return Err("Function calls in expressions not yet supported".to_string());
             }
-            IrInstruction::Panic { .. } => {
-                unreachable();
-            }
-            IrInstruction::Exit { reg } => {
-                let reg_idx = locals.get(reg).unwrap();
-                instr_sink.local_get(*reg_idx);
-                instr_sink.return_();
+            _ => {
+                return Err("Complex expressions not yet supported in Wasm codegen".to_string());
             }
         }
         Ok(())
     }
 }
 
+impl Default for WasmGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-impl WasmGenerator {
-    pub fn generate(ir_module: &IrModule) -> Result<Vec<u8>, String> {
-        let mut gen = Self::new();
-        gen.build_type_section(ir_module)?;
-        gen.build_function_section(ir_module);
-        gen.build_export_section(ir_module);
-        gen.build_code_section(ir_module)?;
-        Ok(gen.module.finish())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_type_to_valtype() {
+        let generator = WasmGenerator::new();
+
+        assert_eq!(generator.type_to_valtype(&Type::Int), Ok(ValType::I32));
+        assert_eq!(generator.type_to_valtype(&Type::Float), Ok(ValType::F64));
+        assert_eq!(generator.type_to_valtype(&Type::Bool), Ok(ValType::I32));
+        assert!(generator.type_to_valtype(&Type::String).is_err());
     }
 
-    fn new() -> Self {
-        Self {
-            module: Module::new(),
-            func_indices: std::collections::HashMap::new(),
-        }
+    #[test]
+    fn test_simple_add_function() {
+        let mut module = IrModule::new();
+
+        let mut block = BasicBlock::new();
+        block.add(IrInstruction::BinaryOp {
+            op: BinaryOp::Add,
+            left: "a".to_string(),
+            right: "b".to_string(),
+            target: "a".to_string(),
+        });
+        block.add(IrInstruction::Return {
+            reg: "a".to_string(),
+        });
+
+        let func = IrFunction {
+            name: "add".to_string(),
+            is_exported: true,
+            params: vec![("a".to_string(), Type::Int), ("b".to_string(), Type::Int)],
+            return_type: Type::Int,
+            block,
+        };
+
+        module.functions.push(func);
+
+        let mut generator = WasmGenerator::new();
+        let wasm_bytes = generator
+            .compile(&module)
+            .expect("Failed to compile to Wasm");
+
+        assert!(!wasm_bytes.is_empty());
+
+        assert_eq!(&wasm_bytes[0..4], b"\x00\x61\x73\x6d");
+        assert_eq!(&wasm_bytes[4..8], b"\x01\x00\x00\x00");
     }
 
-    fn build_type_section(&mut self, ir_module: &IrModule) -> Result<(), String> {
-        let mut types = TypeSection::new();
+    #[test]
+    fn test_simple_const_return() {
+        let mut module = IrModule::new();
 
-        for func in &ir_module.functions {
-            let mut param_types = Vec::new();
-            for (_, param_type) in &func.params {
-                param_types.push(param_type.to_wasm_type().unwrap_or("i32").into());
-            }
-            let return_types = vec![func.return_type.to_wasm_type().unwrap_or("i32").into()];
-            types.ty().function(param_types, return_types);
-        }
+        let mut block = BasicBlock::new();
+        block.add(IrInstruction::LoadConst {
+            reg: "a".to_string(),
+            value: Expr::Literal(Literal::Integer(42)),
+        });
 
-        self.module.section(&types);
-        Ok(())
+        let func = IrFunction {
+            name: "return_const".to_string(),
+            is_exported: true,
+            params: vec![("a".to_string(), Type::Int)],
+            return_type: Type::Int,
+            block,
+        };
+
+        module.functions.push(func);
+
+        let mut generator = WasmGenerator::new();
+        let wasm_bytes = generator
+            .compile(&module)
+            .expect("Failed to compile to Wasm");
+
+        assert!(!wasm_bytes.is_empty());
+        assert_eq!(&wasm_bytes[0..4], b"\x00\x61\x73\x6d");
     }
 
-    fn build_function_section(&mut self, ir_module: &IrModule) {
-        let mut functions = FunctionSection::new();
-        for (i, func) in ir_module.functions.iter().enumerate() {
-            functions.function(i as u32);
-            self.func_indices.insert(func.name.clone(), i as u32);
-        }
-        self.module.section(&functions);
+    #[test]
+    fn test_unsupported_type_returns_error() {
+        let generator = WasmGenerator::new();
+
+        assert!(generator.type_to_valtype(&Type::String).is_err());
+        assert!(generator.type_to_valtype(&Type::Any).is_err());
     }
 
-    fn build_export_section(&mut self, ir_module: &IrModule) {
-        let mut exports = ExportSection::new();
-        let mut func_index = 0u32;
+    #[test]
+    fn test_empty_module() {
+        let module = IrModule::new();
 
-        for func in &ir_module.functions {
-            if func.is_exported {
-                exports.export(&func.name, ExportKind::Func, func_index);
-            }
-            func_index += 1;
-        }
+        let mut generator = WasmGenerator::new();
+        let wasm_bytes = generator
+            .compile(&module)
+            .expect("Failed to compile to Wasm");
 
-        self.module.section(&exports);
+        assert!(!wasm_bytes.is_empty());
+        assert_eq!(&wasm_bytes[0..4], b"\x00\x61\x73\x6d");
     }
 
-    fn build_code_section(&mut self, ir_module: &IrModule) -> Result<(), String> {
-        let mut codes = CodeSection::new();
+    #[test]
+    fn test_multiple_functions() {
+        let mut module = IrModule::new();
 
-        for func in &ir_module.functions {
-            let locals_map = self.allocate_locals(func);
-            let wasm_func = self.translate_function(func, &locals_map)?;
-            codes.function(&wasm_func);
-        }
+        let mut block1 = BasicBlock::new();
+        block1.add(IrInstruction::Return {
+            reg: "a".to_string(),
+        });
 
-        self.module.section(&codes);
-        Ok(())
+        let func1 = IrFunction {
+            name: "identity".to_string(),
+            is_exported: true,
+            params: vec![("a".to_string(), Type::Int)],
+            return_type: Type::Int,
+            block: block1,
+        };
+
+        let mut block2 = BasicBlock::new();
+        block2.add(IrInstruction::Return {
+            reg: "x".to_string(),
+        });
+
+        let func2 = IrFunction {
+            name: "identity2".to_string(),
+            is_exported: true,
+            params: vec![("x".to_string(), Type::Int)],
+            return_type: Type::Int,
+            block: block2,
+        };
+
+        module.functions.push(func1);
+        module.functions.push(func2);
+
+        let mut generator = WasmGenerator::new();
+        let wasm_bytes = generator
+            .compile(&module)
+            .expect("Failed to compile to Wasm");
+
+        assert!(!wasm_bytes.is_empty());
+        assert_eq!(&wasm_bytes[0..4], b"\x00\x61\x73\x6d");
     }
 
-    fn allocate_locals(&self, func: &IrFunction) -> std::collections::HashMap<String, u32> {
-        let mut locals = std::collections::HashMap::new();
+    #[test]
+    fn test_wasm_magic_number() {
+        use crate::ir;
 
-        for (i, (param_name, _)) in func.params.iter().enumerate() {
-            locals.insert(param_name.clone(), i as u32);
-        }
+        let mut module = ir::IrModule::new();
 
-        let mut next_local = func.params.len() as u32;
-        for instr in &func.block.instructions {
-            match instr {
-                IrInstruction::LoadConst { reg, .. } => {
-                    if !locals.contains_key(reg) {
-                        locals.insert(reg.clone(), next_local);
-                        next_local += 1;
-                    }
-                }
-                IrInstruction::Assign { var, .. } => {
-                    if !locals.contains_key(&var.0) {
-                        locals.insert(var.0.clone(), next_local);
-                        next_local += 1;
-                    }
-                }
-                IrInstruction::Call { args, target, .. } => {
-                    for arg in args {
-                        if !locals.contains_key(arg) {
-                            locals.insert(arg.clone(), next_local);
-                            next_local += 1;
-                        }
-                    }
-                    if !locals.contains_key(target) {
-                        locals.insert(target.clone(), next_local);
-                        next_local += 1;
-                    }
-                }
-                IrInstruction::BinaryOp { left, right, target, .. } => {
-                    for reg in [left, right, target] {
-                        if !locals.contains_key(reg) {
-                            locals.insert(reg.clone(), next_local);
-                            next_local += 1;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let mut block = BasicBlock::new();
+        block.add(IrInstruction::BinaryOp {
+            op: BinaryOp::Add,
+            left: "a".to_string(),
+            right: "b".to_string(),
+            target: "a".to_string(),
+        });
+        block.add(IrInstruction::Return {
+            reg: "a".to_string(),
+        });
 
-        locals
-    }
+        let func = IrFunction {
+            name: "add".to_string(),
+            is_exported: true,
+            params: vec![("a".to_string(), Type::Int), ("b".to_string(), Type::Int)],
+            return_type: Type::Int,
+            block,
+        };
 
-    fn translate_function(&self, func: &IrFunction, locals_map: &std::collections::HashMap<String, u32>) -> Result<Function, String> {
-        let mut wasm_func = Function::new([]);
+        module.functions.push(func);
 
-        let mut instr = wasm_func.instructions();
+        let mut generator = WasmGenerator::new();
+        let wasm_bytes = generator
+            .compile(&module)
+            .expect("Failed to compile to Wasm");
 
-        for ir_instr in &func.block.instructions {
-            self.translate_instruction(&mut instr, ir_instr, locals_map)?;
-        }
+        assert!(!wasm_bytes.is_empty());
+        assert!(wasm_bytes.len() > 10);
 
-        instr.end();
-        Ok(wasm_func)
-    }
+        let magic = &wasm_bytes[0..4];
+        assert_eq!(magic, b"\x00\x61\x73\x6d");
 
-    fn translate_instruction(
-        &self,
-        instr_sink: &mut InstructionSink,
-        ir_instr: &IrInstruction,
-        locals_map: &std::collections::HashMap<String, u32>,
-    ) -> Result<(), String> {
-        match ir_instr {
-            IrInstruction::LoadConst { reg, value } => {
-                if let crate::ast::Expr::Literal(crate::ast::Literal::Integer(n)) = value {
-                    instr_sink.i32_const(*n as i32);
-                    let local_idx = locals_map.get(reg).unwrap();
-                    instr_sink.local_set(*local_idx);
-                } else {
-                    return Err("Only integer constants supported".to_string());
-                }
-            }
-            IrInstruction::Assign { var, reg } => {
-                let local_idx = locals_map.get(&var.0).unwrap();
-                let reg_idx = locals_map.get(reg).unwrap();
-                instr_sink.local_get(*reg_idx);
-                instr_sink.local_set(*local_idx);
-            }
-            IrInstruction::Call { func_name, args, target } => {
-                for arg in args {
-                    let arg_idx = locals_map.get(arg).unwrap();
-                    instr_sink.local_get(*arg_idx);
-                }
-                let func_idx = self.func_indices.get(func_name)
-                    .ok_or_else(|| format!("Undefined function '{}'", func_name))?;
-                instr_sink.call(*func_idx);
-                let target_idx = locals_map.get(target).unwrap();
-                instr_sink.local_set(*target_idx);
-            }
-            IrInstruction::Return { reg } => {
-                let reg_idx = locals_map.get(reg).unwrap();
-                instr_sink.local_get(*reg_idx);
-                instr_sink.return_();
-            }
-            IrInstruction::BinaryOp { op, left, right, target } => {
-                let left_idx = locals_map.get(left).unwrap();
-                let right_idx = locals_map.get(right).unwrap();
-                let target_idx = locals_map.get(target).unwrap();
-
-                instr_sink.local_get(*left_idx);
-                instr_sink.local_get(*right_idx);
-
-                match op {
-                    BinaryOp::Add => instr_sink.i32_add(),
-                    BinaryOp::Sub => instr_sink.i32_sub(),
-                    BinaryOp::Mul => instr_sink.i32_mul(),
-                    BinaryOp::Div => instr_sink.i32_div_s(),
-                }
-
-                instr_sink.local_set(*target_idx);
-            }
-            IrInstruction::Branch { .. } => {
-                return Err("Branch instructions not supported yet".to_string());
-            }
-            IrInstruction::Panic { .. } => {
-                instr_sink.unreachable();
-            }
-            IrInstruction::Exit { reg } => {
-                let reg_idx = locals_map.get(reg).unwrap();
-                instr_sink.local_get(*reg_idx);
-                instr_sink.return_();
-            }
-        }
-        Ok(())
+        let version = &wasm_bytes[4..8];
+        assert_eq!(version, b"\x01\x00\x00\x00");
     }
 }

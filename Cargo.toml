@@ -8,3 +8,7 @@ wasm-encoder = "0.217"
 
 [dev-dependencies]
 wasmtime = "27"
+
+[features]
+default = []
+wasmtime = []

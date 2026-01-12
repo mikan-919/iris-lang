@@ -1,5 +1,5 @@
 use crate::ast::{Expr, PipelineStep, Stmt};
-use crate::ir::{BasicBlock, IrInstruction, Variable};
+use crate::ir::{BasicBlock, IrFunction, IrInstruction, IrModule, Variable};
 
 pub fn generate_ir(stmt: &Stmt) -> BasicBlock {
     let mut block = BasicBlock::new();
