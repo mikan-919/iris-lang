@@ -39,7 +39,7 @@ impl Parser {
             TokenKind::Export => {
                 self.advance();
                 if self.check(TokenKind::Fn) {
-                    self.parse_function_definition()
+                    self.parse_function_definition(true)
                 } else {
                     Err(format!(
                         "expected 'fn' after 'export', found {}",
@@ -47,7 +47,7 @@ impl Parser {
                     ))
                 }
             }
-            TokenKind::Fn => self.parse_function_definition(),
+            TokenKind::Fn => self.parse_function_definition(false),
             TokenKind::For => {
                 self.advance();
                 let for_loop = self.parse_for_loop()?;
@@ -69,7 +69,7 @@ impl Parser {
         Ok(Stmt::Binding { name, expr })
     }
 
-    fn parse_function_definition(&mut self) -> Result<Stmt, String> {
+    fn parse_function_definition(&mut self, is_exported: bool) -> Result<Stmt, String> {
         self.consume(TokenKind::Fn, "expected 'fn'")?;
 
         let name = self.consume_identifier()?;
@@ -106,6 +106,7 @@ impl Parser {
 
         Ok(Stmt::FunctionDefinition {
             name,
+            is_exported,
             params,
             return_type,
             body: Box::new(expr),

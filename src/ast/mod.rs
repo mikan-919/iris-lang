@@ -1,5 +1,13 @@
 use std::fmt;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Int,
@@ -69,6 +77,16 @@ impl Type {
             _ => self.clone(),
         }
     }
+
+    pub fn to_wasm_type(&self) -> Result<&'static str, String> {
+        match self {
+            Type::Int => Ok("i32"),
+            Type::Float => Ok("f64"),
+            Type::Bool => Ok("i32"),
+            Type::Unit => Ok("i32"),
+            _ => Err(format!("Type {} not yet supported in Wasm", self)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +126,7 @@ pub enum PipelineStep {
     TupleMerge(Box<Expr>),
     MatchArm(Box<MatchArm>),
     ForLoop(Box<ForLoop>),
+    ArithmeticBinaryOp { op: BinaryOp, right: Box<Expr> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +152,7 @@ pub enum Stmt {
     },
     FunctionDefinition {
         name: String,
+        is_exported: bool,
         params: Vec<(String, Type)>,
         return_type: Type,
         body: Box<Expr>,
@@ -215,6 +235,15 @@ impl fmt::Display for PipelineStep {
                 " :: for {}@{} :: {}",
                 for_loop.item, for_loop.collection, for_loop.body
             ),
+            PipelineStep::ArithmeticBinaryOp { op, right } => {
+                let op_str = match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Sub => "-",
+                    BinaryOp::Mul => "*",
+                    BinaryOp::Div => "/",
+                };
+                write!(f, " :: {}{}", op_str, right)
+            }
         }
     }
 }
