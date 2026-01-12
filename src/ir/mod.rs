@@ -1,4 +1,4 @@
-use crate::ast::Expr;
+use crate::ast::{BinaryOp, Expr, Type};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Variable(pub String);
@@ -32,6 +32,34 @@ pub enum IrInstruction {
     Exit {
         value: String,
     },
+    BinaryOp {
+        op: BinaryOp,
+        left: String,
+        right: String,
+        target: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct IrFunction {
+    pub name: String,
+    pub is_exported: bool,
+    pub params: Vec<(String, Type)>,
+    pub return_type: Type,
+    pub block: BasicBlock,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct IrModule {
+    pub functions: Vec<IrFunction>,
+}
+
+impl IrModule {
+    pub fn new() -> Self {
+        Self {
+            functions: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
