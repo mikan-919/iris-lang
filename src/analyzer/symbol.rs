@@ -55,8 +55,15 @@ impl Scope {
 
 #[derive(Debug)]
 pub struct SymbolTable {
+    #[allow(dead_code)]
     root: Scope,
     current: Scope,
+}
+
+impl Default for SymbolTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SymbolTable {
