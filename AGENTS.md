@@ -45,7 +45,13 @@ cargo fmt               # Format code
 cargo clippy            # Lint
 ```
 
-## NOTES
+## BRANCH STRATEGY
+### ブランチ戦略
+- `main` ブランチ: 安定版（マイルストーン用）
+- `dev` ブランチ: 開発の基幹（Trunk）。トランクベース開発の対象。
+- 機能追加は、`dev` から短い寿命の `feature/` ブランチを切って行い、完了後すぐに `dev` にマージすること。
+
+### NOTES
 - Repository is freshly initialized with git but no Rust project exists
 - Issue #1: "最初の開発" tracks initial development
 - Current branch: `issue-1` (from dev branch)
