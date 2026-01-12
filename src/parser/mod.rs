@@ -82,9 +82,9 @@ impl Parser {
                 let param_name = self.consume_identifier()?;
                 let param_type = if self.match_token(TokenKind::Colon) {
                     let type_name = self.consume_identifier()?;
-                    Type::Simple(type_name)
+                    Type::Simple(type_name).normalize()
                 } else {
-                    Type::Simple("Any".to_string())
+                    Type::Any
                 };
                 params.push((param_name, param_type));
                 if !self.match_token(TokenKind::Comma) {
@@ -98,7 +98,7 @@ impl Parser {
         self.consume(TokenKind::Arrow, "expected '->'")?;
 
         let return_type_name = self.consume_identifier()?;
-        let return_type = Type::Simple(return_type_name);
+        let return_type = Type::Simple(return_type_name).normalize();
 
         self.consume(TokenKind::Bind, "expected '=:'")?;
 

@@ -7,6 +7,7 @@ pub enum Type {
     Bool,
     String,
     Unit,
+    Any,
     Simple(String),
     Tuple(Vec<Type>),
     Generic {
@@ -39,6 +40,33 @@ impl Type {
         Type::Generic {
             name: "Future".to_string(),
             args: vec![inner],
+        }
+    }
+
+    pub fn normalize(&self) -> Self {
+        match self {
+            Type::Simple(name) => match name.as_str() {
+                "Int" => Type::Int,
+                "Float" => Type::Float,
+                "Bool" => Type::Bool,
+                "String" => Type::String,
+                "Unit" => Type::Unit,
+                "Any" => Type::Any,
+                _ => Type::Simple(name.clone()),
+            },
+            Type::Tuple(elems) => Type::Tuple(elems.iter().map(|t| t.normalize()).collect()),
+            Type::Generic { name, args } => Type::Generic {
+                name: name.clone(),
+                args: args.iter().map(|t| t.normalize()).collect(),
+            },
+            Type::Function {
+                params,
+                return_type,
+            } => Type::Function {
+                params: params.iter().map(|t| t.normalize()).collect(),
+                return_type: Box::new(return_type.normalize()),
+            },
+            _ => self.clone(),
         }
     }
 }
@@ -121,6 +149,7 @@ impl fmt::Display for Type {
             Type::Bool => write!(f, "Bool"),
             Type::String => write!(f, "String"),
             Type::Unit => write!(f, "()"),
+            Type::Any => write!(f, "Any"),
             Type::Simple(name) => write!(f, "{}", name),
             Type::Tuple(elems) => {
                 write!(f, "(")?;

@@ -3,6 +3,13 @@ use crate::analyzer::symbol::{OwnershipState, SymbolTable};
 use crate::ast::*;
 use std::collections::HashMap;
 
+fn types_compatible(input: &Type, expected: &Type) -> bool {
+    match (input, expected) {
+        (Type::Any, _) | (_, Type::Any) => true,
+        _ => input == expected,
+    }
+}
+
 pub struct TypeChecker {
     symbol_table: SymbolTable,
     function_signatures: HashMap<String, Type>,
@@ -63,6 +70,16 @@ impl TypeChecker {
                 }
 
                 let body_ty = self.infer_expr(body)?;
+                let normalized_return_type = return_type.normalize();
+                let normalized_body_ty = body_ty.normalize();
+                if !types_compatible(&normalized_body_ty, &normalized_return_type) {
+                    return Err(format!(
+                        "Function '{}' return type mismatch: expected {}, got {}",
+                        name, normalized_return_type, normalized_body_ty
+                    ));
+                }
+
+                let body_ty = self.infer_expr(body)?;
                 if body_ty != *return_type {
                     return Err(format!(
                         "Function '{}' return type mismatch: expected {}, got {}",
@@ -117,10 +134,12 @@ impl TypeChecker {
 
                 for (arg, expected_ty) in args.iter().zip(&param_types) {
                     let arg_ty = self.infer_expr(arg)?;
-                    if arg_ty != *expected_ty {
+                    let normalized_arg_ty = arg_ty.normalize();
+                    let normalized_expected_ty = expected_ty.normalize();
+                    if !types_compatible(&normalized_arg_ty, &normalized_expected_ty) {
                         return Err(format!(
                             "Argument type mismatch for '{}': expected {}, got {}",
-                            name, expected_ty, arg_ty
+                            name, normalized_expected_ty, normalized_arg_ty
                         ));
                     }
                 }
@@ -173,10 +192,12 @@ impl TypeChecker {
                             ));
                         }
 
-                        if input_type != &params[0] {
+                        let normalized_input = input_type.normalize();
+                        let normalized_param = params[0].normalize();
+                        if !types_compatible(&normalized_input, &normalized_param) {
                             return Err(format!(
                                 "Pipeline type mismatch for '{}': expected {}, got {}",
-                                func_name, params[0], input_type
+                                func_name, normalized_param, normalized_input
                             ));
                         }
 
@@ -208,12 +229,17 @@ impl TypeChecker {
 
             PipelineStep::ErrorRescue(fallback) => {
                 let fallback_type = self.infer_expr(fallback)?;
+                let normalized_fallback = fallback_type.normalize();
                 match input_type {
                     Type::Generic { name, args } if name == "Result" && args.len() == 2 => {
-                        if fallback_type != args[0] && fallback_type != args[1] {
+                        let normalized_ok = args[0].normalize();
+                        let normalized_err = args[1].normalize();
+                        if !types_compatible(&normalized_fallback, &normalized_ok)
+                            && !types_compatible(&normalized_fallback, &normalized_err)
+                        {
                             return Err(format!(
                                 "Error rescue fallback must match Ok type {} or Err type {}, got {}",
-                                args[0], args[1], fallback_type
+                                normalized_ok, normalized_err, normalized_fallback
                             ));
                         }
                         Ok(args[0].clone())
@@ -227,12 +253,14 @@ impl TypeChecker {
 
             PipelineStep::Fallback(default_expr) => {
                 let default_type = self.infer_expr(default_expr)?;
+                let normalized_default = default_type.normalize();
                 match input_type {
                     Type::Generic { name, args } if name == "Option" && args.len() == 1 => {
-                        if default_type != args[0] {
+                        let normalized_inner = args[0].normalize();
+                        if !types_compatible(&normalized_default, &normalized_inner) {
                             return Err(format!(
                                 "Fallback type mismatch: expected {}, got {}",
-                                args[0], default_type
+                                normalized_inner, normalized_default
                             ));
                         }
                         Ok(args[0].clone())
