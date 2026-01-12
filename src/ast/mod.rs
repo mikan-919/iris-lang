@@ -2,7 +2,45 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
+    Int,
+    Float,
+    Bool,
+    String,
+    Unit,
     Simple(String),
+    Tuple(Vec<Type>),
+    Generic {
+        name: String,
+        args: Vec<Type>,
+    },
+    TypeVar(usize),
+    Function {
+        params: Vec<Type>,
+        return_type: Box<Type>,
+    },
+}
+
+impl Type {
+    pub fn option(inner: Type) -> Self {
+        Type::Generic {
+            name: "Option".to_string(),
+            args: vec![inner],
+        }
+    }
+
+    pub fn result(ok: Type, err: Type) -> Self {
+        Type::Generic {
+            name: "Result".to_string(),
+            args: vec![ok, err],
+        }
+    }
+
+    pub fn future(inner: Type) -> Self {
+        Type::Generic {
+            name: "Future".to_string(),
+            args: vec![inner],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +116,46 @@ pub enum Stmt {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Type::Int => write!(f, "Int"),
+            Type::Float => write!(f, "Float"),
+            Type::Bool => write!(f, "Bool"),
+            Type::String => write!(f, "String"),
+            Type::Unit => write!(f, "()"),
             Type::Simple(name) => write!(f, "{}", name),
+            Type::Tuple(elems) => {
+                write!(f, "(")?;
+                for (i, elem) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", elem)?;
+                }
+                write!(f, ")")
+            }
+            Type::Generic { name, args } => {
+                write!(f, "{}<", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ">")
+            }
+            Type::TypeVar(id) => write!(f, "'t{}", id),
+            Type::Function {
+                params,
+                return_type,
+            } => {
+                write!(f, "(")?;
+                for (i, param) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", param)?;
+                }
+                write!(f, ") -> {}", return_type)
+            }
         }
     }
 }
@@ -156,7 +233,7 @@ impl fmt::Display for Expr {
                 }
                 Ok(())
             }
-            Expr::Match { subject, arms } => {
+            Expr::Match { subject: _, arms } => {
                 write!(f, ":: match")?;
                 for arm in arms {
                     write!(f, "\n   {}", arm)?;
