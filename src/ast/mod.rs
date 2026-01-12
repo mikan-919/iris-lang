@@ -1,0 +1,275 @@
+use std::fmt;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Type {
+    Int,
+    Float,
+    Bool,
+    String,
+    Unit,
+    Any,
+    Simple(String),
+    Tuple(Vec<Type>),
+    Generic {
+        name: String,
+        args: Vec<Type>,
+    },
+    TypeVar(usize),
+    Function {
+        params: Vec<Type>,
+        return_type: Box<Type>,
+    },
+}
+
+impl Type {
+    pub fn option(inner: Type) -> Self {
+        Type::Generic {
+            name: "Option".to_string(),
+            args: vec![inner],
+        }
+    }
+
+    pub fn result(ok: Type, err: Type) -> Self {
+        Type::Generic {
+            name: "Result".to_string(),
+            args: vec![ok, err],
+        }
+    }
+
+    pub fn future(inner: Type) -> Self {
+        Type::Generic {
+            name: "Future".to_string(),
+            args: vec![inner],
+        }
+    }
+
+    pub fn normalize(&self) -> Self {
+        match self {
+            Type::Simple(name) => match name.as_str() {
+                "Int" => Type::Int,
+                "Float" => Type::Float,
+                "Bool" => Type::Bool,
+                "String" => Type::String,
+                "Unit" => Type::Unit,
+                "Any" => Type::Any,
+                _ => Type::Simple(name.clone()),
+            },
+            Type::Tuple(elems) => Type::Tuple(elems.iter().map(|t| t.normalize()).collect()),
+            Type::Generic { name, args } => Type::Generic {
+                name: name.clone(),
+                args: args.iter().map(|t| t.normalize()).collect(),
+            },
+            Type::Function {
+                params,
+                return_type,
+            } => Type::Function {
+                params: params.iter().map(|t| t.normalize()).collect(),
+                return_type: Box::new(return_type.normalize()),
+            },
+            _ => self.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Literal(Literal),
+    Identifier(String),
+    FunctionCall {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Pipeline {
+        initial: Box<Expr>,
+        steps: Vec<PipelineStep>,
+    },
+    Match {
+        subject: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+    ForLoop(Box<ForLoop>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Literal {
+    Integer(i64),
+    String(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PipelineStep {
+    FunctionCall(String),
+    AsyncCall(String),
+    ErrorPropagate,
+    Force,
+    ErrorRescue(Box<Expr>),
+    Fallback(Box<Expr>),
+    BorrowReference(String),
+    TupleMerge(Box<Expr>),
+    MatchArm(Box<MatchArm>),
+    ForLoop(Box<ForLoop>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchArm {
+    Pattern { name: String, args: Vec<Expr> },
+    Expression(Box<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForLoop {
+    pub subject: Box<Expr>,
+    pub item: String,
+    pub collection: Box<Expr>,
+    pub body: Box<Expr>,
+    pub is_threading: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stmt {
+    Binding {
+        name: String,
+        expr: Expr,
+    },
+    FunctionDefinition {
+        name: String,
+        params: Vec<(String, Type)>,
+        return_type: Type,
+        body: Box<Expr>,
+    },
+    MatchStatement(Box<Expr>),
+    ForLoopStatement(Box<ForLoop>),
+}
+
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Type::Int => write!(f, "Int"),
+            Type::Float => write!(f, "Float"),
+            Type::Bool => write!(f, "Bool"),
+            Type::String => write!(f, "String"),
+            Type::Unit => write!(f, "()"),
+            Type::Any => write!(f, "Any"),
+            Type::Simple(name) => write!(f, "{}", name),
+            Type::Tuple(elems) => {
+                write!(f, "(")?;
+                for (i, elem) in elems.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", elem)?;
+                }
+                write!(f, ")")
+            }
+            Type::Generic { name, args } => {
+                write!(f, "{}<", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ">")
+            }
+            Type::TypeVar(id) => write!(f, "'t{}", id),
+            Type::Function {
+                params,
+                return_type,
+            } => {
+                write!(f, "(")?;
+                for (i, param) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", param)?;
+                }
+                write!(f, ") -> {}", return_type)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Literal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Literal::Integer(n) => write!(f, "{}", n),
+            Literal::String(s) => write!(f, "\"{}\"", s),
+        }
+    }
+}
+
+impl fmt::Display for PipelineStep {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipelineStep::FunctionCall(name) => write!(f, "{}()", name),
+            PipelineStep::AsyncCall(name) => write!(f, ":~ {}()", name),
+            PipelineStep::ErrorPropagate => write!(f, ":^"),
+            PipelineStep::Force => write!(f, ":!"),
+            PipelineStep::ErrorRescue(expr) => write!(f, ":? {}", expr),
+            PipelineStep::Fallback(expr) => write!(f, ":| {}", expr),
+            PipelineStep::BorrowReference(name) => write!(f, ":> {}", name),
+            PipelineStep::TupleMerge(expr) => write!(f, ":& {}", expr),
+            PipelineStep::MatchArm(arm) => write!(f, "| {} ::", arm),
+            PipelineStep::ForLoop(for_loop) => write!(
+                f,
+                " :: for {}@{} :: {}",
+                for_loop.item, for_loop.collection, for_loop.body
+            ),
+        }
+    }
+}
+
+impl fmt::Display for MatchArm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MatchArm::Pattern { name, args } => {
+                write!(f, "{}", name)?;
+                for arg in args {
+                    write!(f, "({})", arg)?;
+                }
+                Ok(())
+            }
+            MatchArm::Expression(expr) => write!(f, "{}", expr),
+        }
+    }
+}
+
+impl fmt::Display for ForLoop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{} :: {}", self.item, self.collection, self.body)
+    }
+}
+
+impl fmt::Display for Expr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Expr::Literal(lit) => write!(f, "{}", lit),
+            Expr::Identifier(name) => write!(f, "{}", name),
+            Expr::FunctionCall { name, args } => {
+                write!(f, "{}(", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
+            Expr::Pipeline { initial, steps } => {
+                write!(f, "{}", initial)?;
+                for step in steps {
+                    write!(f, " {}", step)?;
+                }
+                Ok(())
+            }
+            Expr::Match { subject: _, arms } => {
+                write!(f, ":: match")?;
+                for arm in arms {
+                    write!(f, "\n   {}", arm)?;
+                }
+                Ok(())
+            }
+            Expr::ForLoop(for_loop) => write!(f, "{}", for_loop),
+        }
+    }
+}
