@@ -1,5 +1,4 @@
-use crate::analyzer::errors::TypeError;
-use crate::analyzer::symbol::{OwnershipState, SymbolTable};
+use crate::analyzer::symbol::SymbolTable;
 use crate::ast::*;
 use std::collections::HashMap;
 
@@ -13,6 +12,12 @@ fn types_compatible(input: &Type, expected: &Type) -> bool {
 pub struct TypeChecker {
     symbol_table: SymbolTable,
     function_signatures: HashMap<String, Type>,
+}
+
+impl Default for TypeChecker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TypeChecker {

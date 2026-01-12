@@ -4,17 +4,14 @@ use crate::ir::{BasicBlock, IrInstruction, Variable};
 pub fn generate_ir(stmt: &Stmt) -> BasicBlock {
     let mut block = BasicBlock::new();
 
-    match stmt {
-        Stmt::Binding { name, expr } => {
-            let (reg, expr_block) = generate_expr_ir(expr);
-            block.instructions.extend(expr_block);
+    if let Stmt::Binding { name, expr } = stmt {
+        let (reg, expr_block) = generate_expr_ir(expr);
+        block.instructions.extend(expr_block);
 
-            block.add(IrInstruction::Assign {
-                var: Variable(name.clone()),
-                reg,
-            });
-        }
-        _ => {}
+        block.add(IrInstruction::Assign {
+            var: Variable(name.clone()),
+            reg,
+        });
     }
 
     block
@@ -205,7 +202,7 @@ mod tests {
 
         let block = generate_ir(&stmt);
 
-        assert!(block.instructions.len() >= 1);
+        assert!(!block.instructions.is_empty());
 
         let has_branch = block
             .instructions
