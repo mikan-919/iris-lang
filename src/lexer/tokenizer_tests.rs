@@ -65,3 +65,36 @@ fn test_pipe_and_at() {
     assert_eq!(tokens[3].kind, TokenKind::Pipe);
     assert_eq!(tokens[4].kind, TokenKind::Identifier("pattern".to_string()));
 }
+
+#[test]
+fn test_arithmetic_operators() {
+    let mut lexer = Lexer::new("+ - * /");
+    let tokens = lexer.tokenize();
+    assert_eq!(tokens[0].kind, TokenKind::Plus);
+    assert_eq!(tokens[1].kind, TokenKind::Minus);
+    assert_eq!(tokens[2].kind, TokenKind::Star);
+    assert_eq!(tokens[3].kind, TokenKind::Slash);
+}
+
+#[test]
+fn test_arithmetic_in_pipeline() {
+    let mut lexer = Lexer::new("10 :: +(5)");
+    let tokens = lexer.tokenize();
+    assert_eq!(tokens[0].kind, TokenKind::Integer(10));
+    assert_eq!(tokens[1].kind, TokenKind::Next);
+    assert_eq!(tokens[2].kind, TokenKind::Plus);
+    assert_eq!(tokens[3].kind, TokenKind::LParen);
+    assert_eq!(tokens[4].kind, TokenKind::Integer(5));
+    assert_eq!(tokens[5].kind, TokenKind::RParen);
+}
+
+#[test]
+fn test_minus_distinguishes_from_arrow() {
+    let mut lexer = Lexer::new("x - y -> z");
+    let tokens = lexer.tokenize();
+    assert_eq!(tokens[0].kind, TokenKind::Identifier("x".to_string()));
+    assert_eq!(tokens[1].kind, TokenKind::Minus);
+    assert_eq!(tokens[2].kind, TokenKind::Identifier("y".to_string()));
+    assert_eq!(tokens[3].kind, TokenKind::Arrow);
+    assert_eq!(tokens[4].kind, TokenKind::Identifier("z".to_string()));
+}
