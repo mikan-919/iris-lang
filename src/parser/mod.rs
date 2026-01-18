@@ -118,7 +118,31 @@ impl Parser {
             return self.parse_match();
         }
 
-        let initial = self.parse_term()?;
+        self.parse_binary_op()
+    }
+
+    fn parse_binary_op(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_term()?;
+
+        while matches!(
+            self.peek().kind,
+            TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash
+        ) {
+            let op = match self.peek().kind {
+                TokenKind::Plus => crate::ast::BinaryOp::Add,
+                TokenKind::Minus => crate::ast::BinaryOp::Sub,
+                TokenKind::Star => crate::ast::BinaryOp::Mul,
+                TokenKind::Slash => crate::ast::BinaryOp::Div,
+                _ => unreachable!(),
+            };
+            self.advance();
+            let right = self.parse_term()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
 
         let mut steps = Vec::new();
 
@@ -133,8 +157,18 @@ impl Parser {
                     } else if let TokenKind::Identifier(name) = self.peek().kind.clone() {
                         self.advance();
                         self.consume(TokenKind::LParen, "expected '('")?;
+                        let mut args = Vec::new();
+                        if self.peek().kind != TokenKind::RParen {
+                            loop {
+                                let arg = self.parse_expression()?;
+                                args.push(arg);
+                                if !self.match_token(TokenKind::Comma) {
+                                    break;
+                                }
+                            }
+                        }
                         self.consume(TokenKind::RParen, "expected ')'")?;
-                        steps.push(PipelineStep::FunctionCall(name));
+                        steps.push(PipelineStep::FunctionCall { name, args });
                     } else if matches!(
                         self.peek().kind,
                         TokenKind::Plus | TokenKind::Minus | TokenKind::Star | TokenKind::Slash
@@ -203,10 +237,10 @@ impl Parser {
         }
 
         if steps.is_empty() {
-            Ok(initial)
+            Ok(left)
         } else {
             Ok(Expr::Pipeline {
-                initial: Box::new(initial),
+                initial: Box::new(left),
                 steps,
             })
         }

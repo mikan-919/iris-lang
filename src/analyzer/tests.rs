@@ -111,7 +111,7 @@ fn test_arity_mismatch_error() {
     assert!(check_result.is_err(), "Expected arity mismatch error");
     let error_msg = check_result.unwrap_err();
     assert!(
-        error_msg.contains("1 argument"),
+        error_msg.contains("got 1"),
         "Expected arity error, got: {}",
         error_msg
     );

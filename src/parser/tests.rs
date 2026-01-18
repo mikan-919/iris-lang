@@ -93,3 +93,87 @@ fn test_match_keyword_tokenization() {
         crate::lexer::TokenKind::Identifier("value".to_string())
     );
 }
+
+#[test]
+fn test_function_definition_expression_style() {
+    let code = "fn add(a: Int, b: Int) -> Int =: a + b";
+    let mut lexer = Lexer::new(code);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let result = parser.parse();
+    assert!(result.is_ok());
+    let stmts = result.unwrap();
+    assert_eq!(stmts.len(), 1);
+    match &stmts[0] {
+        crate::ast::Stmt::FunctionDefinition {
+            name,
+            is_exported,
+            params,
+            return_type,
+            body,
+        } => {
+            assert_eq!(name, "add");
+            assert!(!*is_exported);
+            assert_eq!(params.len(), 2);
+            assert_eq!(params[0].0, "a");
+            assert_eq!(params[1].0, "b");
+            assert!(matches!(return_type.normalize(), crate::ast::Type::Int));
+        }
+        _ => panic!("Expected FunctionDefinition"),
+    }
+}
+
+#[test]
+fn test_function_definition_with_pipeline() {
+    let code = r#"fn greet(name: String) -> String =: "Hello, " :: concat(name)"#;
+    let mut lexer = Lexer::new(code);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let result = parser.parse();
+    assert!(result.is_ok());
+    let stmts = result.unwrap();
+    assert_eq!(stmts.len(), 1);
+    match &stmts[0] {
+        crate::ast::Stmt::FunctionDefinition {
+            name,
+            is_exported,
+            params,
+            return_type,
+            body,
+        } => {
+            assert_eq!(name, "greet");
+            assert!(!*is_exported);
+            assert_eq!(params.len(), 1);
+            assert_eq!(params[0].0, "name");
+            assert!(matches!(return_type.normalize(), crate::ast::Type::String));
+        }
+        _ => panic!("Expected FunctionDefinition"),
+    }
+}
+
+#[test]
+fn test_function_definition_literal() {
+    let code = "fn get_constant() -> Int =: 42";
+    let mut lexer = Lexer::new(code);
+    let tokens = lexer.tokenize();
+    let mut parser = Parser::new(tokens);
+    let result = parser.parse();
+    assert!(result.is_ok());
+    let stmts = result.unwrap();
+    assert_eq!(stmts.len(), 1);
+    match &stmts[0] {
+        crate::ast::Stmt::FunctionDefinition {
+            name,
+            is_exported,
+            params,
+            return_type,
+            body,
+        } => {
+            assert_eq!(name, "get_constant");
+            assert!(!*is_exported);
+            assert_eq!(params.len(), 0);
+            assert!(matches!(return_type.normalize(), crate::ast::Type::Int));
+        }
+        _ => panic!("Expected FunctionDefinition"),
+    }
+}

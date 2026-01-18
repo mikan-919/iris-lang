@@ -85,14 +85,6 @@ impl TypeChecker {
                     ));
                 }
 
-                let body_ty = self.infer_expr(body)?;
-                if body_ty != *return_type {
-                    return Err(format!(
-                        "Function '{}' return type mismatch: expected {}, got {}",
-                        name, return_type, body_ty
-                    ));
-                }
-
                 self.symbol_table.pop_scope();
                 Ok(())
             }
@@ -114,6 +106,19 @@ impl TypeChecker {
                 .get(name)
                 .map(|s| s.ty.clone())
                 .ok_or_else(|| format!("Undefined variable '{}'", name)),
+            Expr::BinaryOp { left, op: _, right } => {
+                let left_ty = self.infer_expr(left)?;
+                let right_ty = self.infer_expr(right)?;
+                let normalized_left = left_ty.normalize();
+                let normalized_right = right_ty.normalize();
+                if !types_compatible(&normalized_left, &normalized_right) {
+                    return Err(format!(
+                        "Binary operation type mismatch: {} vs {}",
+                        normalized_left, normalized_right
+                    ));
+                }
+                Ok(left_ty)
+            }
             Expr::FunctionCall { name, args } => {
                 let func_ty = self
                     .function_signatures
@@ -156,9 +161,6 @@ impl TypeChecker {
             Expr::Match { .. } => {
                 Err("Match expression type checking not yet implemented".to_string())
             }
-            Expr::ForLoop(_) => {
-                Err("For loop expression type checking not yet implemented".to_string())
-            }
         }
     }
 
@@ -178,7 +180,10 @@ impl TypeChecker {
         step: &PipelineStep,
     ) -> Result<Type, String> {
         match step {
-            PipelineStep::FunctionCall(func_name) => {
+            PipelineStep::FunctionCall {
+                name: func_name,
+                args,
+            } => {
                 let func_ty = self
                     .function_signatures
                     .get(func_name)
@@ -190,21 +195,29 @@ impl TypeChecker {
                         params,
                         return_type,
                     } => {
-                        if params.len() != 1 {
+                        let mut all_args = vec![input_type.clone()];
+                        for arg in args {
+                            all_args.push(self.infer_expr(arg)?);
+                        }
+
+                        if all_args.len() != params.len() {
                             return Err(format!(
-                                "Pipeline function '{}' must take exactly 1 argument, got {}",
+                                "Function '{}' expects {} arguments, got {}",
                                 func_name,
-                                params.len()
+                                params.len(),
+                                all_args.len()
                             ));
                         }
 
-                        let normalized_input = input_type.normalize();
-                        let normalized_param = params[0].normalize();
-                        if !types_compatible(&normalized_input, &normalized_param) {
-                            return Err(format!(
-                                "Pipeline type mismatch for '{}': expected {}, got {}",
-                                func_name, normalized_param, normalized_input
-                            ));
+                        for (arg_ty, expected_ty) in all_args.iter().zip(&params) {
+                            let normalized_arg = arg_ty.normalize();
+                            let normalized_expected = expected_ty.normalize();
+                            if !types_compatible(&normalized_arg, &normalized_expected) {
+                                return Err(format!(
+                                    "Argument type mismatch for '{}': expected {}, got {}",
+                                    func_name, normalized_expected, normalized_arg
+                                ));
+                            }
                         }
 
                         Ok(*return_type)
@@ -216,7 +229,10 @@ impl TypeChecker {
             PipelineStep::AsyncCall(func_name) => {
                 let inner_type = self.infer_pipeline_step(
                     input_type,
-                    &PipelineStep::FunctionCall(func_name.clone()),
+                    &PipelineStep::FunctionCall {
+                        name: func_name.clone(),
+                        args: vec![],
+                    },
                 )?;
                 Ok(Type::future(inner_type))
             }

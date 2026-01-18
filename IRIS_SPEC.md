@@ -40,16 +40,22 @@ let result
 ```
 
 ### Functions
-Iris uses implicit return (last expression).
+Iris supports two styles for function definitions: Procedural Style and Expression Style.
+
+**Procedural Style** (`fn { ... }`): For complex logic with multiple statements.
 ```iris
-// Block Style (for complex logic)
 export fn calculate(input: Int) -> Int {
     let factor =: 10
     input :: * factor :: clamp(0, 100)
 }
+```
 
-// Flow Style (short-hand)
+**Expression Style** (`fn =: ...`): For simple functions that return a single expression.
+```iris
 fn double(n: Int) -> Int =: n :: * 2
+fn add(a: Int, b: Int) -> Int =: a + b
+fn greet(name: String) -> String =: "Hello, " :: concat(name)
+fn get_constant() -> Int =: 42
 ```
 
 ### Control Flow (No `if`, No `while`)
