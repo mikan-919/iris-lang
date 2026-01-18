@@ -110,7 +110,7 @@ fn test_function_definition_expression_style() {
             is_exported,
             params,
             return_type,
-            body,
+            body: _,
         } => {
             assert_eq!(name, "add");
             assert!(!*is_exported);
@@ -139,7 +139,7 @@ fn test_function_definition_with_pipeline() {
             is_exported,
             params,
             return_type,
-            body,
+            body: _,
         } => {
             assert_eq!(name, "greet");
             assert!(!*is_exported);
@@ -167,7 +167,7 @@ fn test_function_definition_literal() {
             is_exported,
             params,
             return_type,
-            body,
+            body: _,
         } => {
             assert_eq!(name, "get_constant");
             assert!(!*is_exported);
