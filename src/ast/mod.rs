@@ -8,6 +8,17 @@ pub enum BinaryOp {
     Div,
 }
 
+impl fmt::Display for BinaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BinaryOp::Add => write!(f, "+"),
+            BinaryOp::Sub => write!(f, "-"),
+            BinaryOp::Mul => write!(f, "*"),
+            BinaryOp::Div => write!(f, "/"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Int,
@@ -97,6 +108,11 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    BinaryOp {
+        left: Box<Expr>,
+        op: BinaryOp,
+        right: Box<Expr>,
+    },
     Pipeline {
         initial: Box<Expr>,
         steps: Vec<PipelineStep>,
@@ -105,7 +121,6 @@ pub enum Expr {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
     },
-    ForLoop(Box<ForLoop>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -116,7 +131,7 @@ pub enum Literal {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineStep {
-    FunctionCall(String),
+    FunctionCall { name: String, args: Vec<Expr> },
     AsyncCall(String),
     ErrorPropagate,
     Force,
@@ -221,7 +236,16 @@ impl fmt::Display for Literal {
 impl fmt::Display for PipelineStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PipelineStep::FunctionCall(name) => write!(f, "{}()", name),
+            PipelineStep::FunctionCall { name, args } => {
+                write!(f, "{}(", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
             PipelineStep::AsyncCall(name) => write!(f, ":~ {}()", name),
             PipelineStep::ErrorPropagate => write!(f, ":^"),
             PipelineStep::Force => write!(f, ":!"),
@@ -284,6 +308,9 @@ impl fmt::Display for Expr {
                 }
                 write!(f, ")")
             }
+            Expr::BinaryOp { left, op, right } => {
+                write!(f, "({} {} {})", left, op, right)
+            }
             Expr::Pipeline { initial, steps } => {
                 write!(f, "{}", initial)?;
                 for step in steps {
@@ -291,14 +318,16 @@ impl fmt::Display for Expr {
                 }
                 Ok(())
             }
-            Expr::Match { subject: _, arms } => {
-                write!(f, ":: match")?;
-                for arm in arms {
-                    write!(f, "\n   {}", arm)?;
+            Expr::Match { subject, arms } => {
+                write!(f, "match {} ", subject)?;
+                for (i, arm) in arms.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}", arm)?;
                 }
                 Ok(())
             }
-            Expr::ForLoop(for_loop) => write!(f, "{}", for_loop),
         }
     }
 }

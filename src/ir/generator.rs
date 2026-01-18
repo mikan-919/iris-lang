@@ -37,17 +37,40 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
             });
             (reg, instructions)
         }
+        Expr::BinaryOp { left, op, right } => {
+            let (left_reg, left_instrs) = generate_expr_ir(left);
+            instructions.extend(left_instrs);
+            let (right_reg, right_instrs) = generate_expr_ir(right);
+            instructions.extend(right_instrs);
+            let result_reg = format!("t{}", instructions.len());
+            instructions.push(IrInstruction::BinaryOp {
+                op: *op,
+                left: left_reg,
+                right: right_reg,
+                target: result_reg.clone(),
+            });
+            (result_reg, instructions)
+        }
         Expr::Pipeline { initial, steps } => {
             let (mut current_reg, initial_instrs) = generate_expr_ir(initial);
             instructions.extend(initial_instrs);
 
             for step in steps {
                 match step {
-                    PipelineStep::FunctionCall(func_name) => {
+                    PipelineStep::FunctionCall {
+                        name: func_name,
+                        args,
+                    } => {
+                        let mut call_args = vec![current_reg.clone()];
+                        for arg in args {
+                            let (arg_reg, arg_instrs) = generate_expr_ir(arg);
+                            instructions.extend(arg_instrs);
+                            call_args.push(arg_reg);
+                        }
                         let result_reg = format!("t{}", instructions.len());
                         instructions.push(IrInstruction::Call {
                             func_name: func_name.clone(),
-                            args: vec![current_reg.clone()],
+                            args: call_args,
                             target: result_reg.clone(),
                         });
                         current_reg = result_reg;
@@ -169,7 +192,10 @@ mod tests {
             name: "result".to_string(),
             expr: Expr::Pipeline {
                 initial: Box::new(Expr::Literal(Literal::Integer(10))),
-                steps: vec![PipelineStep::FunctionCall("double".to_string())],
+                steps: vec![PipelineStep::FunctionCall {
+                    name: "double".to_string(),
+                    args: vec![],
+                }],
             },
         };
 
@@ -266,8 +292,14 @@ mod tests {
             expr: Expr::Pipeline {
                 initial: Box::new(Expr::Literal(Literal::Integer(10))),
                 steps: vec![
-                    PipelineStep::FunctionCall("double".to_string()),
-                    PipelineStep::FunctionCall("increment".to_string()),
+                    PipelineStep::FunctionCall {
+                        name: "double".to_string(),
+                        args: vec![],
+                    },
+                    PipelineStep::FunctionCall {
+                        name: "increment".to_string(),
+                        args: vec![],
+                    },
                 ],
             },
         };
@@ -286,5 +318,60 @@ mod tests {
             call_count, 2,
             "Expected 2 Call instructions for 2 pipeline steps"
         );
+    }
+
+    #[test]
+    fn test_generate_ir_for_function_simple() {
+        let stmt = Stmt::FunctionDefinition {
+            name: "add".to_string(),
+            is_exported: false,
+            params: vec![
+                ("a".to_string(), crate::ast::Type::Simple("Int".to_string())),
+                ("b".to_string(), crate::ast::Type::Simple("Int".to_string())),
+            ],
+            return_type: crate::ast::Type::Simple("Int".to_string()),
+            body: Box::new(Expr::Literal(Literal::Integer(42))),
+        };
+
+        let ir_func = generate_ir_for_function(&stmt).unwrap();
+
+        assert_eq!(ir_func.name, "add");
+        assert!(!ir_func.is_exported);
+        assert_eq!(ir_func.params.len(), 2);
+        assert_eq!(ir_func.block.label, Some("entry".to_string()));
+        assert!(ir_func.block.instructions.len() >= 2);
+        assert!(matches!(
+            ir_func.block.instructions.last(),
+            Some(IrInstruction::Return { .. })
+        ));
+    }
+
+    #[test]
+    fn test_generate_ir_for_function_with_pipeline() {
+        let stmt = Stmt::FunctionDefinition {
+            name: "greet".to_string(),
+            is_exported: false,
+            params: vec![(
+                "name".to_string(),
+                crate::ast::Type::Simple("String".to_string()),
+            )],
+            return_type: crate::ast::Type::Simple("String".to_string()),
+            body: Box::new(Expr::Pipeline {
+                initial: Box::new(Expr::Literal(Literal::String("Hello".to_string()))),
+                steps: vec![PipelineStep::FunctionCall {
+                    name: "concat".to_string(),
+                    args: vec![Expr::Identifier("name".to_string())],
+                }],
+            }),
+        };
+
+        let ir_func = generate_ir_for_function(&stmt).unwrap();
+
+        assert_eq!(ir_func.name, "greet");
+        assert!(ir_func.block.instructions.len() >= 3);
+        assert!(matches!(
+            ir_func.block.instructions.last(),
+            Some(IrInstruction::Return { .. })
+        ));
     }
 }
