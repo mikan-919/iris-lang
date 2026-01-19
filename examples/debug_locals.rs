@@ -37,7 +37,7 @@ fn main() {
                     len_shift += 7;
                 }
 
-                let section_start = offset;
+                let _section_start = offset;
                 let section_data = &bytes[offset..offset + section_len as usize];
                 offset += section_len as usize;
 

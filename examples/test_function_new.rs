@@ -1,4 +1,4 @@
-use wasm_encoder::{CodeSection, Function, Instruction, Module, ValType};
+use wasm_encoder::{CodeSection, Function, Module, ValType};
 
 fn main() {
     // Test 1: Parameters + 3 temp locals
