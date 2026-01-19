@@ -1,30 +1,31 @@
+# Language Specification: Iris (v1.1)
 
-# Language Specification: Iris (v1.0)
-
-Iris is a Wasm-first, performance-oriented language designed for maximum readability through **Vertical Data-Flow** and **Symbolic Backbone** syntax.
+Iris は、**Vertical Data-Flow（垂直データフロー）** と **Symbolic Backbone（記号の背骨）** 構文を採用した、Wasm ファーストのシステムプログラミング言語です。
 
 ## 1. Core Principles
-*   **Verticality**: All major operations align to the left in a 2-character "backbone".
-*   **Subject-First**: Data flows from a Subject (result) through an Initiation (`=:`) into a Pipeline (`::`).
-*   **Ownership by Flow**: Ownership is moved by default as data descends the pipeline.
-*   **Operator-driven Semantics**: The operator defines the execution strategy (Async, Try, Force), keeping function names clean.
+*   **Verticality**: 主要操作を左端2文字の「背骨」に整列。
+*   **Subject-First**: 常に主語から始まり、`=:`（開始）を経て `::`（継続）へ流れる。
+*   **Flow Structure vs Procedural Block**: 
+    *   **`( )`**: **式構造 (Flow Structure)**。`match` や `join` など、値を生成しパイプラインを分岐・合流させるために使用。
+    *   **`{ }`**: **手続きブロック (Procedural Block)**。関数ボディや `mutate`、一時的な変数スコープに使用。
+*   **Operator-driven Semantics**: 演算子が実行戦略（非同期、エラー伝播、強制等）を決定。
 
 ---
 
 ## 2. The Backbone (Operators)
-All operators must be 2 characters wide to maintain the vertical visual line.
+すべての演算子は視覚的一貫性のために2文字幅とする。
 
-| Op | Name | Logic | Memory/Control Flow |
-| :--- | :--- | :--- | :--- |
-| **`=:`** | **Bind** | Assignment / Start | Moves the pipeline result into the variable. |
-| **`::`** | **Next** | Standard Map | Moves value to the next function (Sync). |
-| **`:~`** | **Await** | Async Call | Awaits the Promise/Future before proceeding. |
-| **`:^`** | **Try** | Error Propagate | Returns `Err` to caller if failed; else unwraps. |
-| **`:!`** | **Force** | Assert/Unwrap | Panics if failed; else unwraps. |
-| **`:?`** | **Catch** | Error Rescue | Branches into an error handler on `Err`. |
-| **`:|`** | **Or** | Fallback | Forwards a default value if `None`/`Err`. |
-| **`:>`** | **Tag** | Borrow/Export | Stores an immutable reference; continues flow. |
-| **`:&`** | **Join** | Tuple Merge | Flattens and appends value into a tuple. |
+| Op | Name | Logic |
+| :--- | :--- | :--- |
+| **`=:`** | **Initiate** | **開始・束縛**。プロセスを開始し、結果を名前に紐付ける。 |
+| **`::`** | **Next** | **継続**。同期的に次の関数へ値を流す。 |
+| **`:~`** | **Await** | **待機**。非同期処理の完了を待って次へ流す。 |
+| **`:^`** | **Try** | **伝播**。失敗時は即座に return、成功時は次へ。 |
+| **`:!`** | **Force** | **断定**。失敗時は Panic、成功時は Unwrap。 |
+| **`:?`** | **Catch** | **捕捉**。失敗をハンドルして別の道へ流す。 |
+| **`:|`** | **Or** | **代替** | 失敗時に右辺のデフォルト値を流す。 |
+| **`:>`** | **Tag** | **借用保存**。値を不変借用として保存し、本流は流す。 |
+| **`:&`** | **Join** | **簡易結合**。タプルに値を追加・平坦化する。 |
 
 ---
 
@@ -35,98 +36,53 @@ All operators must be 2 characters wide to maintain the vertical visual line.
 let result
 =: initialValue
 :: processA()
-:> snapshot       // Borrowed reference stored in 'snapshot'
-:: processB()     // Ownership moves to B
+:> snapshot       // 借用保存
+:: processB()      // 所有権移動
 ```
 
-### Functions
-Iris supports two styles for function definitions: Procedural Style and Expression Style.
-
-**Procedural Style** (`fn { ... }`): For complex logic with multiple statements.
+### Function Styles
 ```iris
+// Procedural Style: 手続きが必要な場合
 export fn calculate(input: Int) -> Int {
     let factor =: 10
     input :: * factor :: clamp(0, 100)
 }
-```
 
-**Expression Style** (`fn =: ...`): For simple functions that return a single expression.
-```iris
+// Expression Style: 結果を直接定義する場合 (短縮形)
 fn double(n: Int) -> Int =: n :: * 2
 fn add(a: Int, b: Int) -> Int =: a + b
-fn greet(name: String) -> String =: "Hello, " :: concat(name)
-fn get_constant() -> Int =: 42
 ```
 
-### Control Flow (No `if`, No `while`)
-**Match** (No arrows `=>`, use `::`)
+### Control Flow (Flow Structures)
+分岐と合流には **`( )`** を使い、各枝の開始は必ず **`=:`** で明示する。これにより「始まり」と「終わり」を視覚化する。
+
+**Match (Branching)**
 ```iris
-:: match
-   | PatternA :: handleA()
-   | PatternB :: handleB()
-   | _        :! "Error message"
+let status
+=: getResponse()
+:: match (
+   Ok(user) =:      // 始まり: パターン =:
+      :: process(user)
+      :: serialize()
+   
+   Err(e) =:        // 始まり: パターン =:
+      :: log(e)
+      :| "Error"
+) // 終わり: ) で閉じ、背骨のメインラインに戻る
+:: print()
 ```
 
-**Loops** (`@` denotes "at" the collection)
-```iris
-// Threading Loop (State stays as subject, iterates over external source)
-canvas :: for shape@shapes :: draw(shape)
-
-// Exploding Loop (Consumes and unpacks subject)
-users :: for user :: process(user)
-```
-
-**Parallelism / Tuple Construction**
+**Parallelism / Tuple Construction (Join)**
 ```iris
 :: (
-   | :: count()           // Fork from parent subject
-   | "Label" :: toUpper() // Gather from new source
-) // Results in (Int, String)
+   | :: count()           // 親の値を主語として開始
+   | =: "Label" :: upper() // 独立した値から開始
+) // 結果は (Int, String) のタプル。 ) で合流。
 ```
 
 ---
 
-## 4. Ownership & Memory Model
-Iris is GC-free by default, using Linear Types and Flow Analysis.
-
-*   **Move by Default**: Passing a non-`Copy` value to `::` moves ownership.
-*   **Mutation**: Only allowed within `:: mutate { self.x = 1 }` blocks.
-*   **Borrowing**: Occurs via `:>` or when passing values to loop sources (the `@` part).
-*   **Shared Ownership**: Opt-in via `:: share()` which wraps value in an `Rc<T>`.
-
----
-
-## 5. Data Structures
-```iris
-struct User {
-    id: Int
-    name: String
-}
-
-enum Status
-| Active
-| Banned(String)
-| Pending { since: Date }
-```
-
----
-
-## 6. FFI & Modules
-*   **Import**: Standard JS-like syntax `import { x } from "mod"`.
-*   **Export**: Prefix with `export`. No `default export`.
-*   **Binding**: Functions can bind directly to host symbols via string literals.
-
-```iris
-export fn alert(msg: String) =: "window.alert"
-```
-
----
-
-## 7. Compiler Requirements (Internal)
-*   **Target**: WebAssembly (Wasm).
-*   **Frontend**: Parser must handle 2-char backbone and indentation for `match`/`for`/`join`.
-*   **Analysis**:
-    1. Hindley-Milner Type Inference.
-    2. Data-flow Ownership Tracking (prevent double-use).
-    3. Escape Analysis for Stack-to-Heap promotion.
-*   **Optimizations**: Refcount elision, Inline monomorphization, Wasm SIMD.
+## 4. Ownership & Mutation
+*   **Move by Default**: `::` を通るたびに所有権は移動。
+*   **Mutation**: `:: mutate { self.x = 1 }` ブロック内のみ許可。
+*   **Borrowing**: `:>` によるタグ付け、または `for` ループの `@` ソース。
