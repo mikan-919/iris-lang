@@ -48,6 +48,8 @@ pub enum IrInstruction {
 pub struct IrFunction {
     pub name: String,
     pub is_exported: bool,
+    pub is_external: bool,
+    pub external_name: Option<String>,
     pub params: Vec<(String, Type)>,
     pub return_type: Type,
     pub block: BasicBlock,

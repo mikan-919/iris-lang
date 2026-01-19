@@ -86,6 +86,8 @@ fn add_main_function(ir_module: &mut IrModule) -> Result<(), String> {
         let main_func = IrFunction {
             name: "main".to_string(),
             is_exported: true,
+            is_external: false,
+            external_name: None,
             params: vec![],
             return_type: Type::Int,
             block,

@@ -34,6 +34,7 @@ impl TypeChecker {
                 name,
                 params,
                 return_type,
+                body,
                 ..
             } = stmt
             {
@@ -41,9 +42,16 @@ impl TypeChecker {
                     params: params.iter().map(|(_, t)| t.clone()).collect(),
                     return_type: Box::new(return_type.clone()),
                 };
-                self.function_signatures
-                    .insert(name.clone(), func_type.clone());
-                self.symbol_table.define(name.clone(), func_type, true);
+
+                if matches!(body, crate::ast::FunctionBody::External(_)) {
+                    self.function_signatures
+                        .insert(name.clone(), func_type.clone());
+                    self.symbol_table.define_external(name.clone(), func_type);
+                } else {
+                    self.function_signatures
+                        .insert(name.clone(), func_type.clone());
+                    self.symbol_table.define(name.clone(), func_type, true);
+                }
             }
         }
 
@@ -68,6 +76,10 @@ impl TypeChecker {
                 return_type,
                 body,
             } => {
+                if matches!(body, crate::ast::FunctionBody::External(_)) {
+                    return Ok(());
+                }
+
                 self.symbol_table.push_scope();
 
                 for (param_name, param_type) in params {
@@ -81,8 +93,9 @@ impl TypeChecker {
                         for stmt in stmts {
                             self.check_stmt(stmt)?;
                         }
-                        Type::Unit // Blocks return unit unless last stmt is expr
+                        Type::Unit
                     }
+                    FunctionBody::External(_) => unreachable!(),
                 };
                 let normalized_return_type = return_type.normalize();
                 let normalized_body_ty = body_ty.normalize();
@@ -96,6 +109,7 @@ impl TypeChecker {
                 self.symbol_table.pop_scope();
                 Ok(())
             }
+            Stmt::ImportStatement { .. } => Ok(()),
             Stmt::MatchStatement(_) => {
                 Err("Match statement type checking not yet implemented".to_string())
             }

@@ -92,8 +92,24 @@ async function runWasm() {
 
     try {
         const wasmModule = await WebAssembly.compile(window.latestWasmBytes);
-        const wasmInstance = await WebAssembly.instantiate(wasmModule);
-        
+
+        const importObject = {
+            env: {
+                console: {
+                    log: (arg) => {
+                        console.log(arg);
+                        log(`console.log called with: ${arg}`, 'success');
+                    }
+                },
+                alert: (msg) => {
+                    alert(msg);
+                    log(`alert called with: ${msg}`, 'success');
+                }
+            }
+        };
+
+        const wasmInstance = await WebAssembly.instantiate(wasmModule, importObject);
+
         if (wasmInstance.exports.main) {
             const result = wasmInstance.exports.main();
             log(`WASM main() returned: ${result}`, 'success');
@@ -103,10 +119,10 @@ async function runWasm() {
         } else {
             log('WASM loaded but no entry point found (main or _start)', 'error');
         }
-        
+
         const exports = Object.keys(wasmInstance.exports);
         log(`Available exports: ${exports.join(', ')}`);
-        
+
     } catch (error) {
         log(`WASM execution failed: ${error.message}`, 'error');
     } finally {
@@ -133,14 +149,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (initialized) {
         log('Ready to compile Iris code!', 'success');
         
-        codeEditor.value = `// Example: Simple addition function
-fn add(a: Int, b: Int) -> Int =: a + b
+        codeEditor.value = `// Example: FFI call to console.log
+import { log } from "host"
 
-// Example: Pipeline calculation
-let result
-=: 42
-:: * 2
-:: + 10
-// result should be 94`;
+fn print_int(n: Int) =: "console.log"
+
+export fn main() {
+    42 :: print_int()
+}
+// This should print 42 to the browser console`;
     }
 });

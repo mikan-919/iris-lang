@@ -155,25 +155,44 @@ pub fn generate_ir_for_function(stmt: &Stmt) -> Result<IrFunction, String> {
         body,
     } = stmt
     {
-        let (result_reg, mut instructions) = match body {
-            FunctionBody::Expression(expr) => generate_expr_ir_with_offset(expr, 0),
+        match body {
+            FunctionBody::External(external) => {
+                let block = BasicBlock {
+                    label: Some("entry".to_string()),
+                    instructions: vec![],
+                };
+
+                Ok(IrFunction {
+                    name: name.clone(),
+                    is_exported: *is_exported,
+                    is_external: true,
+                    external_name: Some(external.clone()),
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                    block,
+                })
+            }
+            FunctionBody::Expression(expr) => {
+                let (result_reg, mut instructions) = generate_expr_ir_with_offset(expr, 0);
+                instructions.push(IrInstruction::Return { reg: result_reg });
+
+                let block = BasicBlock {
+                    label: Some("entry".to_string()),
+                    instructions,
+                };
+
+                Ok(IrFunction {
+                    name: name.clone(),
+                    is_exported: *is_exported,
+                    is_external: false,
+                    external_name: None,
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                    block,
+                })
+            }
             FunctionBody::Block(_) => todo!("Block body IR generation"),
-        };
-
-        instructions.push(IrInstruction::Return { reg: result_reg });
-
-        let block = BasicBlock {
-            label: Some("entry".to_string()),
-            instructions,
-        };
-
-        Ok(IrFunction {
-            name: name.clone(),
-            is_exported: *is_exported,
-            params: params.clone(),
-            return_type: return_type.clone(),
-            block,
-        })
+        }
     } else {
         Err("Expected FunctionDefinition".to_string())
     }

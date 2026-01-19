@@ -54,6 +54,7 @@ impl Parser {
                 }
             }
             TokenKind::Fn => self.parse_function_definition(false),
+            TokenKind::Import => self.parse_import_statement(),
             TokenKind::LBrace => self.parse_block(),
             TokenKind::For => {
                 self.advance();
@@ -74,6 +75,38 @@ impl Parser {
         let expr = self.parse_expression()?;
 
         Ok(Stmt::Binding { name, expr })
+    }
+
+    fn parse_import_statement(&mut self) -> Result<Stmt, String> {
+        self.consume(TokenKind::Import, "expected 'import'")?;
+
+        self.consume(TokenKind::LBrace, "expected '{{' after 'import'")?;
+
+        let mut names = Vec::new();
+        if !self.check(TokenKind::RBrace) {
+            loop {
+                let name = self.consume_identifier()?;
+                names.push(name);
+                if !self.match_token(TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+
+        self.consume(TokenKind::RBrace, "expected '}}' after import names")?;
+        self.consume(TokenKind::From, "expected 'from' after import list")?;
+
+        let module = if let TokenKind::String(module) = self.peek().kind.clone() {
+            self.advance();
+            module
+        } else {
+            return Err(format!(
+                "expected module string after 'from', found {}",
+                self.peek()
+            ));
+        };
+
+        Ok(Stmt::ImportStatement { names, module })
     }
 
     fn peek_ahead(&self, n: usize) -> Option<&Token> {

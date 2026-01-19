@@ -1,8 +1,8 @@
 use crate::ast::{BinaryOp, Expr, Literal, Type};
 use crate::ir::{BasicBlock, IrFunction, IrInstruction, IrModule};
 use wasm_encoder::{
-    CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
-    TypeSection, ValType,
+    CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection, ImportSection,
+    Instruction, Module, TypeSection, ValType,
 };
 
 #[derive(Debug, Clone)]
@@ -27,27 +27,51 @@ impl WasmGenerator {
         }
         module.section(&types);
 
+        let mut imports = ImportSection::new();
+        let mut func_index: u32 = 0;
+        for func in &ir_module.functions {
+            if func.is_external {
+                if let Some(external_name) = &func.external_name {
+                    imports.import("env", external_name, EntityType::Function(func_index));
+                    self.type_indices.insert(func.name.clone(), func_index);
+                    func_index += 1;
+                }
+            } else {
+                self.type_indices.insert(func.name.clone(), func_index);
+                func_index += 1;
+            }
+        }
+        module.section(&imports);
+
         let mut functions = FunctionSection::new();
         for func in &ir_module.functions {
-            let type_idx = *self
-                .type_indices
-                .get(&func.name)
-                .ok_or_else(|| format!("Type index not found for function: {}", func.name))?;
-            functions.function(type_idx);
+            if !func.is_external {
+                let type_idx = *self
+                    .type_indices
+                    .get(&func.name)
+                    .ok_or_else(|| format!("Type index not found for function: {}", func.name))?;
+                functions.function(type_idx);
+            }
         }
         module.section(&functions);
 
         let mut exports = ExportSection::new();
         for (idx, func) in ir_module.functions.iter().enumerate() {
             if func.is_exported {
-                exports.export(&func.name, ExportKind::Func, idx as u32);
+                let func_idx = *self
+                    .type_indices
+                    .get(&func.name)
+                    .ok_or_else(|| format!("Type index not found for function: {}", func.name))?;
+                exports.export(&func.name, ExportKind::Func, func_idx);
             }
         }
         module.section(&exports);
 
         let mut codes = CodeSection::new();
         for func in &ir_module.functions {
-            self.encode_function_body(&mut codes, func)?;
+            if !func.is_external {
+                self.encode_function_body(&mut codes, func)?;
+            }
         }
         module.section(&codes);
 
@@ -356,6 +380,8 @@ mod tests {
         let func = IrFunction {
             name: "add".to_string(),
             is_exported: true,
+            is_external: false,
+            external_name: None,
             params: vec![("a".to_string(), Type::Int), ("b".to_string(), Type::Int)],
             return_type: Type::Int,
             block,
@@ -385,9 +411,11 @@ mod tests {
         });
 
         let func = IrFunction {
-            name: "return_const".to_string(),
+            name: "add".to_string(),
             is_exported: true,
-            params: vec![("a".to_string(), Type::Int)],
+            is_external: false,
+            external_name: None,
+            params: vec![("a".to_string(), Type::Int), ("b".to_string(), Type::Int)],
             return_type: Type::Int,
             block,
         };
@@ -436,6 +464,8 @@ mod tests {
         let func1 = IrFunction {
             name: "identity".to_string(),
             is_exported: true,
+            is_external: false,
+            external_name: None,
             params: vec![("a".to_string(), Type::Int)],
             return_type: Type::Int,
             block: block1,
@@ -449,6 +479,8 @@ mod tests {
         let func2 = IrFunction {
             name: "identity2".to_string(),
             is_exported: true,
+            is_external: false,
+            external_name: None,
             params: vec![("x".to_string(), Type::Int)],
             return_type: Type::Int,
             block: block2,
@@ -486,6 +518,8 @@ mod tests {
         let func = IrFunction {
             name: "add".to_string(),
             is_exported: true,
+            is_external: false,
+            external_name: None,
             params: vec![("a".to_string(), Type::Int), ("b".to_string(), Type::Int)],
             return_type: Type::Int,
             block,

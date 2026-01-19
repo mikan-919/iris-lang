@@ -161,6 +161,7 @@ pub enum MatchArm {
 #[derive(Debug, Clone, PartialEq)]
 pub enum FunctionBody {
     Expression(Box<Expr>),
+    External(String),
     Block(Vec<Stmt>),
 }
 
@@ -185,6 +186,10 @@ pub enum Stmt {
         params: Vec<(String, Type)>,
         return_type: Type,
         body: FunctionBody,
+    },
+    ImportStatement {
+        names: Vec<String>,
+        module: String,
     },
     Block(Vec<Stmt>),
     MatchStatement(Box<Expr>),
@@ -400,6 +405,7 @@ impl fmt::Display for Stmt {
                 write!(f, ") -> {} ", return_type)?;
                 match body {
                     FunctionBody::Expression(expr) => write!(f, "= {}", expr),
+                    FunctionBody::External(external) => write!(f, "=: \"{}\"", external),
                     FunctionBody::Block(stmts) => {
                         write!(f, "{{")?;
                         for stmt in stmts {
@@ -408,6 +414,16 @@ impl fmt::Display for Stmt {
                         write!(f, " }}")
                     }
                 }
+            }
+            Stmt::ImportStatement { names, module } => {
+                write!(f, "import {{ ")?;
+                for (i, name) in names.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", name)?;
+                }
+                write!(f, " }} from \"{}\"", module)
             }
             Stmt::Block(stmts) => {
                 write!(f, "{{")?;

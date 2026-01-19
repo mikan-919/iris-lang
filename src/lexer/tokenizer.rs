@@ -184,6 +184,8 @@ impl<'a> Lexer<'a> {
                         "export" => TokenKind::Export,
                         "match" => TokenKind::Match,
                         "for" => TokenKind::For,
+                        "import" => TokenKind::Import,
+                        "from" => TokenKind::From,
                         _ => TokenKind::Identifier(ident),
                     };
                     tokens.push(Token::new(kind, self.line, self.column));
