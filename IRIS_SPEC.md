@@ -10,9 +10,15 @@ Iris は、**Vertical Data-Flow（垂直データフロー）** と **Symbolic B
     *   **`{ }`**: **手続きブロック (Procedural Block)**。関数ボディや `mutate`、一時的な変数スコープに使用。
 *   **Operator-driven Semantics**: 演算子が実行戦略（非同期、エラー伝播、強制等）を決定。
 
+## 2. Comments
+Iris のコメントは、垂直方向の読みやすさを維持するよう設計されている。
+*   **`//`**: 行コメント。2文字の幅はバックボーン演算子と一致し、パイプラインのステップを無効化しても視覚的な「背骨」が崩れない。
+*   **`///`**: ドキュメントコメント。エクスポートされる関数や型の説明に使用される。
+*   **`/* */`**: ブロックコメント。複数行のロジックを一時的に除外する際に使用される。
+
 ---
 
-## 2. The Backbone (Operators)
+## 3. The Backbone (Operators)
 すべての演算子は視覚的一貫性のために2文字幅とする。
 
 | Op | Name | Logic |
@@ -29,7 +35,7 @@ Iris は、**Vertical Data-Flow（垂直データフロー）** と **Symbolic B
 
 ---
 
-## 3. Syntax & Structure
+## 4. Syntax & Structure
 
 ### Pipeline Definition
 ```iris
@@ -82,7 +88,7 @@ let status
 
 ---
 
-## 4. Ownership & Mutation
+## 5. Ownership & Mutation
 *   **Move by Default**: `::` を通るたびに所有権は移動。
 *   **Mutation**: `:: mutate { self.x = 1 }` ブロック内のみ許可。
 *   **Borrowing**: `:>` によるタグ付け、または `for` ループの `@` ソース。

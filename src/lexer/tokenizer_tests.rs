@@ -98,3 +98,126 @@ fn test_minus_distinguishes_from_arrow() {
     assert_eq!(tokens[3].kind, TokenKind::Arrow);
     assert_eq!(tokens[4].kind, TokenKind::Identifier("z".to_string()));
 }
+
+#[test]
+fn test_line_comment() {
+    let mut lexer = Lexer::new("let x =: 10 // this is a comment");
+    let tokens = lexer.tokenize();
+    assert_eq!(tokens[0].kind, TokenKind::Let);
+    assert_eq!(tokens[1].kind, TokenKind::Identifier("x".to_string()));
+    assert_eq!(tokens[2].kind, TokenKind::Bind);
+    assert_eq!(tokens[3].kind, TokenKind::Integer(10));
+    assert_eq!(
+        tokens[4].kind,
+        TokenKind::LineComment(" this is a comment".to_string())
+    );
+}
+
+#[test]
+fn test_line_comment_at_end_of_line() {
+    let mut lexer = Lexer::new("// comment only\nlet x =: 5");
+    let tokens = lexer.tokenize();
+    assert_eq!(
+        tokens[0].kind,
+        TokenKind::LineComment(" comment only".to_string())
+    );
+    assert_eq!(tokens[1].kind, TokenKind::Let);
+    assert_eq!(tokens[2].kind, TokenKind::Identifier("x".to_string()));
+}
+
+#[test]
+fn test_doc_comment() {
+    let mut lexer = Lexer::new("/// This is a doc comment\nlet x =: 10");
+    let tokens = lexer.tokenize();
+    assert_eq!(
+        tokens[0].kind,
+        TokenKind::DocComment(" This is a doc comment".to_string())
+    );
+    assert_eq!(tokens[1].kind, TokenKind::Let);
+    assert_eq!(tokens[2].kind, TokenKind::Identifier("x".to_string()));
+}
+
+#[test]
+fn test_doc_comment_content() {
+    let mut lexer = Lexer::new("/// Calculates the sum of two numbers");
+    let tokens = lexer.tokenize();
+    assert_eq!(
+        tokens[0].kind,
+        TokenKind::DocComment(" Calculates the sum of two numbers".to_string())
+    );
+}
+
+#[test]
+fn test_block_comment() {
+    let mut lexer = Lexer::new("/* This is a block comment */\nlet x =: 10");
+    let tokens = lexer.tokenize();
+    assert_eq!(
+        tokens[0].kind,
+        TokenKind::BlockComment(" This is a block comment ".to_string())
+    );
+    assert_eq!(tokens[1].kind, TokenKind::Let);
+    assert_eq!(tokens[2].kind, TokenKind::Identifier("x".to_string()));
+}
+
+#[test]
+fn test_block_comment_multiline() {
+    let mut lexer = Lexer::new("/* This is a\nmultiline\nblock comment */\nlet x =: 10");
+    let tokens = lexer.tokenize();
+    assert_eq!(
+        tokens[0].kind,
+        TokenKind::BlockComment(" This is a\nmultiline\nblock comment ".to_string())
+    );
+    assert_eq!(tokens[1].kind, TokenKind::Let);
+}
+
+#[test]
+fn test_block_comment_inline() {
+    let mut lexer = Lexer::new("let x =: 10 /* inline comment */ :: double()");
+    let tokens = lexer.tokenize();
+    assert_eq!(tokens[0].kind, TokenKind::Let);
+    assert_eq!(tokens[1].kind, TokenKind::Identifier("x".to_string()));
+    assert_eq!(tokens[2].kind, TokenKind::Bind);
+    assert_eq!(tokens[3].kind, TokenKind::Integer(10));
+    assert_eq!(
+        tokens[4].kind,
+        TokenKind::BlockComment(" inline comment ".to_string())
+    );
+    assert_eq!(tokens[5].kind, TokenKind::Next);
+}
+
+#[test]
+fn test_empty_block_comment() {
+    let mut lexer = Lexer::new("/**/\nlet x =: 10");
+    let tokens = lexer.tokenize();
+    assert_eq!(tokens[0].kind, TokenKind::BlockComment("".to_string()));
+    assert_eq!(tokens[1].kind, TokenKind::Let);
+}
+
+#[test]
+fn test_mixed_comments() {
+    let mut lexer =
+        Lexer::new("/// Doc comment\n// Line comment\n/* Block comment */\nlet x =: 10");
+    let tokens = lexer.tokenize();
+    assert_eq!(
+        tokens[0].kind,
+        TokenKind::DocComment(" Doc comment".to_string())
+    );
+    assert_eq!(
+        tokens[1].kind,
+        TokenKind::LineComment(" Line comment".to_string())
+    );
+    assert_eq!(
+        tokens[2].kind,
+        TokenKind::BlockComment(" Block comment ".to_string())
+    );
+    assert_eq!(tokens[3].kind, TokenKind::Let);
+}
+
+#[test]
+fn test_slash_without_comment() {
+    let mut lexer = Lexer::new("10 / 2");
+    let tokens = lexer.tokenize();
+    assert_eq!(tokens[0].kind, TokenKind::Integer(10));
+    assert_eq!(tokens[1].kind, TokenKind::Slash);
+    assert_eq!(tokens[2].kind, TokenKind::Integer(2));
+}

@@ -68,7 +68,43 @@ impl<'a> Lexer<'a> {
                 }
                 '/' => {
                     self.advance();
-                    tokens.push(Token::new(TokenKind::Slash, self.line, self.column));
+                    // Check for comments
+                    match self.peek() {
+                        Some('/') => {
+                            self.advance(); // consume second /
+                            // Check for doc comment
+                            let is_doc = self.peek() == Some('/');
+                            if is_doc {
+                                self.advance(); // consume third /
+                            }
+                            let comment = self.read_line_comment_content();
+                            if is_doc {
+                                tokens.push(Token::new(
+                                    TokenKind::DocComment(comment),
+                                    self.line,
+                                    self.column,
+                                ));
+                            } else {
+                                tokens.push(Token::new(
+                                    TokenKind::LineComment(comment),
+                                    self.line,
+                                    self.column,
+                                ));
+                            }
+                        }
+                        Some('*') => {
+                            self.advance(); // consume *
+                            let comment = self.read_block_comment_content();
+                            tokens.push(Token::new(
+                                TokenKind::BlockComment(comment),
+                                self.line,
+                                self.column,
+                            ));
+                        }
+                        _ => {
+                            tokens.push(Token::new(TokenKind::Slash, self.line, self.column));
+                        }
+                    }
                 }
                 '-' => {
                     self.advance();
@@ -211,6 +247,38 @@ impl<'a> Lexer<'a> {
             }
         }
         ident
+    }
+
+    fn read_line_comment_content(&mut self) -> String {
+        let mut comment = String::new();
+        while let Some(ch) = self.peek() {
+            if ch != '\n' {
+                comment.push(ch);
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        comment
+    }
+
+    fn read_block_comment_content(&mut self) -> String {
+        let mut comment = String::new();
+        while let Some(ch) = self.peek() {
+            if ch == '*' {
+                self.advance(); // consume *
+                if self.peek() == Some('/') {
+                    self.advance(); // consume /
+                    break;
+                } else {
+                    comment.push('*');
+                }
+            } else {
+                comment.push(ch);
+                self.advance();
+            }
+        }
+        comment
     }
 
     fn error(&self, msg: &str) {

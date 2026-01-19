@@ -22,7 +22,12 @@ impl Parser {
             if let TokenKind::EOF = self.peek().kind {
                 break;
             }
-            if let TokenKind::Whitespace | TokenKind::Newline = self.peek().kind {
+            if let TokenKind::Whitespace
+            | TokenKind::Newline
+            | TokenKind::LineComment(_)
+            | TokenKind::DocComment(_)
+            | TokenKind::BlockComment(_) = self.peek().kind
+            {
                 self.advance();
                 continue;
             }
@@ -120,7 +125,12 @@ impl Parser {
         let mut statements = Vec::new();
 
         while !self.is_at_end() {
-            if let TokenKind::Whitespace | TokenKind::Newline = self.peek().kind {
+            if let TokenKind::Whitespace
+            | TokenKind::Newline
+            | TokenKind::LineComment(_)
+            | TokenKind::DocComment(_)
+            | TokenKind::BlockComment(_) = self.peek().kind
+            {
                 self.advance();
                 continue;
             }
@@ -183,7 +193,12 @@ impl Parser {
         let body = if self.match_token(TokenKind::LBrace) {
             let mut statements = Vec::new();
             while !self.check(TokenKind::RBrace) && !self.is_at_end() {
-                if let TokenKind::Whitespace | TokenKind::Newline = self.peek().kind {
+                if let TokenKind::Whitespace
+                | TokenKind::Newline
+                | TokenKind::LineComment(_)
+                | TokenKind::DocComment(_)
+                | TokenKind::BlockComment(_) = self.peek().kind
+                {
                     self.advance();
                     continue;
                 }
