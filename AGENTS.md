@@ -36,32 +36,65 @@ WASM-first Rust compiler for Iris language (36% complete). Library-only crate (c
 
 ## Development Workflow & Branching Strategy
 
-Irisプロジェクトでは、**Trunk-Based Development (TBD)** と **GitHub Flow** を組み合わせた戦略を採用します。
+**Strategy**: Trunk-Based Development + GitHub Flow
 
-### 1. Branch Roles
-- `main`: 安定版ブランチ。マイルストーン達成時のみ `dev` からマージされる。直接のコミットは禁止。
-- `dev`: 開発の本流（Trunk）。全ての機能開発はこのブランチを起点とし、ここへのマージを目指す。常にテストがパスしている必要がある。
-- `feature/#<issue>-<desc>`/`vk/<random>-<desc>`: 短寿命な作業ブランチ。寿命は1〜2日とし、完了後は速やかに `dev` へマージする。
+### Branches
+| Branch | Purpose | Rules |
+|--------|---------|-------|
+| `main` | Stable releases | Merged from `dev` only. No direct commits |
+| `dev` | Development trunk | Always test-passing. All feature branches target this |
+| `feat/<description>` | Task work | Created from `dev` for any code changes. Short-lived |
 
-### 2. Implementation Steps (Mandatory)
-タスクを実行する際、エージェントは必ず以下のステップを踏むこと：
+---
 
-1.  Issueの作成: `gh issue create` を使用し、タスクを最小単位にIssue化する。
-2.  ブランチの作成: `dev` ブランチから `feature/#<Issue番号>-<概要>` ブランチを作成し、切り替える。
-    - もし現在居るブランチが`vk/~`であれば、新しくブランチを作成する必要はありません。
-3.  インクリメンタルな開発:
-    - 小さな単位で実装とテストを繰り返す。
-    - コミットメッセージは Conventional Commits (`feat:`, `fix:`, `test:`, `refactor:`) に従う。
-4.  Pull Request (PR) の作成:
-    - 実装完了後、`gh pr create` を使用して `dev` ブランチへのPRを作成する。
-    - PRの説明には「何を解決したか」「どのテストをパスしたか」を記述する。
-5.  マージ後のクリーンアップ: PRがマージされたことをユーザーから受け取ったら、ローカルおよびリモートの作業ブランチを削除する。
+### Task Execution Flow (MANDATORY)
 
-### 3. Coding Standards
-- Small Changes: 1つのPRで巨大な機能を実装しない。レビュー可能なサイズに分割する。
-  - これはユーザーから指示されたタスクが大きすぎる場合に勝手に小さいPRにすることを許可することを意味する。
-- Test-Driven: 新機能には必ず対応するテストを含め、既存のテストを壊していないことを確認する。
-- Doc-Sync: 言語仕様（`IRIS_SPEC.md`）に変更が及ぶ場合、必ずドキュメントも同時に更新する。
+For any task that involves code changes:
+
+```
+1. CHECKOUT → 2. DEVELOP → 3. PUSH → 4. CREATE PR → 5. CLEANUP (after merge)
+```
+
+#### Step 1: Create Feature Branch
+```bash
+git checkout dev
+git pull origin dev
+git checkout -b feat/<description>
+```
+
+#### Step 2: Develop Incrementally
+- Work in small, testable units
+- Commit frequently with Conventional Commits: `feat:`, `fix:`, `test:`, `refactor:`
+- Run tests after meaningful changes
+
+#### Step 3: Push Branch
+```bash
+git push -u origin feat/<description>
+```
+
+#### Step 4: Create PR to `dev`
+```bash
+gh pr create --base dev
+```
+PR description must include:
+- What was solved
+- Which tests pass
+
+#### Step 5: Cleanup (after user confirms merge)
+```bash
+git checkout dev
+git pull origin dev
+git branch -D feat/<description>
+git push origin --delete feat/<description>
+```
+
+---
+
+### Coding Standards
+
+- **Small PRs**: Split large tasks into reviewable chunks. If user asks for too much at once, break it down yourself.
+- **Test-Driven**: New features require tests. Verify existing tests still pass.
+- **Doc-Sync**: If `IRIS_SPEC.md` is affected, update documentation together with code.
 
 ## CONVENTIONS
 - Library-only crate: no main.rs
