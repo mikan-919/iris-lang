@@ -75,7 +75,15 @@ impl TypeChecker {
                         .define(param_name.clone(), param_type.clone(), false);
                 }
 
-                let body_ty = self.infer_expr(body)?;
+                let body_ty = match body {
+                    FunctionBody::Expression(expr) => self.infer_expr(expr)?,
+                    FunctionBody::Block(stmts) => {
+                        for stmt in stmts {
+                            self.check_stmt(stmt)?;
+                        }
+                        Type::Unit // Blocks return unit unless last stmt is expr
+                    }
+                };
                 let normalized_return_type = return_type.normalize();
                 let normalized_body_ty = body_ty.normalize();
                 if !types_compatible(&normalized_body_ty, &normalized_return_type) {
@@ -90,6 +98,12 @@ impl TypeChecker {
             }
             Stmt::MatchStatement(_) => {
                 Err("Match statement type checking not yet implemented".to_string())
+            }
+            Stmt::Block(stmts) => {
+                for stmt in stmts {
+                    self.check_stmt(stmt)?;
+                }
+                Ok(())
             }
             Stmt::ForLoopStatement(_) => {
                 Err("For loop statement type checking not yet implemented".to_string())
@@ -160,6 +174,17 @@ impl TypeChecker {
             Expr::Pipeline { initial, steps } => self.infer_pipeline(initial, steps),
             Expr::Match { .. } => {
                 Err("Match expression type checking not yet implemented".to_string())
+            }
+            Expr::Block(stmts) => {
+                for stmt in stmts {
+                    self.check_stmt(stmt)?;
+                }
+                Ok(Type::Unit)
+            }
+            Expr::Join(exprs) => {
+                let types: Result<Vec<Type>, String> =
+                    exprs.iter().map(|e| self.infer_expr(e)).collect();
+                Ok(Type::Tuple(types?))
             }
         }
     }

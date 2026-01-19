@@ -1,4 +1,5 @@
-use crate::ast::{Expr, Literal, MatchArm, PipelineStep, Stmt, Type};
+use crate::ast::FunctionBody;
+use crate::ast::{Expr, Literal, MatchArm, Pattern, PipelineStep, Stmt, Type};
 use crate::lexer::{Token, TokenKind};
 
 #[cfg(test)]
@@ -48,6 +49,7 @@ impl Parser {
                 }
             }
             TokenKind::Fn => self.parse_function_definition(false),
+            TokenKind::LBrace => self.parse_block(),
             TokenKind::For => {
                 self.advance();
                 let for_loop = self.parse_for_loop()?;
@@ -67,6 +69,82 @@ impl Parser {
         let expr = self.parse_expression()?;
 
         Ok(Stmt::Binding { name, expr })
+    }
+
+    fn peek_ahead(&self, n: usize) -> Option<&Token> {
+        self.tokens.get(self.current + n)
+    }
+
+    fn parse_join(&mut self) -> Result<Expr, String> {
+        self.consume(TokenKind::LParen, "expected '('")?;
+        self.consume(TokenKind::Pipe, "expected '|'")?;
+        let mut exprs = Vec::new();
+        exprs.push(self.parse_expression()?);
+        while self.match_token(TokenKind::Pipe) {
+            exprs.push(self.parse_expression()?);
+        }
+        self.consume(TokenKind::RParen, "expected ')'")?;
+        Ok(Expr::Join(exprs))
+    }
+
+    fn parse_pattern(&mut self) -> Result<Pattern, String> {
+        match self.peek().kind.clone() {
+            TokenKind::Identifier(name) => {
+                self.advance();
+                if self.match_token(TokenKind::LParen) {
+                    let mut args = Vec::new();
+                    if !self.check(TokenKind::RParen) {
+                        loop {
+                            args.push(self.parse_pattern()?);
+                            if !self.match_token(TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    self.consume(TokenKind::RParen, "expected ')'")?;
+                    Ok(Pattern::Constructor { name, args })
+                } else {
+                    Ok(Pattern::Identifier(name))
+                }
+            }
+            TokenKind::Integer(n) => {
+                self.advance();
+                Ok(Pattern::Literal(Literal::Integer(n)))
+            }
+            _ => Err(format!("expected pattern, found {}", self.peek())),
+        }
+    }
+
+    fn parse_block(&mut self) -> Result<Stmt, String> {
+        self.consume(TokenKind::LBrace, "expected '{'")?;
+        let mut statements = Vec::new();
+
+        while !self.is_at_end() {
+            if let TokenKind::Whitespace | TokenKind::Newline = self.peek().kind {
+                self.advance();
+                continue;
+            }
+            if self.check(TokenKind::RBrace) {
+                break;
+            }
+            if self.check(TokenKind::Let)
+                || self.check(TokenKind::Fn)
+                || self.check(TokenKind::For)
+                || self.check(TokenKind::Export)
+            {
+                let stmt = self.parse_statement()?;
+                statements.push(stmt);
+            } else {
+                let expr = self.parse_expression()?;
+                statements.push(Stmt::Binding {
+                    name: "_".to_string(),
+                    expr,
+                });
+            }
+        }
+
+        self.consume(TokenKind::RBrace, "expected '}'")?;
+        Ok(Stmt::Block(statements))
     }
 
     fn parse_function_definition(&mut self, is_exported: bool) -> Result<Stmt, String> {
@@ -95,27 +173,60 @@ impl Parser {
 
         self.consume(TokenKind::RParen, "expected ')'")?;
 
-        self.consume(TokenKind::Arrow, "expected '->'")?;
+        let return_type = if self.match_token(TokenKind::Arrow) {
+            let return_type_name = self.consume_identifier()?;
+            Type::Simple(return_type_name).normalize()
+        } else {
+            Type::Any
+        };
 
-        let return_type_name = self.consume_identifier()?;
-        let return_type = Type::Simple(return_type_name).normalize();
-
-        self.consume(TokenKind::Bind, "expected '=:'")?;
-
-        let expr = self.parse_expression()?;
+        let body = if self.match_token(TokenKind::LBrace) {
+            let mut statements = Vec::new();
+            while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+                if let TokenKind::Whitespace | TokenKind::Newline = self.peek().kind {
+                    self.advance();
+                    continue;
+                }
+                if self.check(TokenKind::Let)
+                    || self.check(TokenKind::Fn)
+                    || self.check(TokenKind::For)
+                    || self.check(TokenKind::Export)
+                {
+                    let stmt = self.parse_statement()?;
+                    statements.push(stmt);
+                } else {
+                    let expr = self.parse_expression()?;
+                    statements.push(Stmt::Binding {
+                        name: "_".to_string(),
+                        expr,
+                    });
+                }
+            }
+            self.consume(TokenKind::RBrace, "expected '}'")?;
+            FunctionBody::Block(statements)
+        } else {
+            self.consume(TokenKind::Bind, "expected '=:' or '{'")?;
+            let expr = self.parse_expression()?;
+            FunctionBody::Expression(Box::new(expr))
+        };
 
         Ok(Stmt::FunctionDefinition {
             name,
             is_exported,
             params,
             return_type,
-            body: Box::new(expr),
+            body,
         })
     }
 
     fn parse_expression(&mut self) -> Result<Expr, String> {
         if self.check(TokenKind::Match) {
             return self.parse_match();
+        }
+        if self.check(TokenKind::LParen)
+            && self.peek_ahead(1).map(|t| t.kind.clone()) == Some(TokenKind::Pipe)
+        {
+            return self.parse_join();
         }
 
         self.parse_binary_op()
@@ -228,10 +339,6 @@ impl Parser {
                     let expr = self.parse_term()?;
                     steps.push(PipelineStep::TupleMerge(Box::new(expr)));
                 }
-                TokenKind::Pipe => {
-                    let arm = self.parse_match_arm()?;
-                    steps.push(PipelineStep::MatchArm(Box::new(arm)));
-                }
                 _ => break,
             }
         }
@@ -248,50 +355,23 @@ impl Parser {
 
     fn parse_match(&mut self) -> Result<Expr, String> {
         self.consume(TokenKind::Match, "expected 'match'")?;
-
-        let subject = self.parse_term()?;
-
+        let subject = self.parse_expression()?;
+        self.consume(TokenKind::LParen, "expected '('")?;
         let mut arms = Vec::new();
-
-        while self.check(TokenKind::Pipe) {
-            self.advance();
-            let arm = self.parse_match_arm()?;
-            arms.push(arm);
+        loop {
+            let pattern = self.parse_pattern()?;
+            self.consume(TokenKind::Bind, "expected '=:'")?;
+            let expr = self.parse_expression()?;
+            arms.push(MatchArm::Arm { pattern, expr });
+            if !self.match_token(TokenKind::Pipe) {
+                break;
+            }
         }
-
+        self.consume(TokenKind::RParen, "expected ')'")?;
         Ok(Expr::Match {
             subject: Box::new(subject),
             arms,
         })
-    }
-
-    fn parse_match_arm(&mut self) -> Result<MatchArm, String> {
-        match self.peek().kind.clone() {
-            TokenKind::Identifier(_) => Ok(MatchArm::Pattern {
-                name: self.consume_identifier()?,
-                args: if self.check(TokenKind::LParen) {
-                    self.consume(TokenKind::LParen, "expected '('")?;
-                    let mut args = Vec::new();
-                    if self.peek().kind != TokenKind::RParen {
-                        loop {
-                            let arg = self.parse_term()?;
-                            args.push(arg);
-                            if !self.match_token(TokenKind::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    self.consume(TokenKind::RParen, "expected ')'")?;
-                    args
-                } else {
-                    Vec::new()
-                },
-            }),
-            _ => {
-                let expr = self.parse_term()?;
-                Ok(MatchArm::Expression(Box::new(expr)))
-            }
-        }
     }
 
     fn parse_for_loop(&mut self) -> Result<crate::ast::ForLoop, String> {

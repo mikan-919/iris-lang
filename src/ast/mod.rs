@@ -121,6 +121,8 @@ pub enum Expr {
         subject: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    Block(Vec<Stmt>),
+    Join(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,9 +147,21 @@ pub enum PipelineStep {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    Identifier(String),
+    Constructor { name: String, args: Vec<Pattern> },
+    Literal(Literal),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum MatchArm {
-    Pattern { name: String, args: Vec<Expr> },
+    Arm { pattern: Pattern, expr: Expr },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionBody {
     Expression(Box<Expr>),
+    Block(Vec<Stmt>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,8 +184,9 @@ pub enum Stmt {
         is_exported: bool,
         params: Vec<(String, Type)>,
         return_type: Type,
-        body: Box<Expr>,
+        body: FunctionBody,
     },
+    Block(Vec<Stmt>),
     MatchStatement(Box<Expr>),
     ForLoopStatement(Box<ForLoop>),
 }
@@ -272,17 +287,29 @@ impl fmt::Display for PipelineStep {
     }
 }
 
+impl fmt::Display for Pattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Pattern::Identifier(name) => write!(f, "{}", name),
+            Pattern::Constructor { name, args } => {
+                write!(f, "{}(", name)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
+            Pattern::Literal(lit) => write!(f, "{}", lit),
+        }
+    }
+}
+
 impl fmt::Display for MatchArm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MatchArm::Pattern { name, args } => {
-                write!(f, "{}", name)?;
-                for arg in args {
-                    write!(f, "({})", arg)?;
-                }
-                Ok(())
-            }
-            MatchArm::Expression(expr) => write!(f, "{}", expr),
+            MatchArm::Arm { pattern, expr } => write!(f, "{} =: {}", pattern, expr),
         }
     }
 }
@@ -328,6 +355,69 @@ impl fmt::Display for Expr {
                 }
                 Ok(())
             }
+            Expr::Block(stmts) => {
+                write!(f, "{{")?;
+                for stmt in stmts {
+                    write!(f, " {}", stmt)?;
+                }
+                write!(f, " }}")
+            }
+            Expr::Join(exprs) => {
+                write!(f, "(")?;
+                for (i, expr) in exprs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}", expr)?;
+                }
+                write!(f, ")")
+            }
+        }
+    }
+}
+
+impl fmt::Display for Stmt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Stmt::Binding { name, expr } => write!(f, "let {} =: {}", name, expr),
+            Stmt::FunctionDefinition {
+                name,
+                is_exported,
+                params,
+                return_type,
+                body,
+            } => {
+                if *is_exported {
+                    write!(f, "export ")?;
+                }
+                write!(f, "fn {}(", name)?;
+                for (i, (param_name, param_type)) in params.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", param_name, param_type)?;
+                }
+                write!(f, ") -> {} ", return_type)?;
+                match body {
+                    FunctionBody::Expression(expr) => write!(f, "= {}", expr),
+                    FunctionBody::Block(stmts) => {
+                        write!(f, "{{")?;
+                        for stmt in stmts {
+                            write!(f, " {}", stmt)?;
+                        }
+                        write!(f, " }}")
+                    }
+                }
+            }
+            Stmt::Block(stmts) => {
+                write!(f, "{{")?;
+                for stmt in stmts {
+                    write!(f, " {}", stmt)?;
+                }
+                write!(f, " }}")
+            }
+            Stmt::MatchStatement(expr) => write!(f, "match {}", expr),
+            Stmt::ForLoopStatement(for_loop) => write!(f, "for {}", for_loop),
         }
     }
 }

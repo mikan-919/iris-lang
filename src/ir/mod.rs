@@ -9,6 +9,10 @@ pub enum IrInstruction {
         reg: String,
         value: Expr,
     },
+    LoadLocal {
+        reg: String,
+        name: String,
+    },
     Assign {
         var: Variable,
         reg: String,

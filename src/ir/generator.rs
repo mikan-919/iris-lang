@@ -1,11 +1,11 @@
-use crate::ast::{Expr, PipelineStep, Stmt};
+use crate::ast::{Expr, FunctionBody, PipelineStep, Stmt};
 use crate::ir::{BasicBlock, IrFunction, IrInstruction, IrModule, Variable};
 
 pub fn generate_ir(stmt: &Stmt) -> BasicBlock {
     let mut block = BasicBlock::new();
 
     if let Stmt::Binding { name, expr } = stmt {
-        let (reg, expr_block) = generate_expr_ir(expr);
+        let (reg, expr_block) = generate_expr_ir_with_offset(expr, 0);
         block.instructions.extend(expr_block);
 
         block.add(IrInstruction::Assign {
@@ -17,12 +17,12 @@ pub fn generate_ir(stmt: &Stmt) -> BasicBlock {
     block
 }
 
-fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
+fn generate_expr_ir_with_offset(expr: &Expr, offset: usize) -> (String, Vec<IrInstruction>) {
     let mut instructions = Vec::new();
 
     match expr {
         Expr::Literal(lit) => {
-            let reg = format!("t{}", instructions.len());
+            let reg = format!("t{}", offset + instructions.len());
             instructions.push(IrInstruction::LoadConst {
                 reg: reg.clone(),
                 value: Expr::Literal(lit.clone()),
@@ -30,19 +30,21 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
             (reg, instructions)
         }
         Expr::Identifier(name) => {
-            let reg = format!("t{}", instructions.len());
-            instructions.push(IrInstruction::LoadConst {
+            let reg = format!("t{}", offset + instructions.len());
+            instructions.push(IrInstruction::LoadLocal {
                 reg: reg.clone(),
-                value: Expr::Identifier(name.clone()),
+                name: name.clone(),
             });
             (reg, instructions)
         }
         Expr::BinaryOp { left, op, right } => {
-            let (left_reg, left_instrs) = generate_expr_ir(left);
+            let (left_reg, left_instrs) =
+                generate_expr_ir_with_offset(left, offset + instructions.len());
             instructions.extend(left_instrs);
-            let (right_reg, right_instrs) = generate_expr_ir(right);
+            let (right_reg, right_instrs) =
+                generate_expr_ir_with_offset(right, offset + instructions.len());
             instructions.extend(right_instrs);
-            let result_reg = format!("t{}", instructions.len());
+            let result_reg = format!("t{}", offset + instructions.len());
             instructions.push(IrInstruction::BinaryOp {
                 op: *op,
                 left: left_reg,
@@ -52,7 +54,8 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
             (result_reg, instructions)
         }
         Expr::Pipeline { initial, steps } => {
-            let (mut current_reg, initial_instrs) = generate_expr_ir(initial);
+            let (mut current_reg, initial_instrs) =
+                generate_expr_ir_with_offset(initial, offset + instructions.len());
             instructions.extend(initial_instrs);
 
             for step in steps {
@@ -63,11 +66,12 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
                     } => {
                         let mut call_args = vec![current_reg.clone()];
                         for arg in args {
-                            let (arg_reg, arg_instrs) = generate_expr_ir(arg);
+                            let (arg_reg, arg_instrs) =
+                                generate_expr_ir_with_offset(arg, offset + instructions.len());
                             instructions.extend(arg_instrs);
                             call_args.push(arg_reg);
                         }
-                        let result_reg = format!("t{}", instructions.len());
+                        let result_reg = format!("t{}", offset + instructions.len());
                         instructions.push(IrInstruction::Call {
                             func_name: func_name.clone(),
                             args: call_args,
@@ -76,8 +80,8 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
                         current_reg = result_reg;
                     }
                     PipelineStep::Force => {
-                        let branch_true = format!("bb_panic_{}", instructions.len());
-                        let branch_false = format!("bb_continue_{}", instructions.len());
+                        let branch_true = format!("bb_panic_{}", offset + instructions.len());
+                        let branch_false = format!("bb_continue_{}", offset + instructions.len());
 
                         instructions.push(IrInstruction::Branch {
                             cond: current_reg.clone(),
@@ -90,8 +94,8 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
                         });
                     }
                     PipelineStep::ErrorPropagate => {
-                        let branch_true = format!("bb_return_err_{}", instructions.len());
-                        let branch_false = format!("bb_continue_{}", instructions.len());
+                        let branch_true = format!("bb_return_err_{}", offset + instructions.len());
+                        let branch_false = format!("bb_continue_{}", offset + instructions.len());
 
                         instructions.push(IrInstruction::Branch {
                             cond: current_reg.clone(),
@@ -109,6 +113,35 @@ fn generate_expr_ir(expr: &Expr) -> (String, Vec<IrInstruction>) {
 
             (current_reg, instructions)
         }
+        Expr::Block(stmts) => {
+            let last_reg = String::new();
+            for stmt in stmts {
+                let block = generate_ir(stmt);
+                instructions.extend(block.instructions);
+            }
+            (last_reg, instructions)
+        }
+        Expr::Join(exprs) => {
+            let mut last_reg = String::new();
+            for expr in exprs {
+                let (reg, instrs) = generate_expr_ir_with_offset(expr, offset + instructions.len());
+                instructions.extend(instrs);
+                last_reg = reg;
+            }
+            (last_reg, instructions)
+        }
+        Expr::Match { subject, arms } => {
+            let (_subject_reg, subject_instrs) =
+                generate_expr_ir_with_offset(subject, offset + instructions.len());
+            instructions.extend(subject_instrs);
+            for arm in arms {
+                let crate::ast::MatchArm::Arm { pattern: _, expr } = arm;
+                let (_expr_reg, expr_instrs) =
+                    generate_expr_ir_with_offset(expr, offset + instructions.len());
+                instructions.extend(expr_instrs);
+            }
+            (String::new(), instructions)
+        }
         _ => (String::new(), instructions),
     }
 }
@@ -122,7 +155,10 @@ pub fn generate_ir_for_function(stmt: &Stmt) -> Result<IrFunction, String> {
         body,
     } = stmt
     {
-        let (result_reg, mut instructions) = generate_expr_ir(body);
+        let (result_reg, mut instructions) = match body {
+            FunctionBody::Expression(expr) => generate_expr_ir_with_offset(expr, 0),
+            FunctionBody::Block(_) => todo!("Block body IR generation"),
+        };
 
         instructions.push(IrInstruction::Return { reg: result_reg });
 
@@ -330,7 +366,7 @@ mod tests {
                 ("b".to_string(), crate::ast::Type::Simple("Int".to_string())),
             ],
             return_type: crate::ast::Type::Simple("Int".to_string()),
-            body: Box::new(Expr::Literal(Literal::Integer(42))),
+            body: FunctionBody::Expression(Box::new(Expr::Literal(Literal::Integer(42)))),
         };
 
         let ir_func = generate_ir_for_function(&stmt).unwrap();
@@ -356,13 +392,13 @@ mod tests {
                 crate::ast::Type::Simple("String".to_string()),
             )],
             return_type: crate::ast::Type::Simple("String".to_string()),
-            body: Box::new(Expr::Pipeline {
+            body: FunctionBody::Expression(Box::new(Expr::Pipeline {
                 initial: Box::new(Expr::Literal(Literal::String("Hello".to_string()))),
                 steps: vec![PipelineStep::FunctionCall {
                     name: "concat".to_string(),
                     args: vec![Expr::Identifier("name".to_string())],
                 }],
-            }),
+            })),
         };
 
         let ir_func = generate_ir_for_function(&stmt).unwrap();
