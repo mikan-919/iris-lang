@@ -56,7 +56,7 @@ impl WasmGenerator {
         module.section(&functions);
 
         let mut exports = ExportSection::new();
-        for (idx, func) in ir_module.functions.iter().enumerate() {
+        for func in ir_module.functions.iter() {
             if func.is_exported {
                 let func_idx = *self
                     .type_indices
