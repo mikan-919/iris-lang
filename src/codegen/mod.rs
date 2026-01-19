@@ -87,16 +87,78 @@ impl WasmGenerator {
         codes: &mut CodeSection,
         func: &IrFunction,
     ) -> Result<(), String> {
-        let locals: Vec<(u32, ValType)> = vec![];
-        let mut wasm_func = Function::new(locals);
-
-        let mut locals_map: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
-        for (param_idx, (param_name, _)) in func.params.iter().enumerate() {
-            locals_map.insert(param_name.clone(), param_idx as u32);
+        // Collect all temporary registers used in the function
+        let mut temp_regs = std::collections::HashSet::new();
+        for instr in &func.block.instructions {
+            match instr {
+                IrInstruction::LoadConst { reg, .. } => {
+                    temp_regs.insert(reg.clone());
+                }
+                IrInstruction::LoadLocal { reg, .. } => {
+                    temp_regs.insert(reg.clone());
+                }
+                IrInstruction::BinaryOp {
+                    left,
+                    right,
+                    target,
+                    ..
+                } => {
+                    temp_regs.insert(left.clone());
+                    temp_regs.insert(right.clone());
+                    temp_regs.insert(target.clone());
+                }
+                IrInstruction::Call { args, target, .. } => {
+                    for arg in args {
+                        temp_regs.insert(arg.clone());
+                    }
+                    temp_regs.insert(target.clone());
+                }
+                IrInstruction::Assign { var: _, reg } => {
+                    temp_regs.insert(reg.clone());
+                }
+                IrInstruction::Return { reg } => {
+                    temp_regs.insert(reg.clone());
+                }
+                IrInstruction::Branch { cond, .. } => {
+                    temp_regs.insert(cond.clone());
+                }
+                IrInstruction::Exit { value } => {
+                    temp_regs.insert(value.clone());
+                }
+                IrInstruction::Panic { .. } => {}
+            }
         }
 
-        self.encode_basic_block(&mut wasm_func, &func.block, &locals_map)?;
+        // Build locals: first parameters, then temporary registers
+        let mut all_locals: Vec<(String, u32)> = Vec::new();
+        for (param_idx, (param_name, _)) in func.params.iter().enumerate() {
+            all_locals.push((param_name.clone(), param_idx as u32));
+        }
+
+        let temp_reg_type = self.type_to_valtype(&func.return_type)?;
+        for reg in temp_regs.iter() {
+            if !all_locals.iter().any(|(name, _)| name == reg) {
+                let idx = all_locals.len() as u32;
+                all_locals.push((reg.clone(), idx));
+            }
+        }
+
+        // Create locals for Wasm function (additional locals only, not parameters)
+        // Function::new() expects Vec<(count, type)> where count is the number of consecutive locals
+        let additional_locals: Vec<(u32, ValType)> = {
+            let temp_reg_count = temp_regs.len() as u32;
+            if temp_reg_count > 0 {
+                vec![(temp_reg_count, temp_reg_type)]
+            } else {
+                vec![]
+            }
+        };
+
+        let locals_map: std::collections::HashMap<String, u32> = all_locals.into_iter().collect();
+
+        let mut wasm_func = Function::new(additional_locals);
+
+        self.encode_basic_block(&mut wasm_func, &func.block, &locals_map, &self.type_indices)?;
 
         wasm_func.instruction(&Instruction::End);
 
@@ -109,9 +171,10 @@ impl WasmGenerator {
         wasm_func: &mut Function,
         block: &BasicBlock,
         locals_map: &std::collections::HashMap<String, u32>,
+        func_indices: &std::collections::HashMap<String, u32>,
     ) -> Result<(), String> {
         for instr in &block.instructions {
-            self.encode_instruction(wasm_func, instr, locals_map)?;
+            self.encode_instruction(wasm_func, instr, locals_map, func_indices)?;
         }
         Ok(())
     }
@@ -121,37 +184,64 @@ impl WasmGenerator {
         wasm_func: &mut Function,
         instr: &IrInstruction,
         locals_map: &std::collections::HashMap<String, u32>,
+        func_indices: &std::collections::HashMap<String, u32>,
     ) -> Result<(), String> {
         match instr {
-            IrInstruction::LoadConst { reg: _, value } => {
-                self.encode_expr(wasm_func, value)?;
-            }
-            IrInstruction::Assign { var, reg: _ } => {
+            IrInstruction::LoadConst { reg, value } => {
                 let local_idx = locals_map
+                    .get(reg)
+                    .ok_or_else(|| format!("Register not found: {}", reg))?;
+                self.encode_expr(wasm_func, value)?;
+                wasm_func.instruction(&Instruction::LocalSet(*local_idx));
+            }
+            IrInstruction::LoadLocal { reg, name } => {
+                let name_idx = locals_map
+                    .get(name)
+                    .ok_or_else(|| format!("Local variable not found: {}", name))?;
+                let reg_idx = locals_map
+                    .get(reg)
+                    .ok_or_else(|| format!("Register not found: {}", reg))?;
+                wasm_func.instruction(&Instruction::LocalGet(*name_idx));
+                wasm_func.instruction(&Instruction::LocalSet(*reg_idx));
+            }
+            IrInstruction::Assign { var, reg } => {
+                let var_idx = locals_map
                     .get(&var.0)
-                    .ok_or_else(|| format!("Local variable not found: {}", var.0))?;
-                wasm_func.instruction(&Instruction::LocalGet(*local_idx));
-                wasm_func.instruction(&Instruction::Drop);
+                    .ok_or_else(|| format!("Variable not found: {}", var.0))?;
+                let reg_idx = locals_map
+                    .get(reg)
+                    .ok_or_else(|| format!("Register not found: {}", reg))?;
+                wasm_func.instruction(&Instruction::LocalGet(*reg_idx));
+                wasm_func.instruction(&Instruction::LocalSet(*var_idx));
             }
             IrInstruction::Return { reg } => {
                 let local_idx = locals_map
                     .get(reg)
                     .ok_or_else(|| format!("Register not found: {}", reg))?;
                 wasm_func.instruction(&Instruction::LocalGet(*local_idx));
-                wasm_func.instruction(&Instruction::End);
             }
             IrInstruction::Call {
-                func_name: _,
+                func_name,
                 args,
-                target: _,
+                target,
             } => {
+                let func_idx = func_indices
+                    .get(func_name)
+                    .ok_or_else(|| format!("Function not found: {}", func_name))?;
+
                 for arg in args {
                     let local_idx = locals_map
                         .get(arg)
                         .ok_or_else(|| format!("Argument register not found: {}", arg))?;
                     wasm_func.instruction(&Instruction::LocalGet(*local_idx));
                 }
-                wasm_func.instruction(&Instruction::Unreachable);
+
+                wasm_func.instruction(&Instruction::Call(*func_idx));
+
+                let target_idx = locals_map
+                    .get(target)
+                    .ok_or_else(|| format!("Target register not found: {}", target))?;
+                wasm_func.instruction(&Instruction::LocalSet(*target_idx));
             }
             IrInstruction::Branch {
                 cond,
@@ -172,13 +262,12 @@ impl WasmGenerator {
                     .get(value)
                     .ok_or_else(|| format!("Value register not found: {}", value))?;
                 wasm_func.instruction(&Instruction::LocalGet(*val_idx));
-                wasm_func.instruction(&Instruction::End);
             }
             IrInstruction::BinaryOp {
                 op,
                 left,
                 right,
-                target: _,
+                target,
             } => {
                 let left_idx = locals_map
                     .get(left)
@@ -186,6 +275,9 @@ impl WasmGenerator {
                 let right_idx = locals_map
                     .get(right)
                     .ok_or_else(|| format!("Right operand not found: {}", right))?;
+                let target_idx = locals_map
+                    .get(target)
+                    .ok_or_else(|| format!("Target register not found: {}", target))?;
 
                 wasm_func.instruction(&Instruction::LocalGet(*left_idx));
                 wasm_func.instruction(&Instruction::LocalGet(*right_idx));
@@ -196,6 +288,7 @@ impl WasmGenerator {
                     BinaryOp::Mul => wasm_func.instruction(&Instruction::I32Mul),
                     BinaryOp::Div => wasm_func.instruction(&Instruction::I32DivS),
                 };
+                wasm_func.instruction(&Instruction::LocalSet(*target_idx));
             }
         }
         Ok(())
