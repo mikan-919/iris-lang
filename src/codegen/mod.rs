@@ -28,16 +28,20 @@ impl WasmGenerator {
         module.section(&types);
 
         let mut imports = ImportSection::new();
+        let mut func_indices = std::collections::HashMap::new();
         let mut func_index: u32 = 0;
         for func in &ir_module.functions {
             if func.is_external {
                 if let Some(external_name) = &func.external_name {
-                    imports.import("env", external_name, EntityType::Function(func_index));
-                    self.type_indices.insert(func.name.clone(), func_index);
+                    let type_idx = *self.type_indices.get(&func.name).ok_or_else(|| {
+                        format!("Type index not found for function: {}", func.name)
+                    })?;
+                    imports.import("env", external_name, EntityType::Function(type_idx));
+                    func_indices.insert(func.name.clone(), func_index);
                     func_index += 1;
                 }
             } else {
-                self.type_indices.insert(func.name.clone(), func_index);
+                func_indices.insert(func.name.clone(), func_index);
                 func_index += 1;
             }
         }
@@ -58,10 +62,9 @@ impl WasmGenerator {
         let mut exports = ExportSection::new();
         for func in ir_module.functions.iter() {
             if func.is_exported {
-                let func_idx = *self
-                    .type_indices
+                let func_idx = *func_indices
                     .get(&func.name)
-                    .ok_or_else(|| format!("Type index not found for function: {}", func.name))?;
+                    .ok_or_else(|| format!("Function index not found for: {}", func.name))?;
                 exports.export(&func.name, ExportKind::Func, func_idx);
             }
         }

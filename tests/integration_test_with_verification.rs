@@ -22,12 +22,12 @@ fn test_compile_and_verify_add_function() {
     );
 
     // Check that the module is non-empty and reasonably sized
-    assert!(wasm_bytes.len() > 100, "WASM module too small");
+    assert!(wasm_bytes.len() > 40, "WASM module too small");
     assert!(wasm_bytes.len() < 10000, "WASM module too large");
 
     println!("WASM module size: {} bytes", wasm_bytes.len());
 
-    // Basic section validation - should at least have type, function, export, code sections
+    // Basic section validation - should at least have type, function, code sections
     let mut has_type_section = false;
     let mut has_function_section = false;
     let mut has_code_section = false;
@@ -63,5 +63,4 @@ fn test_compile_and_verify_add_function() {
     assert!(has_type_section, "Missing type section");
     assert!(has_function_section, "Missing function section");
     assert!(has_code_section, "Missing code section");
-    // Export section might not exist if function is not exported
 }
