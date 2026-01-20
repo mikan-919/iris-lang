@@ -6,10 +6,17 @@ fn main() {
 
     let wasm_path = format!("target/wasm32-unknown-unknown/{}/iris_lang.wasm", profile);
 
-    // Only run wasm-bindgen if the wasm file exists
+    // Only run wasm-bindgen if wasm file exists
     if std::path::Path::new(&wasm_path).exists() {
+        let args: Vec<String> = vec![
+            "--out-dir".to_string(),
+            "iris-web/pkg/".to_string(),
+            "--target".to_string(),
+            "web".to_string(),
+            wasm_path,
+        ];
         let status = Command::new("wasm-bindgen")
-            .args(&["--out-dir", "iris-web/pkg/", "--target", "web", &wasm_path])
+            .args(args.iter().map(|s| s.as_str()).collect::<Vec<_>>())
             .status()
             .expect("Failed to run wasm-bindgen");
 

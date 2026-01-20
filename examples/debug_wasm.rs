@@ -104,7 +104,7 @@ fn parse_code_section(bytes: &[u8], start: usize, _len: usize) {
         offset += section_len_size(locals_count);
 
         for i in 0..locals_count {
-            let count = read_u32(bytes, offset) as u32;
+            let count = read_u32(bytes, offset);
             offset += section_len_size(count as usize);
             let ty = bytes[offset];
             offset += 1;
@@ -132,7 +132,7 @@ fn parse_code_section(bytes: &[u8], start: usize, _len: usize) {
                 0x41 => {
                     offset += 1;
                     let val = read_i32(bytes, offset);
-                    offset += section_len_size((val as i32).unsigned_abs() as usize);
+                    offset += section_len_size(val.unsigned_abs() as usize);
                     println!("i32.const {}", val);
                 }
                 0x6a => {

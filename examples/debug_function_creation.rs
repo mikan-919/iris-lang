@@ -2,7 +2,7 @@ use wasm_encoder::{Encode, Function, Instruction, ValType};
 
 fn main() {
     println!("=== Test 1: Vec<(3, I32)> ===");
-    let func1 = Function::new(vec![(3u32, ValType::I32)]);
+    let _func1 = Function::new(vec![(3u32, ValType::I32)]);
 
     let mut bytes = Vec::new();
     // Manually encode to see what Function does internally

@@ -1,6 +1,6 @@
 use iris_lang::{
-    ast::Expr, ast::Literal, ast::Type, ir::BasicBlock, ir::IrInstruction,
-    ir::generator::generate_ir_for_function, lexer::tokenizer::Lexer, parser::Parser,
+    ir::BasicBlock, ir::IrInstruction, ir::generator::generate_ir_for_function,
+    lexer::tokenizer::Lexer, parser::Parser,
 };
 
 fn collect_temp_regs(block: &BasicBlock) -> Vec<String> {

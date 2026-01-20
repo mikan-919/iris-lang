@@ -55,7 +55,6 @@ fn add_main_function(ir_module: &mut IrModule) -> Result<(), String> {
         let func = &exported_funcs[0];
 
         let mut block = BasicBlock::new();
-        let mut temp_offset = 0;
         let mut args = Vec::new();
 
         for (param_idx, _) in func.params.iter().enumerate() {
@@ -64,8 +63,7 @@ fn add_main_function(ir_module: &mut IrModule) -> Result<(), String> {
                 1 => 5,
                 _ => 1,
             };
-            let reg = format!("t{}", temp_offset);
-            temp_offset += 1;
+            let reg = format!("t{}", param_idx);
             args.push(reg.clone());
             block.add(IrInstruction::LoadConst {
                 reg: reg.clone(),
@@ -86,6 +84,8 @@ fn add_main_function(ir_module: &mut IrModule) -> Result<(), String> {
         let main_func = IrFunction {
             name: "main".to_string(),
             is_exported: true,
+            is_external: false,
+            external_name: None,
             params: vec![],
             return_type: Type::Int,
             block,

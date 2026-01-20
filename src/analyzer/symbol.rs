@@ -14,11 +14,12 @@ pub struct Symbol {
     pub ty: Type,
     pub ownership: OwnershipState,
     pub is_function: bool,
+    pub is_external: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Scope {
-    symbols: HashMap<String, Symbol>,
+    pub symbols: HashMap<String, Symbol>,
     parent: Option<Box<Scope>>,
 }
 
@@ -91,6 +92,18 @@ impl SymbolTable {
             ty,
             ownership: OwnershipState::Available,
             is_function,
+            is_external: false,
+        };
+        self.current.insert(name, symbol);
+    }
+
+    pub fn define_external(&mut self, name: String, ty: Type) {
+        let symbol = Symbol {
+            name: name.clone(),
+            ty,
+            ownership: OwnershipState::Available,
+            is_function: true,
+            is_external: true,
         };
         self.current.insert(name, symbol);
     }
