@@ -114,11 +114,36 @@ foo$x(
 
 ## if
 
+`:if/:then/:else` は必ずペアで、必ず一つの値に収束する。`:else` は省略不可。
+
 ```iris
 value
 :if condition()
 :then foo()
 :else bar()
+```
+
+---
+
+## Lambda Predicate
+
+条件がキャストや複合式を必要とする場合、ラムダを使う。
+
+```iris
+value
+:if (x -> Int(x) > 3)
+:then foo()
+:else bar()
+```
+
+ラムダの中は **Expression のみ**。関数呼び出しは可、パイプラインは不可。
+
+シンプルな条件は関数で表現する：
+
+```iris
+value
+:if validate()          // 関数一個で済むなら関数
+:if (x -> Int(x) > 3)  // キャスト・演算が必要なときラムダ
 ```
 
 ---
@@ -146,7 +171,31 @@ value
 
 ---
 
-# 4. ループ
+# 4. Match
+
+`:: match` はパイプラインのステップとして使う。
+
+パターンの後に `::` が来たらそこからarm本体のパイプライン。
+`_` はワイルドカード（どのパターンにも一致しない場合）。
+
+```iris
+value
+:: match (
+  1 :: processOne()
+  2 :: processTwo() :: trim()
+  _ :: default()
+)
+```
+
+## 制約
+
+- パターンは値の比較のみ（現時点ではパターン分解なし）
+- 各armは必ず `::` で始まる
+- `_` は最後に置く
+
+---
+
+# 6. ループ
 
 ## while
 
@@ -158,7 +207,7 @@ stream
 
 ---
 
-# 5. 副作用分岐 `%`
+# 7. 副作用分岐 `%`
 
 親主体を置換しない。
 
@@ -176,7 +225,17 @@ return value
 
 ---
 
-# 6. エラー処理
+# 8. エラー処理
+
+## 型によるエラー強制
+
+関数が `Result<T, E>` を返す場合、その値は `Error` を含む型になる。
+`Error` 型のまま次の `::` に渡すとコンパイルエラー。
+`:catch` で処理するか、`@unwrap` で明示的にパニックを選ぶかを強制される。
+
+## :catch
+
+`:catch` はフローの一部。直前のステップのエラーを捕捉する。
 
 ```iris
 value
@@ -184,11 +243,36 @@ value
 :catch$error recover(error)
 ```
 
-`$error` はエラー主体。
+複数ステップで処理する場合は首なしパイプラインを渡す：
+
+```iris
+value
+:: parse()
+:catch (
+  :: fallback()
+  :: log()
+)
+:: trim()
+```
+
+`:catch` を通過した後の主体は `Error` が除去された型として扱われる。
+
+## @unwrap 修飾子
+
+エラーをパニックで処理する場合は `@unwrap` をステップに付加する。
+`:!` は廃止。
+
+```iris
+value
+:: parse() @unwrap    ← エラーならパニック、正常値はそのまま続行
+:: trim()
+```
+
+`@` はステップへの修飾子。フロー制御ではなく付加情報として機能する。
 
 ---
 
-# 7. 非同期
+# 9. 非同期
 
 ## Promise
 
@@ -215,7 +299,7 @@ T
 
 ---
 
-# 8. Stream
+# 10. Stream
 
 Stream は複数主体を未来に供給する。
 
@@ -234,7 +318,7 @@ Promise<Option<T>>
 
 ---
 
-# 9. 型システム
+# 11. 型システム
 
 ## 型
 
@@ -286,7 +370,7 @@ String ∈ #String
 
 ---
 
-# 10. Trait 継承
+# 12. Trait 継承
 
 ```iris
 trait #String : #Text
@@ -306,7 +390,7 @@ trait #String : #Text
 
 ---
 
-# 11. Trait 定義
+# 13. Trait 定義
 
 ```iris
 trait #Text {
@@ -333,7 +417,7 @@ trait #Text {
 
 ---
 
-# 12. Impl
+# 14. Impl
 
 ```iris
 impl #String for String {
@@ -370,7 +454,7 @@ impl #String for String {
 
 ---
 
-# 13. Override Chain
+# 15. Override Chain
 
 Override は継承系列のみ許可。
 
@@ -396,7 +480,7 @@ String.trim
 
 ---
 
-# 14. Module
+# 16. Module
 
 関数はモジュールに属する。
 
@@ -425,7 +509,7 @@ use std::*
 
 ---
 
-# 15. 関数探索
+# 17. 関数探索
 
 探索順序:
 
@@ -470,7 +554,7 @@ use済みモジュール
 
 ---
 
-# 16. Specialization
+# 18. Specialization
 
 一般 Specialization は存在しない。
 
@@ -489,7 +573,7 @@ convert(Int32)
 
 ---
 
-# 17. Override による隠蔽
+# 19. Override による隠蔽
 
 唯一の例外。
 
@@ -519,7 +603,7 @@ trait #String : #Text {
 
 ---
 
-# 18. Trait 系列指定
+# 20. Trait 系列指定
 
 競合する実装群が存在する場合、
 
@@ -542,7 +626,7 @@ override解決
 
 ---
 
-# 19. require
+# 21. require
 
 require は comptime 制約。
 
@@ -623,7 +707,7 @@ T ∈ #Serializable
 
 ---
 
-# 20. comptime directive
+# 22. comptime directive
 
 `!` は comptime directive。
 
@@ -654,7 +738,7 @@ comptime {
 
 ---
 
-# 21. ジェネリクス
+# 23. ジェネリクス
 
 能力制約はジェネリクスで表現する方向。
 
@@ -674,7 +758,7 @@ save<T:#Text && #Serializable>(...)
 
 ---
 
-# 22. 現在の根本原則
+# 24. 現在の根本原則
 
 1. 主体が言語の中心
 2. メソッドではなく関数探索
