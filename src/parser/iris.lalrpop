@@ -1,0 +1,389 @@
+use crate::ast::*;
+use crate::lexer::{Token, LexError};
+
+grammar;
+
+extern {
+    type Location = usize;
+    type Error = LexError;
+
+    enum Token {
+        "let"    => Token::Let,
+        "fn"     => Token::Fn,
+        "use"    => Token::Use,
+        "trait"  => Token::Trait,
+        "impl"   => Token::Impl,
+        "for"    => Token::For,
+        "match"  => Token::Match,
+        "::"     => Token::Next,
+        ":if"    => Token::ColonIf,
+        ":then"  => Token::ColonThen,
+        ":else"  => Token::ColonElse,
+        ":while" => Token::ColonWhile,
+        ":await" => Token::ColonAwait,
+        ":catch" => Token::ColonCatch,
+        "="      => Token::Equal,
+        "->"     => Token::Arrow,
+        ":"      => Token::Colon,
+        ","      => Token::Comma,
+        "."      => Token::Dot,
+        ";"      => Token::Semi,
+        "$"      => Token::Dollar,
+        "|"      => Token::Pipe,
+        "!"      => Token::Bang,
+        "*"      => Token::Star,
+        "&&"     => Token::AndAnd,
+        "_"      => Token::Underscore,
+        "("      => Token::LParen,
+        ")"      => Token::RParen,
+        "{"      => Token::LBrace,
+        "}"      => Token::RBrace,
+        "+"      => Token::Plus,
+        "-"      => Token::Minus,
+        "/"      => Token::Slash,
+        "%"      => Token::Percent,
+        "=="     => Token::EqEq,
+        "!="     => Token::NotEq,
+        "<"      => Token::Lt,
+        "<="     => Token::Le,
+        ">"      => Token::Gt,
+        ">="     => Token::Ge,
+        IntLit    => Token::IntLit(<i64>),
+        FloatLit  => Token::FloatLit(<f64>),
+        StringLit => Token::StringLit(<String>),
+        "true"    => Token::True,
+        "false"   => Token::False,
+        TraitIdent => Token::TraitIdent(<String>),
+        Ident      => Token::Ident(<String>),
+    }
+}
+
+// ─── トップレベル ─────────────────────────────────────────────
+
+pub Program: Vec<Item> = {
+    Item* => <>,
+};
+
+Item: Item = {
+    LetStmt           => Item::LetStmt(<>),
+    FuncDef           => Item::FuncDef(<>),
+    UseStmt           => Item::UseStmt(<>),
+    TraitDef          => Item::TraitDef(<>),
+    ImplDef           => Item::ImplDef(<>),
+    ComptimeDirective => Item::ComptimeDirective(<>),
+};
+
+// ─── 変数宣言 ─────────────────────────────────────────────────
+
+LetStmt: LetStmt = {
+    <l:@L> "let" <name:Ident> "=" <value:Expr> <r:@R>
+    => LetStmt { name, ty: None, value, span: (l, r) },
+    <l:@L> "let" <name:Ident> ":" <ty:Type> "=" <value:Expr> <r:@R>
+    => LetStmt { name, ty: Some(ty), value, span: (l, r) },
+};
+
+// ─── use文 ────────────────────────────────────────────────────
+
+UseStmt: UseStmt = {
+    <l:@L> "use" <head:Ident> <tail:UseTail*> <r:@R> => {
+        let mut path = vec![PathSegment::Ident(head)];
+        path.extend(tail.into_iter().flatten());
+        UseStmt { path, glob: false, span: (l, r) }
+    },
+    <l:@L> "use" <head:Ident> <tail:UseTail*> "." "*" <r:@R> => {
+        let mut path = vec![PathSegment::Ident(head)];
+        path.extend(tail.into_iter().flatten());
+        UseStmt { path, glob: true, span: (l, r) }
+    },
+};
+
+UseTail: Vec<PathSegment> = {
+    "." <seg:PathSegment> => vec![seg],
+};
+
+PathSegment: PathSegment = {
+    Ident      => PathSegment::Ident(<>),
+    TraitIdent => PathSegment::Trait(<>),
+};
+
+// ─── Comptime ─────────────────────────────────────────────────
+
+ComptimeDirective: ComptimeDirective = {
+    <l:@L> "!" <name:Ident> "(" <args:ArgList> ")" <r:@R>
+    => ComptimeDirective { name, args, span: (l, r) },
+};
+
+// ─── 型 ───────────────────────────────────────────────────────
+// 注意: Type<T> の `<` と Expr の `<` は同じトークン。
+// ジェネリクス型は TypeGeneric として別扱いし、
+// 呼び出し元が文脈に合わせて使う
+
+// 単純型（ジェネリクスなし）: Ident または #Trait
+SimpleType: Type = {
+    TraitIdent => Type::Trait(<>),
+    Ident      => Type::Named(<>),
+};
+
+// 完全型（ジェネリクスあり）: Ident<Type, ...> または SimpleType
+// これは型宣言文脈でのみ使う
+Type: Type = {
+    <name:Ident> "<" <args:TypeArgList> ">"  => Type::Generic(name, args),
+    SimpleType,
+};
+
+TypeArgList: Vec<Type> = {
+    <t:Type>                             => vec![t],
+    <t:Type> "," <rest:TypeArgList>      => { let mut v = vec![t]; v.extend(rest); v },
+};
+
+FuncHeader: (String, Vec<Param>, Type) = {
+    "fn" <name:Ident>
+        "(" <params:ParamList> ")" ":" <ret_ty:SimpleType>
+    => (name, params, ret_ty),
+};
+
+FuncDef: FuncDef = {
+    // ブロック本体: fn name(params): Ret -> { stmts }
+    <l:@L> <h:FuncHeader>
+        "->" "{" <stmts:Stmt*> "}" <r:@R>
+    => FuncDef {
+        name: h.0, generics: vec![], params: h.1, ret_ty: h.2,
+        body: FuncBody::Block(stmts), span: (l, r),
+    },
+    // パイプライン本体: fn name(params): Ret -> subject :: steps
+    <l:@L> <h:FuncHeader>
+        "->" <pipeline:Pipeline> <r:@R>
+    => FuncDef {
+        name: h.0, generics: vec![], params: h.1, ret_ty: h.2,
+        body: FuncBody::Pipeline(pipeline), span: (l, r),
+    },
+};
+
+// ParamList: 空 or 1+ カンマ区切り
+ParamList: Vec<Param> = {
+    => vec![],
+    NonEmptyParamList,
+};
+NonEmptyParamList: Vec<Param> = {
+    <p:Param> => vec![p],
+    <p:Param> "," <rest:NonEmptyParamList> => {
+        let mut v = vec![p]; v.extend(rest); v
+    },
+};
+Param: Param = {
+    <name:Ident> ":" <ty:SimpleType> => Param { name, ty },
+};
+
+// ─── Trait ────────────────────────────────────────────────────
+
+TraitDef: TraitDef = {
+    <l:@L> "trait" <name:Ident> "{" <members:TraitMember*> "}" <r:@R>
+    => TraitDef { name, parent: None, members, span: (l, r) },
+    <l:@L> "trait" <name:Ident> ":" <parent:Ident> "{" <members:TraitMember*> "}" <r:@R>
+    => TraitDef { name, parent: Some(parent), members, span: (l, r) },
+};
+
+TraitMember: TraitMember = {
+    MethodSig => TraitMember::MethodSig(<>),
+    FuncDef   => TraitMember::FuncDef(<>),
+};
+
+MethodSig: MethodSig = {
+    <l:@L> <h:FuncHeader> <r:@R>
+    => MethodSig { name: h.0, params: h.1, ret_ty: h.2, span: (l, r) },
+};
+
+// ─── Impl ────────────────────────────────────────────────────
+
+ImplDef: ImplDef = {
+    <l:@L> "impl" <trait_name:Ident> "for" <for_ty:Ident> "{" <members:FuncDef*> "}" <r:@R>
+    => ImplDef { trait_name, for_ty: Type::Named(for_ty), members, span: (l, r) },
+};
+
+// ─── 文 ───────────────────────────────────────────────────────
+
+Stmt: Stmt = {
+    <s:LetStmt> ";" => Stmt::Let(s),
+    <e:Expr> ";"    => Stmt::Expr(e),
+};
+
+// ─── パイプライン ─────────────────────────────────────────────
+// subject は CallExpr (関数呼び出しまたはリテラル)
+// PipelineStep+ が続くことでパイプラインと確定
+
+Pipeline: Pipeline = {
+    <l:@L> <subject:CallExpr> <first:PipelineStep> <rest:PipelineStep*> <r:@R> => {
+        let mut steps = vec![first];
+        steps.extend(rest);
+        Pipeline { subject: Box::new(subject), steps, span: (l, r) }
+    },
+};
+
+PipelineStep: (BackboneOp, PipelineStep) = {
+    <op:BackboneOp> <step:StepExpr> => (op, step),
+};
+
+BackboneOp: BackboneOp = {
+    "::"  => BackboneOp::Next,
+};
+
+StepExpr: PipelineStep = {
+    // AliasedCall: `foo$x(expr)` — `$` が来るので ImplicitCall と確定的に区別
+    <func:Ident> "$" <alias:Ident> "(" <body:Expr> ")"
+    => PipelineStep::AliasedCall { func, alias, body: Box::new(body) },
+    // ImplicitCall: `trim()` or `trim(a, b)`
+    <func:Ident> "(" <args:ArgList> ")"
+    => PipelineStep::ImplicitCall { func, args },
+    // BinOpRhs: `+ 1` など。rhs は LitOrIdent のみ（曖昧性回避）
+    <op:BinOpSymbol> <rhs:LitOrIdent>
+    => PipelineStep::BinOpRhs { op, rhs: Box::new(rhs) },
+    // FlowStructure
+    FlowStructure => PipelineStep::Flow(<>),
+};
+
+// ─── FlowStructure ────────────────────────────────────────────
+
+FlowStructure: FlowStructure = {
+    // match ( Branch* ) — ブランチは {} で囲む
+    "match" "(" <branches:MatchBranch*> ")"
+    => FlowStructure::Match(branches),
+
+    // :if cond :then expr
+    ":if" <cond:LitOrIdent> ":then" <then:LitOrIdent>
+    => FlowStructure::If { cond: Box::new(cond), then: Box::new(then), else_: None },
+
+    // :if cond :then expr :else expr
+    ":if" <cond:LitOrIdent> ":then" <then:LitOrIdent> ":else" <else_:LitOrIdent>
+    => FlowStructure::If { cond: Box::new(cond), then: Box::new(then), else_: Some(Box::new(else_)) },
+
+    // :while cond :then expr
+    ":while" <cond:LitOrIdent> ":then" <then:LitOrIdent>
+    => FlowStructure::While { cond: Box::new(cond), then: Box::new(then) },
+};
+
+// MatchBranch: Pattern -> Pipeline
+MatchBranch: MatchBranch = {
+    <pattern:Pattern> "->" <l:@L> <subject:CallExpr> <steps:PipelineStep*> <r:@R>
+    => MatchBranch {
+        pattern,
+        body: Pipeline { subject: Box::new(subject), steps, span: (l, r) },
+    },
+};
+
+Pattern: Pattern = {
+    <name:Ident> "(" ")" => Pattern::Constructor(name, vec![]),
+    <name:Ident> "(" <inner:NonEmptyPatternList> ")" => Pattern::Constructor(name, inner),
+    "_"  => Pattern::Wildcard,
+    <name:Ident> => Pattern::Ident(name),
+};
+NonEmptyPatternList: Vec<Pattern> = {
+    <p:Pattern> => vec![p],
+    <p:Pattern> "," <rest:NonEmptyPatternList> => { let mut v = vec![p]; v.extend(rest); v },
+};
+
+// ─── 式 ───────────────────────────────────────────────────────
+// #[precedence] で左結合二項演算を定義
+
+Expr: Expr = {
+    // 比較演算子 (低優先度)
+    #[precedence(level="1")] #[assoc(side="left")]
+    <l:Expr> "==" <r:Expr> => Expr::BinOp { op: BinOp::Eq,  lhs: Box::new(l), rhs: Box::new(r) },
+    #[precedence(level="1")] #[assoc(side="left")]
+    <l:Expr> "!=" <r:Expr> => Expr::BinOp { op: BinOp::Ne,  lhs: Box::new(l), rhs: Box::new(r) },
+    #[precedence(level="1")] #[assoc(side="left")]
+    <l:Expr> "<"  <r:Expr> => Expr::BinOp { op: BinOp::Lt,  lhs: Box::new(l), rhs: Box::new(r) },
+    #[precedence(level="1")] #[assoc(side="left")]
+    <l:Expr> "<=" <r:Expr> => Expr::BinOp { op: BinOp::Le,  lhs: Box::new(l), rhs: Box::new(r) },
+    #[precedence(level="1")] #[assoc(side="left")]
+    <l:Expr> ">"  <r:Expr> => Expr::BinOp { op: BinOp::Gt,  lhs: Box::new(l), rhs: Box::new(r) },
+    #[precedence(level="1")] #[assoc(side="left")]
+    <l:Expr> ">=" <r:Expr> => Expr::BinOp { op: BinOp::Ge,  lhs: Box::new(l), rhs: Box::new(r) },
+    // 加減算
+    #[precedence(level="2")] #[assoc(side="left")]
+    <l:Expr> "+"  <r:Expr> => Expr::BinOp { op: BinOp::Add, lhs: Box::new(l), rhs: Box::new(r) },
+    #[precedence(level="2")] #[assoc(side="left")]
+    <l:Expr> "-"  <r:Expr> => Expr::BinOp { op: BinOp::Sub, lhs: Box::new(l), rhs: Box::new(r) },
+    // 乗除算
+    #[precedence(level="3")] #[assoc(side="left")]
+    <l:Expr> "*"  <r:Expr> => Expr::BinOp { op: BinOp::Mul, lhs: Box::new(l), rhs: Box::new(r) },
+    #[precedence(level="3")] #[assoc(side="left")]
+    <l:Expr> "/"  <r:Expr> => Expr::BinOp { op: BinOp::Div, lhs: Box::new(l), rhs: Box::new(r) },
+    #[precedence(level="3")] #[assoc(side="left")]
+    <l:Expr> "%"  <r:Expr> => Expr::BinOp { op: BinOp::Mod, lhs: Box::new(l), rhs: Box::new(r) },
+
+    // パイプライン (最低優先度)
+    #[precedence(level="0")]
+    <p:Pipeline> => Expr::Pipeline(Box::new(p)),
+
+    // ベース
+    #[precedence(level="4")]
+    CallExpr,
+};
+
+// 関数呼び出し・括弧・Lambda・HeadlessPipeline
+CallExpr: Expr = {
+    // Lambda: `(params -> body)` — `->` で区別
+    "(" <params:LambdaParamList> "->" <body:Expr> ")"
+    => Expr::Lambda { params, body: Box::new(body) },
+    // HeadlessPipeline: `( :: step+ )` — BackboneOp で区別
+    "(" <first:PipelineStep> <rest:PipelineStep*> ")" => {
+        let mut v = vec![first.1];
+        v.extend(rest.into_iter().map(|(_, s)| s));
+        Expr::HeadlessPipeline(v)
+    },
+    // 括弧式
+    "(" <e:Expr> ")" => e,
+    // 関数呼び出し: Ident が来て次が `(` なら呼び出し
+    <func:Ident> "(" <args:ArgList> ")"
+    => Expr::Call { func: Box::new(Expr::Ident(func)), args },
+    LitOrIdent,
+};
+
+// リテラルまたは識別子（関数呼び出しなし）
+LitOrIdent: Expr = {
+    IntLit    => Expr::Int(<>),
+    FloatLit  => Expr::Float(<>),
+    StringLit => Expr::Str(<>),
+    "true"    => Expr::Bool(true),
+    "false"   => Expr::Bool(false),
+    Ident     => Expr::Ident(<>),
+};
+
+// ─── 補助 ─────────────────────────────────────────────────────
+
+ArgList: Vec<Expr> = {
+    => vec![],
+    NonEmptyArgList,
+};
+NonEmptyArgList: Vec<Expr> = {
+    <e:Expr> => vec![e],
+    <e:Expr> "," <rest:NonEmptyArgList> => { let mut v = vec![e]; v.extend(rest); v },
+};
+
+LambdaParamList: Vec<LambdaParam> = {
+    => vec![],
+    NonEmptyLPList,
+};
+NonEmptyLPList: Vec<LambdaParam> = {
+    <p:LambdaParam> => vec![p],
+    <p:LambdaParam> "," <rest:NonEmptyLPList> => { let mut v = vec![p]; v.extend(rest); v },
+};
+LambdaParam: LambdaParam = {
+    <name:Ident> ":" <ty:SimpleType> => LambdaParam { name, ty: Some(ty) },
+    <name:Ident>                     => LambdaParam { name, ty: None },
+};
+
+// BinOpSymbol は StepExpr/Pipeline の BinOpRhs でのみ使用
+BinOpSymbol: BinOp = {
+    "+"  => BinOp::Add,
+    "-"  => BinOp::Sub,
+    "*"  => BinOp::Mul,
+    "/"  => BinOp::Div,
+    "%"  => BinOp::Mod,
+    "==" => BinOp::Eq,
+    "!=" => BinOp::Ne,
+    "<"  => BinOp::Lt,
+    "<=" => BinOp::Le,
+    ">"  => BinOp::Gt,
+    ">=" => BinOp::Ge,
+};

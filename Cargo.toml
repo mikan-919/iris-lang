@@ -1,0 +1,14 @@
+[package]
+name = "iris-lang"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"
+lalrpop-util = { version = "0.22", features = ["lexer"] }
+logos = "0.15"
+
+[build-dependencies]
+lalrpop = "0.22"
