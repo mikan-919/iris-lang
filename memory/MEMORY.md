@@ -1,0 +1,3 @@
+- [Parser slice assumptions](parser-slice-assumptions.md) — docs未記載で独自に決めた構文の仮定（要確認）
+- [Sema plan](sema-plan.md) — 意味解析の縦切り順序と現在地（名前解決→型検査→所有権DAG 完了）
+- [Codegen plan](codegen-plan.md) — LLVM コード生成の方式（テキストIR＋clang）と現在地
