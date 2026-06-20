@@ -10,9 +10,12 @@
 //! - 算術 `+ - * / %`、比較、論理 `&& ||`（短絡）、単項 `-`
 //! - `if` 文・三項演算子（基本ブロックで分岐）
 //! - 整数 `i8..u64`（符号付き/なしで命令を選ぶ）と浮動小数 `f32`/`f64`
+//! - 参照 `&T` / `&mut T`（opaque ポインタ。`&x` は場所のアドレス。値の文脈では
+//!   暗黙にデリファレンス＝`load` する）
 //!
 //! ローカルは alloca + load/store で扱う（SSA 化は LLVM の mem2reg に任せられる）。
-//! struct・参照・`!`・文字列・ジェネリクスなどは未対応（エラーにする）。
+//! struct・`!`・文字列・ジェネリクスなどは未対応（エラーにする）。参照越しの代入
+//! （write-through）はまだ無く、参照への再代入は束縛の付け替えになる。
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -76,6 +79,7 @@ pub fn emit_module(
                     locals: HashMap::new(),
                     terminated: false,
                     loops: Vec::new(),
+                    ret_ty: Ty::unit(),
                 };
                 let func_ir = cg.emit_function(f)?;
                 module.push_str(&func_ir);
@@ -101,10 +105,16 @@ struct FnCodegen<'a> {
     terminated: bool,
     /// ネスト中のループの (continue 先ラベル, break 先ラベル) のスタック。
     loops: Vec<(String, String)>,
+    /// 現在の関数の戻り値の内部型（`return` での暗黙 deref 判定に使う）。
+    ret_ty: Ty,
 }
 
 impl<'a> FnCodegen<'a> {
     fn emit_function(&mut self, f: &Function) -> Result<String, CodegenError> {
+        self.ret_ty = match &f.ret {
+            Some(t) => Ty::from_ast(t),
+            None => Ty::unit(),
+        };
         let ret_ty = match &f.ret {
             Some(t) => llvm_ty(&Ty::from_ast(t)).map_err(|m| CodegenError::new(t.span(), m))?,
             None => "void".to_string(),
@@ -178,13 +188,12 @@ impl<'a> FnCodegen<'a> {
             Stmt::Let {
                 ty, value, span, ..
             } => {
-                let llty = match ty {
-                    Some(t) => {
-                        llvm_ty(&Ty::from_ast(t)).map_err(|m| CodegenError::new(t.span(), m))?
-                    }
-                    None => self.expr_llvm_ty(value)?,
+                // 注釈があればその型、無ければ値の型（参照はそのまま束縛する）。
+                let want = match ty {
+                    Some(t) => Ty::from_ast(t),
+                    None => self.raw_ty(value).defaulted(),
                 };
-                let v = self.gen_expr(value, &llty)?;
+                let (v, llty) = self.gen_value(value, &want)?;
                 if let Some(&id) = self.def_spans.get(span) {
                     let ptr = format!("%{}.slot{}", "v", id);
                     self.emit(&format!("{ptr} = alloca {llty}"));
@@ -196,8 +205,8 @@ impl<'a> FnCodegen<'a> {
             Stmt::Return { value, .. } => {
                 match value {
                     Some(v) => {
-                        let llty = self.expr_llvm_ty(v)?;
-                        let r = self.gen_expr(v, &llty)?;
+                        let want = self.ret_ty.clone();
+                        let (r, llty) = self.gen_value(v, &want)?;
                         self.emit(&format!("ret {llty} {r}"));
                     }
                     None => self.emit("ret void"),
@@ -207,7 +216,8 @@ impl<'a> FnCodegen<'a> {
             }
             Stmt::Assign { target, value, .. } => {
                 let (ptr, llty) = self.place_ptr(target)?;
-                let v = self.gen_expr(value, &llty)?;
+                let want = self.raw_ty(target).defaulted();
+                let (v, _) = self.gen_value(value, &want)?;
                 self.emit(&format!("store {llty} {v}, ptr {ptr}"));
                 Ok(())
             }
@@ -248,7 +258,7 @@ impl<'a> FnCodegen<'a> {
 
         self.emit(&format!("br label %{cond_l}"));
         self.emit_label(&cond_l);
-        let c = self.gen_expr(cond, "i1")?;
+        let (c, _) = self.gen_value(cond, &Ty::named("bool"))?;
         self.emit(&format!("br i1 {c}, label %{body_l}, label %{end_l}"));
 
         self.emit_label(&body_l);
@@ -340,9 +350,9 @@ impl<'a> FnCodegen<'a> {
     fn gen_unary(&mut self, op: UnaryOp, inner: &Expr, span: Span) -> Result<String, CodegenError> {
         match op {
             UnaryOp::Neg => {
-                let ity = self.iris_ty(inner);
-                let ty = llvm_ty(&ity).map_err(|m| CodegenError::new(inner.span, m))?;
-                let v = self.gen_expr(inner, &ty)?;
+                // 被演算子が参照なら暗黙にデリファレンスして数値を得る。
+                let ity = self.iris_ty(inner).peel_refs().clone();
+                let (v, ty) = self.gen_value(inner, &ity)?;
                 let r = self.fresh_tmp();
                 if num_kind(&ity) == NumKind::Float {
                     self.emit(&format!("{r} = fneg {ty} {v}"));
@@ -351,8 +361,12 @@ impl<'a> FnCodegen<'a> {
                 }
                 Ok(r)
             }
+            // `&x` / `&mut x` は場所のアドレス（ポインタ）を値として返す。
             UnaryOp::Ref | UnaryOp::RefMut => {
-                Err(CodegenError::new(span, "参照のコード生成は未対応です"))
+                let (ptr, _) = self.place_ptr(inner).map_err(|_| {
+                    CodegenError::new(span, "この場所の参照はコード生成に未対応です")
+                })?;
+                Ok(ptr)
             }
         }
     }
@@ -375,9 +389,10 @@ impl<'a> FnCodegen<'a> {
             _ => {}
         }
 
-        let (opnd_ty, kind) = self.operand_ty(lhs, rhs)?;
-        let l = self.gen_expr(lhs, &opnd_ty)?;
-        let r = self.gen_expr(rhs, &opnd_ty)?;
+        let (chosen, opnd_ty, kind) = self.operand_ty(lhs, rhs)?;
+        // 参照の被演算子は gen_value が暗黙にデリファレンスする。
+        let (l, _) = self.gen_value(lhs, &chosen)?;
+        let (r, _) = self.gen_value(rhs, &chosen)?;
         let res = self.fresh_tmp();
 
         // 算術・比較の命令は数値クラス（符号付き/なし整数・浮動小数）で変わる。
@@ -437,14 +452,14 @@ impl<'a> FnCodegen<'a> {
         };
         let mut arg_strs = Vec::new();
         for (i, a) in args.iter().enumerate() {
-            let pty = func
+            // 仮引数の型を期待型として渡す。引数が参照で仮引数が値型なら
+            // gen_value が暗黙にデリファレンスする。
+            let want = func
                 .params
                 .get(i)
-                .map(|p| llvm_ty(&Ty::from_ast(&p.ty)))
-                .transpose()
-                .map_err(|m| CodegenError::new(a.span, m))?
-                .unwrap_or_else(|| "i32".to_string());
-            let v = self.gen_expr(a, &pty)?;
+                .map(|p| Ty::from_ast(&p.ty))
+                .unwrap_or(Ty::Infer);
+            let (v, pty) = self.gen_value(a, &want)?;
             arg_strs.push(format!("{pty} {v}"));
         }
         let call = format!("call {ret_ty} @{name}({})", arg_strs.join(", "));
@@ -468,7 +483,7 @@ impl<'a> FnCodegen<'a> {
     ) -> Result<String, CodegenError> {
         let slot = self.fresh_tmp();
         self.emit(&format!("{slot} = alloca {resty}"));
-        let c = self.gen_expr(cond, "i1")?;
+        let (c, _) = self.gen_value(cond, &Ty::named("bool"))?;
         let then_l = self.fresh_label("tern.then");
         let else_l = self.fresh_label("tern.else");
         let merge_l = self.fresh_label("tern.end");
@@ -505,7 +520,7 @@ impl<'a> FnCodegen<'a> {
         then: &Block,
         otherwise: Option<&Else>,
     ) -> Result<(), CodegenError> {
-        let c = self.gen_expr(cond, "i1")?;
+        let (c, _) = self.gen_value(cond, &Ty::named("bool"))?;
         let then_l = self.fresh_label("if.then");
         let merge_l = self.fresh_label("if.end");
         let else_l = if otherwise.is_some() {
@@ -590,10 +605,54 @@ impl<'a> FnCodegen<'a> {
             .defaulted()
     }
 
+    /// 式の内部型（型検査の結果のまま。リテラルは未確定型を保つ）。
+    fn raw_ty(&self, expr: &Expr) -> Ty {
+        self.types.get(&expr.span).cloned().unwrap_or(Ty::Infer)
+    }
+
+    /// 式を評価し、期待型 `want` に合わせて必要なら暗黙デリファレンスして
+    /// (値レジスタ, LLVM 型名) を返す。`want` が値型で式が参照型のときだけ
+    /// `load` を挟んで指す先の値を取り出す（`want` が参照型・`Infer` なら参照のまま）。
+    fn gen_value(&mut self, expr: &Expr, want: &Ty) -> Result<(String, String), CodegenError> {
+        let want_value = !matches!(want, Ty::Infer | Ty::Error | Ty::Ref { .. });
+        // リテラルの幅は期待型で決めたいので、値型を期待するときは want をヒントにする。
+        let hint_ty = if want_value {
+            want.clone()
+        } else {
+            self.raw_ty(expr).defaulted()
+        };
+        let hint = llvm_ty(&hint_ty).map_err(|m| CodegenError::new(expr.span, m))?;
+        let mut val = self.gen_expr(expr, &hint)?;
+
+        // 参照の被演算子を、値型が期待される間だけ 1 段ずつ参照外しする。
+        let mut cur = self.raw_ty(expr).defaulted();
+        while let Ty::Ref { inner, .. } = &cur {
+            if !want_value {
+                break;
+            }
+            let inner_ty = (**inner).clone();
+            let inner_ll = llvm_ty(&inner_ty).map_err(|m| CodegenError::new(expr.span, m))?;
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = load {inner_ll}, ptr {val}"));
+            val = r;
+            cur = inner_ty;
+        }
+
+        // 値型を期待し参照を外しきったときは want の幅で確定（リテラル対策）。
+        let llty = if want_value && !matches!(cur, Ty::Ref { .. }) {
+            llvm_ty(want).map_err(|m| CodegenError::new(expr.span, m))?
+        } else {
+            llvm_ty(&cur).map_err(|m| CodegenError::new(expr.span, m))?
+        };
+        Ok((val, llty))
+    }
+
     /// 二項演算の被演算子型と数値クラス（リテラルでない側を優先）。
-    fn operand_ty(&self, lhs: &Expr, rhs: &Expr) -> Result<(String, NumKind), CodegenError> {
-        let raw_l = self.types.get(&lhs.span).cloned().unwrap_or(Ty::Infer);
-        let raw_r = self.types.get(&rhs.span).cloned().unwrap_or(Ty::Infer);
+    /// 参照の被演算子は暗黙デリファレンスのため指す先の型で判定する。
+    /// 戻り値は (被演算子の内部型, LLVM 型名, 数値クラス)。
+    fn operand_ty(&self, lhs: &Expr, rhs: &Expr) -> Result<(Ty, String, NumKind), CodegenError> {
+        let raw_l = self.raw_ty(lhs).peel_refs().clone();
+        let raw_r = self.raw_ty(rhs).peel_refs().clone();
         let chosen = match (is_literal_ty(&raw_l), is_literal_ty(&raw_r)) {
             (true, false) => raw_r,
             (false, true) => raw_l,
@@ -601,7 +660,7 @@ impl<'a> FnCodegen<'a> {
         }
         .defaulted();
         let llty = llvm_ty(&chosen).map_err(|m| CodegenError::new(lhs.span, m))?;
-        Ok((llty, num_kind(&chosen)))
+        Ok((chosen.clone(), llty, num_kind(&chosen)))
     }
 
     fn emit(&mut self, line: &str) {
@@ -642,6 +701,8 @@ fn llvm_ty(ty: &Ty) -> Result<String, String> {
     match ty {
         Ty::IntLit => Ok("i32".to_string()),
         Ty::FloatLit => Ok("double".to_string()),
+        // 参照は opaque ポインタ（指す先の型は命令側で扱う）。
+        Ty::Ref { .. } => Ok("ptr".to_string()),
         Ty::Named { name, args } if args.is_empty() => match name.as_str() {
             // 整数は LLVM では符号を型に持たない（幅だけ）。符号は命令側で扱う。
             "i8" | "u8" => Ok("i8".to_string()),
@@ -700,6 +761,7 @@ fn float_const(v: f64, llty: &str) -> String {
 fn zero_value(llty: &str) -> &'static str {
     match llty {
         "float" | "double" => "0.0",
+        "ptr" => "null",
         _ => "0",
     }
 }

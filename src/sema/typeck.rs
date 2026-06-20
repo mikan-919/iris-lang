@@ -641,6 +641,8 @@ impl<'a> Checker<'a> {
     }
 
     fn expect_bool(&mut self, t: &Ty, span: Span, ctx: &str) {
+        // 参照は暗黙にデリファレンスされる（`&bool` は条件として使える）。
+        let t = t.peel_refs();
         if !t.is_bool() && *t != Ty::Error && *t != Ty::Infer {
             self.error(
                 span,
@@ -718,6 +720,13 @@ impl<'a> Checker<'a> {
         if *expected == FloatLit && self.is_float_like(actual) {
             return true;
         }
+        // 暗黙デリファレンス: `&T` の値は `T` が期待される場所で自動的に
+        // 参照外しされる（`&mut T` → `&T` の参照同士の適合は下の match で扱う）。
+        if let Ty::Ref { inner, .. } = actual
+            && !matches!(expected, Ty::Ref { .. })
+        {
+            return self.assignable(expected, inner);
+        }
         match (expected, actual) {
             (Named { name: n1, args: a1 }, Named { name: n2, args: a2 }) => {
                 n1 == n2
@@ -748,7 +757,10 @@ impl<'a> Checker<'a> {
     }
 
     /// 数値 2 項演算の結果型。両者が同じ数値族のときのみ成立する。
+    /// 参照（`&T`）の被演算子は暗黙にデリファレンスして判定する。
     fn join_numeric(&self, a: &Ty, b: &Ty) -> Option<Ty> {
+        let a = a.peel_refs();
+        let b = b.peel_refs();
         if matches!(a, Ty::Error | Ty::Infer) {
             return Some(b.clone());
         }

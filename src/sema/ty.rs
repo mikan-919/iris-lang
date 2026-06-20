@@ -115,6 +115,16 @@ impl Ty {
         }
     }
 
+    /// 参照（`&T` / `&mut T`）を剥がして指す先の型を返す。多段参照も剥がす。
+    /// 参照は値が期待される場所で自動的にデリファレンスされる（暗黙 deref）。
+    pub fn peel_refs(&self) -> &Ty {
+        let mut cur = self;
+        while let Ty::Ref { inner, .. } = cur {
+            cur = inner;
+        }
+        cur
+    }
+
     /// リテラルの未確定型を既定の具体型へ確定する（`IntLit`→`i32`, `FloatLit`→`f64`）。
     /// それ以外はそのまま返す。
     pub fn defaulted(self) -> Ty {

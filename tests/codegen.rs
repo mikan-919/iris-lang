@@ -144,6 +144,44 @@ fn runs_ternary_and_short_circuit() {
 }
 
 #[test]
+fn emits_reference_params_as_ptr() {
+    // 参照は opaque ポインタ。値として使うときは暗黙にデリファレンス（load）する。
+    let ir = emit("fn add(a: &i32, b: &i32): i32 {\n    return a + b\n}");
+    assert!(ir.contains("define i32 @add(ptr %arg0, ptr %arg1)"));
+    // 参照そのもの（ptr）を読み、続けて指す先の i32 を読む二段 load。
+    assert!(ir.contains("load ptr, ptr"));
+    assert!(ir.contains("load i32, ptr"));
+    assert!(ir.contains("add i32"));
+}
+
+#[test]
+fn runs_reference_deref_sum() {
+    // `&x` で場所のアドレスを渡し、関数側で暗黙 deref して合計する。
+    let src = "fn add(a: &i32, b: &i32): i32 {\n    return a + b\n}\nfn main(): i32 {\n    let x = 20\n    let y = 22\n    return add(&x, &y)\n}";
+    if let Some(code) = run_exit_code(src, "ref_sum") {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn runs_reference_local_binding() {
+    // 参照をローカルに束縛し、値の文脈で使うと暗黙にデリファレンスされる。
+    let src = "fn main(): i32 {\n    let x = 7\n    let r = &x\n    return r + 1\n}";
+    if let Some(code) = run_exit_code(src, "ref_local") {
+        assert_eq!(code, 8);
+    }
+}
+
+#[test]
+fn runs_mut_ref_and_bool_ref_condition() {
+    // `&mut` の引き渡しと、`&bool` の条件での暗黙 deref。
+    let src = "fn pick(flag: &bool, a: &i32, b: &i32): i32 {\n    if flag {\n        return a\n    }\n    return b\n}\nfn main(): i32 {\n    let cond = true\n    let mut x = 30\n    let y = 12\n    return pick(&cond, &mut x, &y)\n}";
+    if let Some(code) = run_exit_code(src, "ref_mut_bool") {
+        assert_eq!(code, 30);
+    }
+}
+
+#[test]
 fn emits_while_loop_blocks() {
     let ir = emit("fn main(): i32 {\n    let mut i = 0\n    while i < 3 {\n        i = i + 1\n    }\n    return i\n}");
     assert!(ir.contains("while.cond"));

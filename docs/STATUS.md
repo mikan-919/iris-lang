@@ -149,11 +149,12 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-20。
   （`fadd`/`fsub`/`fmul`/`fdiv`/`frem`・`fcmp o*`・`fneg`）。LLVM 型は符号を持たないため数値クラス（`NumKind`）を
   iris の `Ty` から導いて命令を選ぶ。浮動小数リテラルは double ビット列（`0x...`）で出力
 - ローカルは alloca + load/store（SSA 化は LLVM の mem2reg に委ねられる）
+- **参照 `&T` / `&mut T`**: opaque ポインタ（`ptr`）で表現。`&x` / `&mut x` は場所（ローカル/引数の alloca）のアドレスを値として返す。値が期待される文脈（算術・比較・条件・引数・`return`・注釈付き `let`）では**暗黙にデリファレンス**（`load`）して指す先の値を取り出す。多段参照も剥がす。typeck 側も `&T` を `T` の位置で受け入れる（`assignable` / `join_numeric` / `expect_bool` で参照を剥がす）。参照越しの代入（write-through）は未対応で、参照変数への再代入は束縛の付け替えになる
 - `main(): i32` の戻り値が終了コードになり、`clang` で実行して検証できる
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
-- 未対応（今後）: struct/enum・メンバ/構造体リテラル、参照、
+- 未対応（今後）: struct/enum・メンバ/構造体リテラル、参照越しの代入（write-through）、
   `!`（Result/Option 伝播）、文字列、ジェネリクス
 
 ### 標準ライブラリ（最小・iris 自身で記述）
