@@ -63,9 +63,52 @@ fn emits_short_circuit_for_logical_and() {
 
 #[test]
 fn unsupported_type_is_reported() {
-    // f64 はまだ未対応。
-    let err = iris_lang::compile_ir("test", "fn f(): f64 {\n    return 1.0\n}");
+    // 文字列はまだコード生成に未対応。
+    let err = iris_lang::compile_ir("test", "fn f(): string {\n    return \"hi\"\n}");
     assert!(err.is_err());
+}
+
+#[test]
+fn emits_float_arithmetic() {
+    // f64 の算術・比較は浮動小数命令で生成される。
+    let ir = emit("fn f(a: f64, b: f64): bool {\n    return a + b == 4.0\n}");
+    assert!(ir.contains("define i1 @f(double %arg0, double %arg1)"));
+    assert!(ir.contains("fadd double"));
+    assert!(ir.contains("fcmp oeq double"));
+}
+
+#[test]
+fn emits_unsigned_division() {
+    // 符号なし整数は udiv/icmp ult を選ぶ。
+    let ir = emit("fn f(a: u32, b: u32): bool {\n    return a / b < b\n}");
+    assert!(ir.contains("udiv i32"));
+    assert!(ir.contains("icmp ult i32"));
+}
+
+#[test]
+fn emits_wide_integer() {
+    // i64 リテラル・演算は i64 幅で生成される。
+    let ir = emit("fn f(): i64 {\n    let big: i64 = 5000000000\n    return big + 1\n}");
+    assert!(ir.contains("define i64 @f()"));
+    assert!(ir.contains("add i64"));
+}
+
+#[test]
+fn runs_float_computation() {
+    // 浮動小数の加算と比較が実行時に正しいこと。
+    let src = "fn main(): i32 {\n    let x: f64 = 1.5\n    let y: f64 = 2.5\n    if x + y == 4.0 {\n        return 7\n    }\n    return 0\n}";
+    if let Some(code) = run_exit_code(src, "float") {
+        assert_eq!(code, 7);
+    }
+}
+
+#[test]
+fn runs_unsigned_division() {
+    // 符号なし除算の実行結果。
+    let src = "fn main(): i32 {\n    let a: u32 = 200\n    let b: u32 = 7\n    if a / b == 28 {\n        return 9\n    }\n    return 0\n}";
+    if let Some(code) = run_exit_code(src, "udiv") {
+        assert_eq!(code, 9);
+    }
 }
 
 #[test]

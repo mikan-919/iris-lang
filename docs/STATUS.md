@@ -10,7 +10,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-20。
 ```
 
 現状はフロントエンドの **字句解析 → 構文解析 → AST → 名前解決 → 型検査 → 所有権 DAG 検査** までを縦切りで実装済み。
-さらに **LLVM IR（テキスト `.ll`）生成**に着手済み（`i32` / `bool` の部分集合）。`clang` で実行ファイル化できる。
+さらに **LLVM IR（テキスト `.ll`）生成**に着手済み（数値プリミティブ `i8..u64` / `f32` / `f64` と `bool`）。`clang` で実行ファイル化できる。
 エラーはすべて [miette](https://github.com/zkat/miette) でソース位置付きで表示する。
 字句・構文解析には [nom 8](https://github.com/rust-bakery/nom)（+ nom_locate）を用いる。
 
@@ -29,7 +29,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-20。
 | `src/sema/ty.rs` | 型検査の内部型表現 `Ty` | ✅（縦切り範囲） |
 | `src/sema/typeck.rs` | 型検査（型付け・整合性検査・可変性検査） | ✅（縦切り範囲） |
 | `src/sema/ownership/` | 所有権 DAG（型グラフ循環検出＋ムーブ/借用グラフ＋借用競合） | ✅（縦切り範囲） |
-| `src/codegen.rs` | LLVM IR（テキスト）生成 | ✅（i32 / bool） |
+| `src/codegen.rs` | LLVM IR（テキスト）生成 | ✅（数値プリミティブ / bool） |
 | `std/std.iris` | 最小の標準ライブラリ（iris 自身で記述・自動前置） | ✅ |
 | `src/diagnostics.rs` | miette 診断 | ✅ |
 | `src/lib.rs` / `src/main.rs` | ライブラリ / CLI（AST 表示・`--emit-llvm`・`build`/`run`） | ✅ |
@@ -142,15 +142,18 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-20。
 落とす。この環境には `llvm-config` が無く inkwell/llvm-sys が使えないため、まずは
 テキスト出力とし、`clang file.ll -o out` で実行ファイル化する（JIT は将来 LLVM 導入時）。
 
-- 対応（確実性のため `i32` / `bool` に限定）: 関数定義・引数・再帰呼び出し、`let`/再代入/`return`、
+- 対応（数値プリミティブと `bool`）: 関数定義・引数・再帰呼び出し、`let`/再代入/`return`、
   算術 `+ - * / %`、比較、論理 `&& ||`（短絡）、単項 `-`、`if` 文、三項演算子、
   ループ `while` / `loop` / `break` / `continue`（基本ブロック＋後方辺。`break`/`continue` はラベルスタックで解決）
+- **数値型**: 整数 `i8..u64`（符号付き/なしで `sdiv`/`udiv`・`icmp slt`/`ult` 等を選択）と浮動小数 `f32`/`f64`
+  （`fadd`/`fsub`/`fmul`/`fdiv`/`frem`・`fcmp o*`・`fneg`）。LLVM 型は符号を持たないため数値クラス（`NumKind`）を
+  iris の `Ty` から導いて命令を選ぶ。浮動小数リテラルは double ビット列（`0x...`）で出力
 - ローカルは alloca + load/store（SSA 化は LLVM の mem2reg に委ねられる）
 - `main(): i32` の戻り値が終了コードになり、`clang` で実行して検証できる
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
-- 未対応（今後）: `f64` など他の型・幅、struct/enum・メンバ/構造体リテラル、参照、
+- 未対応（今後）: struct/enum・メンバ/構造体リテラル、参照、
   `!`（Result/Option 伝播）、文字列、ジェネリクス
 
 ### 標準ライブラリ（最小・iris 自身で記述）

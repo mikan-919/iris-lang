@@ -4,14 +4,15 @@
 //! `clang file.ll -o out` で実行ファイルにできる（このリポジトリの環境には
 //! `llvm-config` が無く inkwell/llvm-sys が使えないため、まずはテキスト出力とする）。
 //!
-//! 最初のスライスの対応範囲（確実性のため `i32` / `bool` に限定）:
+//! 対応範囲（数値プリミティブと `bool`）:
 //! - 関数定義・引数・再帰呼び出し
 //! - `let` / 再代入 / `return`
 //! - 算術 `+ - * / %`、比較、論理 `&& ||`（短絡）、単項 `-`
 //! - `if` 文・三項演算子（基本ブロックで分岐）
+//! - 整数 `i8..u64`（符号付き/なしで命令を選ぶ）と浮動小数 `f32`/`f64`
 //!
 //! ローカルは alloca + load/store で扱う（SSA 化は LLVM の mem2reg に任せられる）。
-//! `f64` 等のほかの型・struct・参照・`!`・文字列などは未対応（エラーにする）。
+//! struct・参照・`!`・文字列・ジェネリクスなどは未対応（エラーにする）。
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -145,7 +146,7 @@ impl<'a> FnCodegen<'a> {
             if ret_ty == "void" {
                 self.emit("ret void");
             } else {
-                self.emit(&format!("ret {ret_ty} 0"));
+                self.emit(&format!("ret {ret_ty} {}", zero_value(&ret_ty)));
             }
         }
 
@@ -301,6 +302,7 @@ impl<'a> FnCodegen<'a> {
     fn gen_expr(&mut self, expr: &Expr, hint: &str) -> Result<String, CodegenError> {
         match &expr.kind {
             ExprKind::Int(v) => Ok(v.to_string()),
+            ExprKind::Float(v) => Ok(float_const(*v, hint)),
             ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
             ExprKind::Ident(_) => {
                 let (ptr, ty) = self.lookup(expr)?;
@@ -338,10 +340,15 @@ impl<'a> FnCodegen<'a> {
     fn gen_unary(&mut self, op: UnaryOp, inner: &Expr, span: Span) -> Result<String, CodegenError> {
         match op {
             UnaryOp::Neg => {
-                let ty = self.expr_llvm_ty(inner)?;
+                let ity = self.iris_ty(inner);
+                let ty = llvm_ty(&ity).map_err(|m| CodegenError::new(inner.span, m))?;
                 let v = self.gen_expr(inner, &ty)?;
                 let r = self.fresh_tmp();
-                self.emit(&format!("{r} = sub {ty} 0, {v}"));
+                if num_kind(&ity) == NumKind::Float {
+                    self.emit(&format!("{r} = fneg {ty} {v}"));
+                } else {
+                    self.emit(&format!("{r} = sub {ty} 0, {v}"));
+                }
                 Ok(r)
             }
             UnaryOp::Ref | UnaryOp::RefMut => {
@@ -368,24 +375,42 @@ impl<'a> FnCodegen<'a> {
             _ => {}
         }
 
-        let opnd_ty = self.operand_ty(lhs, rhs)?;
+        let (opnd_ty, kind) = self.operand_ty(lhs, rhs)?;
         let l = self.gen_expr(lhs, &opnd_ty)?;
         let r = self.gen_expr(rhs, &opnd_ty)?;
         let res = self.fresh_tmp();
 
-        let inst = match op {
-            BinaryOp::Add => format!("add {opnd_ty} {l}, {r}"),
-            BinaryOp::Sub => format!("sub {opnd_ty} {l}, {r}"),
-            BinaryOp::Mul => format!("mul {opnd_ty} {l}, {r}"),
-            BinaryOp::Div => format!("sdiv {opnd_ty} {l}, {r}"),
-            BinaryOp::Rem => format!("srem {opnd_ty} {l}, {r}"),
-            BinaryOp::Eq => format!("icmp eq {opnd_ty} {l}, {r}"),
-            BinaryOp::NotEq => format!("icmp ne {opnd_ty} {l}, {r}"),
-            BinaryOp::Lt => format!("icmp slt {opnd_ty} {l}, {r}"),
-            BinaryOp::LtEq => format!("icmp sle {opnd_ty} {l}, {r}"),
-            BinaryOp::Gt => format!("icmp sgt {opnd_ty} {l}, {r}"),
-            BinaryOp::GtEq => format!("icmp sge {opnd_ty} {l}, {r}"),
-            BinaryOp::And | BinaryOp::Or => {
+        // 算術・比較の命令は数値クラス（符号付き/なし整数・浮動小数）で変わる。
+        let inst = match (op, kind) {
+            (BinaryOp::Add, NumKind::Float) => format!("fadd {opnd_ty} {l}, {r}"),
+            (BinaryOp::Add, _) => format!("add {opnd_ty} {l}, {r}"),
+            (BinaryOp::Sub, NumKind::Float) => format!("fsub {opnd_ty} {l}, {r}"),
+            (BinaryOp::Sub, _) => format!("sub {opnd_ty} {l}, {r}"),
+            (BinaryOp::Mul, NumKind::Float) => format!("fmul {opnd_ty} {l}, {r}"),
+            (BinaryOp::Mul, _) => format!("mul {opnd_ty} {l}, {r}"),
+            (BinaryOp::Div, NumKind::Float) => format!("fdiv {opnd_ty} {l}, {r}"),
+            (BinaryOp::Div, NumKind::UInt) => format!("udiv {opnd_ty} {l}, {r}"),
+            (BinaryOp::Div, NumKind::SInt) => format!("sdiv {opnd_ty} {l}, {r}"),
+            (BinaryOp::Rem, NumKind::Float) => format!("frem {opnd_ty} {l}, {r}"),
+            (BinaryOp::Rem, NumKind::UInt) => format!("urem {opnd_ty} {l}, {r}"),
+            (BinaryOp::Rem, NumKind::SInt) => format!("srem {opnd_ty} {l}, {r}"),
+            (BinaryOp::Eq, NumKind::Float) => format!("fcmp oeq {opnd_ty} {l}, {r}"),
+            (BinaryOp::Eq, _) => format!("icmp eq {opnd_ty} {l}, {r}"),
+            (BinaryOp::NotEq, NumKind::Float) => format!("fcmp one {opnd_ty} {l}, {r}"),
+            (BinaryOp::NotEq, _) => format!("icmp ne {opnd_ty} {l}, {r}"),
+            (BinaryOp::Lt, NumKind::Float) => format!("fcmp olt {opnd_ty} {l}, {r}"),
+            (BinaryOp::Lt, NumKind::UInt) => format!("icmp ult {opnd_ty} {l}, {r}"),
+            (BinaryOp::Lt, NumKind::SInt) => format!("icmp slt {opnd_ty} {l}, {r}"),
+            (BinaryOp::LtEq, NumKind::Float) => format!("fcmp ole {opnd_ty} {l}, {r}"),
+            (BinaryOp::LtEq, NumKind::UInt) => format!("icmp ule {opnd_ty} {l}, {r}"),
+            (BinaryOp::LtEq, NumKind::SInt) => format!("icmp sle {opnd_ty} {l}, {r}"),
+            (BinaryOp::Gt, NumKind::Float) => format!("fcmp ogt {opnd_ty} {l}, {r}"),
+            (BinaryOp::Gt, NumKind::UInt) => format!("icmp ugt {opnd_ty} {l}, {r}"),
+            (BinaryOp::Gt, NumKind::SInt) => format!("icmp sgt {opnd_ty} {l}, {r}"),
+            (BinaryOp::GtEq, NumKind::Float) => format!("fcmp oge {opnd_ty} {l}, {r}"),
+            (BinaryOp::GtEq, NumKind::UInt) => format!("icmp uge {opnd_ty} {l}, {r}"),
+            (BinaryOp::GtEq, NumKind::SInt) => format!("icmp sge {opnd_ty} {l}, {r}"),
+            (BinaryOp::And | BinaryOp::Or, _) => {
                 return Err(CodegenError::new(span, "論理演算の内部エラー"));
             }
         };
@@ -556,16 +581,27 @@ impl<'a> FnCodegen<'a> {
         llvm_ty(&ty).map_err(|m| CodegenError::new(expr.span, m))
     }
 
-    /// 二項演算の被演算子型（リテラルでない側を優先）。
-    fn operand_ty(&self, lhs: &Expr, rhs: &Expr) -> Result<String, CodegenError> {
+    /// 式の内部型（型検査の結果、リテラルは既定型へ確定）。
+    fn iris_ty(&self, expr: &Expr) -> Ty {
+        self.types
+            .get(&expr.span)
+            .cloned()
+            .unwrap_or(Ty::Infer)
+            .defaulted()
+    }
+
+    /// 二項演算の被演算子型と数値クラス（リテラルでない側を優先）。
+    fn operand_ty(&self, lhs: &Expr, rhs: &Expr) -> Result<(String, NumKind), CodegenError> {
         let raw_l = self.types.get(&lhs.span).cloned().unwrap_or(Ty::Infer);
         let raw_r = self.types.get(&rhs.span).cloned().unwrap_or(Ty::Infer);
         let chosen = match (is_literal_ty(&raw_l), is_literal_ty(&raw_r)) {
             (true, false) => raw_r,
             (false, true) => raw_l,
             _ => raw_l.defaulted(),
-        };
-        llvm_ty(&chosen.defaulted()).map_err(|m| CodegenError::new(lhs.span, m))
+        }
+        .defaulted();
+        let llty = llvm_ty(&chosen).map_err(|m| CodegenError::new(lhs.span, m))?;
+        Ok((llty, num_kind(&chosen)))
     }
 
     fn emit(&mut self, line: &str) {
@@ -601,19 +637,69 @@ fn is_literal_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::IntLit | Ty::FloatLit)
 }
 
-/// 内部型を LLVM 型名へ変換する（最初のスライスは i32 / bool のみ）。
+/// 内部型を LLVM 型名へ変換する（数値プリミティブと bool）。
 fn llvm_ty(ty: &Ty) -> Result<String, String> {
     match ty {
         Ty::IntLit => Ok("i32".to_string()),
+        Ty::FloatLit => Ok("double".to_string()),
         Ty::Named { name, args } if args.is_empty() => match name.as_str() {
-            "i32" => Ok("i32".to_string()),
+            // 整数は LLVM では符号を型に持たない（幅だけ）。符号は命令側で扱う。
+            "i8" | "u8" => Ok("i8".to_string()),
+            "i16" | "u16" => Ok("i16".to_string()),
+            "i32" | "u32" => Ok("i32".to_string()),
+            "i64" | "u64" => Ok("i64".to_string()),
+            "f32" => Ok("float".to_string()),
+            "f64" => Ok("double".to_string()),
             "bool" => Ok("i1".to_string()),
             "void" => Ok("void".to_string()),
-            other => Err(format!("型 `{other}` のコード生成は未対応です（現状 i32 / bool のみ）")),
+            other => Err(format!(
+                "型 `{other}` のコード生成は未対応です（数値プリミティブと bool のみ）"
+            )),
         },
         other => Err(format!(
-            "型 `{}` のコード生成は未対応です（現状 i32 / bool のみ）",
+            "型 `{}` のコード生成は未対応です（数値プリミティブと bool のみ）",
             other.describe()
         )),
+    }
+}
+
+/// 命令選択のための数値クラス（LLVM 型は符号を持たないため別途必要）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumKind {
+    SInt,
+    UInt,
+    Float,
+}
+
+/// 内部型から数値クラスを求める。整数・浮動小数以外は既定で符号付き整数扱い
+/// （bool 等の `==`/`!=` は整数比較でよい）。
+fn num_kind(ty: &Ty) -> NumKind {
+    match ty {
+        Ty::FloatLit => NumKind::Float,
+        Ty::Named { name, args } if args.is_empty() => match name.as_str() {
+            "u8" | "u16" | "u32" | "u64" => NumKind::UInt,
+            "f32" | "f64" => NumKind::Float,
+            _ => NumKind::SInt,
+        },
+        _ => NumKind::SInt,
+    }
+}
+
+/// 浮動小数リテラルを LLVM が受け付ける定数表現（double のビット列）にする。
+/// LLVM のテキスト IR では float 定数も「正確に表現できる double」のビット列で書く。
+fn float_const(v: f64, llty: &str) -> String {
+    let bits = if llty == "float" {
+        ((v as f32) as f64).to_bits()
+    } else {
+        v.to_bits()
+    };
+    format!("0x{bits:016X}")
+}
+
+/// LLVM 型の零値（既定 return 用）。
+fn zero_value(llty: &str) -> &'static str {
+    match llty {
+        "float" | "double" => "0.0",
+        _ => "0",
     }
 }
