@@ -1,0 +1,48 @@
+// ループ（while / loop / break / continue）の実行例。
+//
+//   cargo run -- run examples/loop.iris
+//
+// std（println_int 等）は自動で前置される。現状のコード生成は i32 / bool のみ。
+
+// while: 1..=5 の合計を出力する（15）。
+fn sum_to(n: i32): i32 {
+    let mut i = 1
+    let mut acc = 0
+    while i <= n {
+        acc = acc + i
+        i = i + 1
+    }
+    return acc
+}
+
+// loop + break: 2 のべき乗で limit を超えない最大値（loop と break）。
+fn pow2_below(limit: i32): i32 {
+    let mut x = 1
+    loop {
+        if x * 2 > limit {
+            return x
+        }
+        x = x * 2
+    }
+}
+
+// continue: 1..=n のうち偶数だけ合計する。
+fn sum_even(n: i32): i32 {
+    let mut i = 0
+    let mut acc = 0
+    while i < n {
+        i = i + 1
+        if i % 2 == 1 {
+            continue
+        }
+        acc = acc + i
+    }
+    return acc
+}
+
+fn main(): i32 {
+    let a = println_int(sum_to(5))        // 15
+    let b = println_int(pow2_below(100))  // 64
+    let c = println_int(sum_even(10))     // 2+4+6+8+10 = 30
+    return 0
+}

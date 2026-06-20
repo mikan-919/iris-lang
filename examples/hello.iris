@@ -1,0 +1,46 @@
+// 型の別名（名前的型付け）
+type Meters = f64
+
+// 構造体
+type Rect = struct {
+    w: f64
+    h: f64
+}
+
+// バリアント（構築・分解構文は未対応）
+type Shape = enum { Circle, Square, Triangle }
+
+// メンバアクセスで面積を求める
+fn area(r: Rect): f64 {
+    return r.w * r.h
+}
+
+// 階乗を計算する
+fn factorial(n: i32): i32 {
+    if n <= 1 {
+        return 1
+    }
+    return n * factorial(n - 1)
+}
+
+// 2つの整数を割る。0除算は Err を返す
+fn divide(a: i32, b: i32): Result<i32, string> {
+    if b == 0 {
+        return Err("ゼロ除算")
+    }
+    return Ok(a / b)
+}
+
+// Result を返すので `!` でエラーを伝播できる
+pub fn run(): Result<i32, string> {
+    let mut total = 0
+    let f = factorial(5)
+    let half = divide(f, 2)!        // Err なら呼び出し元へ早期リターン
+    total = total + half
+
+    let r = Rect { w: 3.0, h: 4.0 } // 構造体リテラル
+    let size = area(r)              // f64 と推論される
+    let dist: Meters = 10.0         // 別名にリテラルは代入可（名前的型付け）
+    let positive = total == 0 ? false : true
+    return Ok(total)
+}

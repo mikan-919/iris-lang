@@ -1,0 +1,39 @@
+// 最小の標準ライブラリ（iris 自身で記述）。
+// 各プログラムの先頭に自動で前置される。I/O は C の putchar を extern で借りる。
+// 現状のコード生成は i32 / bool のみ対応なので、std もその範囲で書く。
+
+// C の putchar（1 文字出力）。返り値は書き込んだ文字。
+extern fn putchar(c: i32): i32
+
+// 1 桁の数字 (0-9) を出力する。
+fn put_digit(d: i32): i32 {
+    return putchar(d + 48)
+}
+
+// 改行を出力する。
+fn newline(): i32 {
+    return putchar(10)
+}
+
+// 整数を 10 進で出力する（負数・多桁は再帰で処理）。
+fn print_int(n: i32): i32 {
+    if n < 0 {
+        let neg = putchar(45)
+        return print_int(0 - n)
+    }
+    if n >= 10 {
+        let hi = print_int(n / 10)
+    }
+    return put_digit(n % 10)
+}
+
+// 整数を出力して改行する。
+fn println_int(n: i32): i32 {
+    let r = print_int(n)
+    return newline()
+}
+
+// bool を 1 / 0 で出力して改行する。
+fn println_bool(b: bool): i32 {
+    return println_int(b ? 1 : 0)
+}

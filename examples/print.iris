@@ -1,0 +1,32 @@
+// 標準ライブラリ（println_int / println_bool）を使って実際に出力する例。
+//
+//   cargo run -- --emit-llvm examples/print.iris > print.ll
+//   clang print.ll -o print && ./print
+//
+// std（std/std.iris）は自動で前置されるので import は不要。
+// 現状のコード生成は i32 / bool のみ対応。
+
+fn fib(n: i32): i32 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn factorial(n: i32): i32 {
+    return n <= 1 ? 1 : n * factorial(n - 1)
+}
+
+fn main(): i32 {
+    let a = println_int(fib(10))       // 55
+    let b = println_int(factorial(5))  // 120
+    let c = println_bool(3 > 2)        // 1
+    let d = println_int(0 - 42)        // -42
+    let e=println_int(a-d*30)
+    let mut i = 0
+    while i < 10 {
+        println_int(i)
+        i = i + 1
+    }
+    return 0
+}
