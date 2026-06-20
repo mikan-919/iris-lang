@@ -12,16 +12,19 @@
 //! - 整数 `i8..u64`（符号付き/なしで命令を選ぶ）と浮動小数 `f32`/`f64`
 //! - 参照 `&T` / `&mut T`（opaque ポインタ。`&x` は場所のアドレス。値の文脈では
 //!   暗黙にデリファレンス＝`load` する）
+//! - struct（名前付き LLVM 構造体型）。構造体リテラル `Name { ... }`・メンバアクセス
+//!   `a.b`・フィールドへの代入 `a.b = v`。値は first-class な構造体値として扱う
 //!
 //! ローカルは alloca + load/store で扱う（SSA 化は LLVM の mem2reg に任せられる）。
-//! struct・`!`・文字列・ジェネリクスなどは未対応（エラーにする）。参照越しの代入
-//! （write-through）はまだ無く、参照への再代入は束縛の付け替えになる。
+//! enum・`!`・文字列・ジェネリクスなどは未対応（エラーにする）。参照越しの代入
+//! （write-through `&mut x = v`）はまだ無く、参照への再代入は束縛の付け替えになる。
 
 use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::ast::{
-    BinaryOp, Block, Else, Expr, ExprKind, Function, Item, Program, Stmt, UnaryOp,
+    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, Stmt, Type,
+    TypeDefBody, UnaryOp,
 };
 use crate::sema::resolve::{DefId, Resolution};
 use crate::sema::ty::Ty;
@@ -40,6 +43,59 @@ impl CodegenError {
             span: Some(span),
             message: message.into(),
         }
+    }
+}
+
+/// struct のレイアウト情報（コード生成で参照する）。
+///
+/// 非ジェネリックな struct を名前 → フィールド列（宣言順）で持つ。`type X = Y` の
+/// 別名は `alias_to` に記録し、struct 解決・LLVM 型変換のとき末尾までたどる。
+#[derive(Default)]
+struct StructReg {
+    /// struct 名 → フィールド（名前, 型）の宣言順リスト。
+    layouts: HashMap<String, Vec<(String, Ty)>>,
+    /// 別名 `type A = B`（B は引数なし名前付き型）の A → B。
+    alias_to: HashMap<String, String>,
+}
+
+impl StructReg {
+    /// プログラムの型定義から struct レイアウトと別名を集める。
+    fn build(program: &Program) -> StructReg {
+        let mut reg = StructReg::default();
+        for item in &program.items {
+            let Item::TypeDef(t) = item else { continue };
+            match &t.body {
+                // ジェネリックな struct は単一化未実装のためコード生成では扱わない。
+                TypeDefBody::Struct(fields) if t.generics.is_empty() => {
+                    let layout = fields
+                        .iter()
+                        .map(|f| (f.name.clone(), Ty::from_ast(&f.ty)))
+                        .collect();
+                    reg.layouts.insert(t.name.clone(), layout);
+                }
+                // `type A = B`（引数なし名前付き型）は別名としてたどれるようにする。
+                TypeDefBody::Alias(Type::Named { name, args, .. }) if args.is_empty() => {
+                    reg.alias_to.insert(t.name.clone(), name.clone());
+                }
+                _ => {}
+            }
+        }
+        reg
+    }
+
+    /// 名前を別名チェーンでたどり、struct なら（正規名, フィールド列）を返す。
+    fn struct_def(&self, name: &str) -> Option<(String, &Vec<(String, Ty)>)> {
+        let mut cur = name.to_string();
+        for _ in 0..32 {
+            if let Some(fields) = self.layouts.get(&cur) {
+                return Some((cur, fields));
+            }
+            match self.alias_to.get(&cur) {
+                Some(t) => cur = t.clone(),
+                None => return None,
+            }
+        }
+        None
     }
 }
 
@@ -64,7 +120,31 @@ pub fn emit_module(
         }
     }
 
+    let structs = StructReg::build(program);
+
     let mut module = String::from("; iris-lang が生成した LLVM IR\n\n");
+
+    // 名前付き struct 型を宣言する（`%Name = type { ... }`）。プログラム順で
+    // 出力して再現性を保つ。型宣言は前方参照が許されるので順序は問わない。
+    for item in &program.items {
+        if let Item::TypeDef(t) = item
+            && let TypeDefBody::Struct(fields) = &t.body
+            && t.generics.is_empty()
+        {
+            let mut field_tys = Vec::new();
+            for f in fields {
+                let ty = Ty::from_ast(&f.ty);
+                field_tys.push(
+                    llvm_ty(&ty, &structs).map_err(|m| CodegenError::new(f.span, m))?,
+                );
+            }
+            let _ = writeln!(module, "%{} = type {{ {} }}", t.name, field_tys.join(", "));
+        }
+    }
+    if !structs.layouts.is_empty() {
+        module.push('\n');
+    }
+
     for item in &program.items {
         match item {
             Item::Function(f) => {
@@ -73,6 +153,7 @@ pub fn emit_module(
                     types: &type_info.expr_types,
                     def_spans: &def_spans,
                     func_table: &func_table,
+                    structs: &structs,
                     body: String::new(),
                     tmp: 0,
                     label: 0,
@@ -97,6 +178,7 @@ struct FnCodegen<'a> {
     types: &'a HashMap<Span, Ty>,
     def_spans: &'a HashMap<Span, DefId>,
     func_table: &'a HashMap<String, &'a Function>,
+    structs: &'a StructReg,
     body: String,
     tmp: usize,
     label: usize,
@@ -116,7 +198,7 @@ impl<'a> FnCodegen<'a> {
             None => Ty::unit(),
         };
         let ret_ty = match &f.ret {
-            Some(t) => llvm_ty(&Ty::from_ast(t)).map_err(|m| CodegenError::new(t.span(), m))?,
+            Some(t) => llvm_ty(&Ty::from_ast(t), self.structs).map_err(|m| CodegenError::new(t.span(), m))?,
             None => "void".to_string(),
         };
 
@@ -125,7 +207,7 @@ impl<'a> FnCodegen<'a> {
             let mut tys = Vec::new();
             for p in &f.params {
                 tys.push(
-                    llvm_ty(&Ty::from_ast(&p.ty)).map_err(|m| CodegenError::new(p.span, m))?,
+                    llvm_ty(&Ty::from_ast(&p.ty), self.structs).map_err(|m| CodegenError::new(p.span, m))?,
                 );
             }
             return Ok(format!("declare {ret_ty} @{}({})\n", f.name, tys.join(", ")));
@@ -135,7 +217,7 @@ impl<'a> FnCodegen<'a> {
         let mut params_sig = Vec::new();
         let mut param_setup = Vec::new();
         for (i, p) in f.params.iter().enumerate() {
-            let ty = llvm_ty(&Ty::from_ast(&p.ty))
+            let ty = llvm_ty(&Ty::from_ast(&p.ty), self.structs)
                 .map_err(|m| CodegenError::new(p.span, m))?;
             params_sig.push(format!("{ty} %arg{i}"));
             // 引数を alloca に退避して、ローカルと同様に扱う。
@@ -294,16 +376,137 @@ impl<'a> FnCodegen<'a> {
 
     /// 代入先の場所のポインタと型を返す。
     fn place_ptr(&mut self, target: &Expr) -> Result<(String, String), CodegenError> {
-        if let ExprKind::Ident(_) = &target.kind
-            && let Some(&id) = self.res.uses.get(&target.span)
-            && let Some((ptr, ty)) = self.locals.get(&id)
-        {
-            return Ok((ptr.clone(), ty.clone()));
+        match &target.kind {
+            ExprKind::Ident(_) => {
+                if let Some(&id) = self.res.uses.get(&target.span)
+                    && let Some((ptr, ty)) = self.locals.get(&id)
+                {
+                    return Ok((ptr.clone(), ty.clone()));
+                }
+            }
+            // フィールドの場所（`a.b`）はその struct のフィールドアドレス。
+            ExprKind::Member { object, field } => {
+                let (ptr, fllty, _) = self.field_ptr(object, field, target.span)?;
+                return Ok((ptr, fllty));
+            }
+            _ => {}
         }
         Err(CodegenError::new(
             target.span,
             "この代入先はコード生成に未対応です",
         ))
+    }
+
+    /// メンバアクセス `object.field` のフィールドへのポインタを求める。
+    /// 戻り値は (フィールドポインタ, フィールドの LLVM 型, フィールドの内部型)。
+    fn field_ptr(
+        &mut self,
+        object: &Expr,
+        field: &str,
+        span: Span,
+    ) -> Result<(String, String, Ty), CodegenError> {
+        let (base, sname) = self.struct_base_ptr(object, span)?;
+        let (canon, fields) = self
+            .structs
+            .struct_def(&sname)
+            .ok_or_else(|| CodegenError::new(span, format!("型 `{sname}` は構造体ではありません")))?;
+        let idx = fields
+            .iter()
+            .position(|(n, _)| n == field)
+            .ok_or_else(|| {
+                CodegenError::new(span, format!("型 `{canon}` にフィールド `{field}` はありません"))
+            })?;
+        let fty = fields[idx].1.clone();
+        let fllty = llvm_ty(&fty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        let p = self.fresh_tmp();
+        self.emit(&format!(
+            "{p} = getelementptr inbounds %{canon}, ptr {base}, i32 0, i32 {idx}"
+        ));
+        Ok((p, fllty, fty))
+    }
+
+    /// メンバアクセスの基底となる struct のポインタと（正規化前の）struct 名を返す。
+    /// 参照越しのアクセスは参照値（ポインタ）を辿る。場所でない値（関数の戻り値など）は
+    /// 一時 alloca に退避してアドレスを得る。
+    fn struct_base_ptr(
+        &mut self,
+        object: &Expr,
+        span: Span,
+    ) -> Result<(String, String), CodegenError> {
+        let oty = self.raw_ty(object).defaulted();
+        if let Ty::Ref { .. } = oty {
+            // object は値としてポインタを返す。多段参照は値の文脈で 1 段ずつ load する。
+            let mut ptr = self.gen_expr(object, "ptr")?;
+            let mut cur = oty;
+            while let Ty::Ref { inner, .. } = cur {
+                let inner = *inner;
+                // 指す先がさらに参照なら、そのポインタを load して辿る。
+                if let Ty::Ref { .. } = inner {
+                    let r = self.fresh_tmp();
+                    self.emit(&format!("{r} = load ptr, ptr {ptr}"));
+                    ptr = r;
+                    cur = inner;
+                } else {
+                    cur = inner;
+                    break;
+                }
+            }
+            let name = struct_name_of(&cur).ok_or_else(|| {
+                CodegenError::new(span, "メンバアクセスの対象が構造体ではありません")
+            })?;
+            return Ok((ptr, name));
+        }
+        // 場所ならそのアドレス、そうでなければ一時 alloca に退避する。
+        let name = struct_name_of(&oty)
+            .ok_or_else(|| CodegenError::new(span, "メンバアクセスの対象が構造体ではありません"))?;
+        match self.place_ptr(object) {
+            Ok((p, _)) => Ok((p, name)),
+            Err(_) => {
+                let llty = llvm_ty(&oty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+                let val = self.gen_expr(object, &llty)?;
+                let slot = self.fresh_tmp();
+                self.emit(&format!("{slot} = alloca {llty}"));
+                self.emit(&format!("store {llty} {val}, ptr {slot}"));
+                Ok((slot, name))
+            }
+        }
+    }
+
+    /// 構造体リテラル `Name { field: value, ... }` を生成し、構造体値を返す。
+    fn gen_struct_lit(
+        &mut self,
+        name: &str,
+        fields: &[FieldInit],
+        span: Span,
+    ) -> Result<String, CodegenError> {
+        let (canon, def_fields) = self
+            .structs
+            .struct_def(name)
+            .map(|(c, f)| (c, f.clone()))
+            .ok_or_else(|| {
+                CodegenError::new(
+                    span,
+                    format!("`{name}` の構造体定義が見つかりません（ジェネリック struct は未対応）"),
+                )
+            })?;
+        let slot = self.fresh_tmp();
+        self.emit(&format!("{slot} = alloca %{canon}"));
+        // 宣言順にフィールドを書き込む。
+        for (idx, (fname, fty)) in def_fields.iter().enumerate() {
+            let init = fields.iter().find(|fi| &fi.name == fname).ok_or_else(|| {
+                CodegenError::new(span, format!("フィールド `{fname}` が初期化されていません"))
+            })?;
+            let (v, fllty) = self.gen_value(&init.value, fty)?;
+            let p = self.fresh_tmp();
+            self.emit(&format!(
+                "{p} = getelementptr inbounds %{canon}, ptr {slot}, i32 0, i32 {idx}"
+            ));
+            self.emit(&format!("store {fllty} {v}, ptr {p}"));
+        }
+        // 構造体値として読み出す（first-class 値）。
+        let r = self.fresh_tmp();
+        self.emit(&format!("{r} = load %{canon}, ptr {slot}"));
+        Ok(r)
     }
 
     // ---- 式 -------------------------------------------------------------
@@ -323,6 +526,17 @@ impl<'a> FnCodegen<'a> {
             ExprKind::Unary { op, expr: inner } => self.gen_unary(*op, inner, expr.span),
             ExprKind::Binary { op, lhs, rhs } => self.gen_binary(*op, lhs, rhs, expr.span),
             ExprKind::Call { callee, args } => self.gen_call(callee, args, expr.span),
+            // メンバアクセス `a.b`: フィールドのアドレスを求めて load する。
+            ExprKind::Member { object, field } => {
+                let (ptr, fllty, _) = self.field_ptr(object, field, expr.span)?;
+                let r = self.fresh_tmp();
+                self.emit(&format!("{r} = load {fllty}, ptr {ptr}"));
+                Ok(r)
+            }
+            // 構造体リテラル `Name { ... }`。
+            ExprKind::StructLit { name, fields, .. } => {
+                self.gen_struct_lit(name, fields, expr.span)
+            }
             ExprKind::Ternary {
                 cond,
                 then,
@@ -447,7 +661,7 @@ impl<'a> FnCodegen<'a> {
             .find_function(name)
             .ok_or_else(|| CodegenError::new(span, format!("`{name}` の定義が見つかりません")))?;
         let ret_ty = match &func.ret {
-            Some(t) => llvm_ty(&Ty::from_ast(t)).map_err(|m| CodegenError::new(t.span(), m))?,
+            Some(t) => llvm_ty(&Ty::from_ast(t), self.structs).map_err(|m| CodegenError::new(t.span(), m))?,
             None => "void".to_string(),
         };
         let mut arg_strs = Vec::new();
@@ -593,7 +807,7 @@ impl<'a> FnCodegen<'a> {
             .cloned()
             .unwrap_or(Ty::Infer)
             .defaulted();
-        llvm_ty(&ty).map_err(|m| CodegenError::new(expr.span, m))
+        llvm_ty(&ty, self.structs).map_err(|m| CodegenError::new(expr.span, m))
     }
 
     /// 式の内部型（型検査の結果、リテラルは既定型へ確定）。
@@ -621,7 +835,7 @@ impl<'a> FnCodegen<'a> {
         } else {
             self.raw_ty(expr).defaulted()
         };
-        let hint = llvm_ty(&hint_ty).map_err(|m| CodegenError::new(expr.span, m))?;
+        let hint = llvm_ty(&hint_ty, self.structs).map_err(|m| CodegenError::new(expr.span, m))?;
         let mut val = self.gen_expr(expr, &hint)?;
 
         // 参照の被演算子を、値型が期待される間だけ 1 段ずつ参照外しする。
@@ -631,7 +845,7 @@ impl<'a> FnCodegen<'a> {
                 break;
             }
             let inner_ty = (**inner).clone();
-            let inner_ll = llvm_ty(&inner_ty).map_err(|m| CodegenError::new(expr.span, m))?;
+            let inner_ll = llvm_ty(&inner_ty, self.structs).map_err(|m| CodegenError::new(expr.span, m))?;
             let r = self.fresh_tmp();
             self.emit(&format!("{r} = load {inner_ll}, ptr {val}"));
             val = r;
@@ -640,9 +854,9 @@ impl<'a> FnCodegen<'a> {
 
         // 値型を期待し参照を外しきったときは want の幅で確定（リテラル対策）。
         let llty = if want_value && !matches!(cur, Ty::Ref { .. }) {
-            llvm_ty(want).map_err(|m| CodegenError::new(expr.span, m))?
+            llvm_ty(want, self.structs).map_err(|m| CodegenError::new(expr.span, m))?
         } else {
-            llvm_ty(&cur).map_err(|m| CodegenError::new(expr.span, m))?
+            llvm_ty(&cur, self.structs).map_err(|m| CodegenError::new(expr.span, m))?
         };
         Ok((val, llty))
     }
@@ -659,7 +873,7 @@ impl<'a> FnCodegen<'a> {
             _ => raw_l.defaulted(),
         }
         .defaulted();
-        let llty = llvm_ty(&chosen).map_err(|m| CodegenError::new(lhs.span, m))?;
+        let llty = llvm_ty(&chosen, self.structs).map_err(|m| CodegenError::new(lhs.span, m))?;
         Ok((chosen.clone(), llty, num_kind(&chosen)))
     }
 
@@ -696,8 +910,8 @@ fn is_literal_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::IntLit | Ty::FloatLit)
 }
 
-/// 内部型を LLVM 型名へ変換する（数値プリミティブと bool）。
-fn llvm_ty(ty: &Ty) -> Result<String, String> {
+/// 内部型を LLVM 型名へ変換する（数値プリミティブ・bool・参照・struct）。
+fn llvm_ty(ty: &Ty, reg: &StructReg) -> Result<String, String> {
     match ty {
         Ty::IntLit => Ok("i32".to_string()),
         Ty::FloatLit => Ok("double".to_string()),
@@ -713,14 +927,32 @@ fn llvm_ty(ty: &Ty) -> Result<String, String> {
             "f64" => Ok("double".to_string()),
             "bool" => Ok("i1".to_string()),
             "void" => Ok("void".to_string()),
-            other => Err(format!(
-                "型 `{other}` のコード生成は未対応です（数値プリミティブと bool のみ）"
-            )),
+            // 定義済み struct（別名チェーン越しを含む）は名前付き構造体型。
+            other => {
+                if let Some((canon, _)) = reg.struct_def(other) {
+                    Ok(format!("%{canon}"))
+                } else if let Some(target) = reg.alias_to.get(other) {
+                    // struct でない別名（`type Meters = f64` など）は元の型へ。
+                    llvm_ty(&Ty::named(target), reg)
+                } else {
+                    Err(format!(
+                        "型 `{other}` のコード生成は未対応です（数値プリミティブ・bool・struct のみ）"
+                    ))
+                }
+            }
         },
         other => Err(format!(
-            "型 `{}` のコード生成は未対応です（数値プリミティブと bool のみ）",
+            "型 `{}` のコード生成は未対応です（数値プリミティブ・bool・struct のみ）",
             other.describe()
         )),
+    }
+}
+
+/// 名前付き型（引数なし）の名前を取り出す。参照は剥がす。struct 解決の入口に使う。
+fn struct_name_of(ty: &Ty) -> Option<String> {
+    match ty.peel_refs() {
+        Ty::Named { name, args } if args.is_empty() => Some(name.clone()),
+        _ => None,
     }
 }
 
@@ -762,6 +994,8 @@ fn zero_value(llty: &str) -> &'static str {
     match llty {
         "float" | "double" => "0.0",
         "ptr" => "null",
+        // 名前付き struct 型（`%Name`）は zeroinitializer。
+        _ if llty.starts_with('%') => "zeroinitializer",
         _ => "0",
     }
 }

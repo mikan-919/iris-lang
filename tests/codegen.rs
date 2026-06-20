@@ -210,6 +210,65 @@ fn runs_loop_with_break() {
 }
 
 #[test]
+fn emits_named_struct_type_and_gep() {
+    // struct は名前付き LLVM 構造体型として宣言し、フィールドは GEP で読み書きする。
+    let ir = emit(
+        "type Point = struct {\n    x: i32\n    y: i32\n}\nfn sum(p: Point): i32 {\n    return p.x + p.y\n}",
+    );
+    assert!(ir.contains("%Point = type { i32, i32 }"));
+    assert!(ir.contains("define i32 @sum(%Point %arg0)"));
+    assert!(ir.contains("getelementptr inbounds %Point, ptr"));
+}
+
+#[test]
+fn emits_struct_literal_construction() {
+    // 構造体リテラルは alloca + 各フィールド store + 全体 load で first-class 値を作る。
+    let ir = emit(
+        "type Point = struct {\n    x: i32\n    y: i32\n}\nfn make(): Point {\n    return Point { x: 1, y: 2 }\n}",
+    );
+    assert!(ir.contains("alloca %Point"));
+    assert!(ir.contains("store i32 1, ptr"));
+    assert!(ir.contains("load %Point, ptr"));
+    assert!(ir.contains("ret %Point"));
+}
+
+#[test]
+fn runs_struct_literal_and_member_access() {
+    // 値で渡した struct のフィールド合計。
+    let src = "type Point = struct {\n    x: i32\n    y: i32\n}\nfn sum(p: Point): i32 {\n    return p.x + p.y\n}\nfn main(): i32 {\n    let p = Point { x: 17, y: 25 }\n    return sum(p)\n}";
+    if let Some(code) = run_exit_code(src, "struct_sum") {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn runs_struct_reference_member_access() {
+    // 参照越しのメンバアクセス（暗黙にポインタを辿る）。
+    let src = "type Point = struct {\n    x: i32\n    y: i32\n}\nfn shift(p: &Point): i32 {\n    return p.x * 10 + p.y\n}\nfn main(): i32 {\n    let p = Point { x: 4, y: 2 }\n    return shift(&p)\n}";
+    if let Some(code) = run_exit_code(src, "struct_ref") {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn runs_struct_field_assignment() {
+    // ローカル struct のフィールドへの代入 `q.x = v`。
+    let src = "type Point = struct {\n    x: i32\n    y: i32\n}\nfn main(): i32 {\n    let mut q = Point { x: 1, y: 2 }\n    q.x = 40\n    return q.x + q.y\n}";
+    if let Some(code) = run_exit_code(src, "struct_assign") {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn runs_nested_struct_and_call_return_member() {
+    // ネストした struct のチェーンアクセスと、関数戻り値（場所でない値）のメンバアクセス。
+    let src = "type Point = struct {\n    x: i32\n    y: i32\n}\ntype Line = struct {\n    a: Point\n    b: Point\n}\nfn origin(): Point {\n    return Point { x: 2, y: 5 }\n}\nfn main(): i32 {\n    let l = Line { a: Point { x: 1, y: 2 }, b: Point { x: 3, y: 4 } }\n    return l.a.x * 10 + l.b.y + origin().y\n}";
+    if let Some(code) = run_exit_code(src, "struct_nested") {
+        assert_eq!(code, 19);
+    }
+}
+
+#[test]
 fn runs_while_with_continue() {
     // 1..=10 のうち偶数の合計 = 30。
     let src = "fn main(): i32 {\n    let mut i = 0\n    let mut acc = 0\n    while i < 10 {\n        i = i + 1\n        if i % 2 == 1 {\n            continue\n        }\n        acc = acc + i\n    }\n    return acc\n}";
