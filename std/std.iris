@@ -8,6 +8,9 @@ extern fn putchar(c: i32): i32
 // C の puts（NUL 終端文字列を出力し、末尾に改行を付ける）。返り値は非負なら成功。
 extern fn puts(s: string): i32
 
+// C の strcmp（NUL 終端文字列を比較。等しければ 0）。match の文字列パターン比較に使う。
+extern fn strcmp(a: string, b: string): i32
+
 // 1 桁の数字 (0-9) を出力する。
 fn put_digit(d: i32): i32 {
     return putchar(d + 48)

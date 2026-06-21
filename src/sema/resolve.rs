@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Block, Else, Expr, ExprKind, Function, Item, Program, Stmt};
+use crate::ast::{Block, Else, Expr, ExprKind, Function, Item, Pattern, Program, Stmt, TypeDefBody};
 use crate::span::Span;
 
 /// 定義の種類。
@@ -103,6 +103,19 @@ impl Resolver {
         for item in &program.items {
             if let Item::Function(f) = item {
                 self.declare(&f.name, DefKind::Function, f.name_span, false, false);
+            }
+        }
+        // 非ジェネリック enum のバリアント名をグローバルスコープに登録する。
+        // バリアントはコンストラクタ（値）として使えるため値の名前空間に入れる。
+        for item in &program.items {
+            if let Item::TypeDef(t) = item
+                && t.generics.is_empty()
+                && let TypeDefBody::Enum(variants) = &t.body
+            {
+                for v in variants {
+                    // シャドーイングを許す（prelude の Ok/Err/Some/None は上書き可）。
+                    self.declare(&v.name, DefKind::Builtin, v.span, false, true);
+                }
             }
         }
         for item in &program.items {
@@ -231,6 +244,31 @@ impl Resolver {
                         Else::If(e) => self.resolve_expr(e),
                         Else::Block(b) => self.resolve_block(b),
                     }
+                }
+            }
+            ExprKind::EnumLit { payload, .. } => {
+                if let Some(p) = payload {
+                    self.resolve_expr(p);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.resolve_expr(scrutinee);
+                for arm in arms {
+                    // アームの本体は独立したスコープ。パターンの束縛変数を登録する。
+                    self.push_scope();
+                    if let Pattern::Variant {
+                        binding: Some((bname, bspan)),
+                        ..
+                    } = &arm.pattern
+                    {
+                        self.declare(bname, DefKind::Local, *bspan, false, true);
+                    }
+                    // ガードはアームスコープ内で解決する（束縛変数を参照できる）。
+                    if let Some(g) = &arm.guard {
+                        self.resolve_expr(g);
+                    }
+                    self.resolve_expr(&arm.body);
+                    self.pop_scope();
                 }
             }
         }

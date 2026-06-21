@@ -29,8 +29,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::ast::{
-    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, SelfKind, Stmt, Type,
-    TypeDefBody, UnaryOp,
+    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, LitPat, MatchArm, Pattern,
+    Program, SelfKind, Stmt, Type, TypeDefBody, UnaryOp,
 };
 use crate::sema::resolve::{DefId, Resolution};
 use crate::sema::ty::Ty;
@@ -102,6 +102,46 @@ impl StructReg {
             }
         }
         None
+    }
+}
+
+/// enum のレイアウト情報。
+///
+/// 非ジェネリックな enum を名前 → バリアント列（宣言順）で持つ。
+/// LLVM 表現は `{ i8, i64 }` 固定（タグ＋ペイロードを i64 に格納）。
+#[derive(Default)]
+struct EnumReg {
+    /// enum 名 → バリアント（名前, ペイロード型）の宣言順リスト。
+    layouts: HashMap<String, Vec<(String, Option<Ty>)>>,
+}
+
+impl EnumReg {
+    fn build(program: &Program) -> EnumReg {
+        let mut reg = EnumReg::default();
+        for item in &program.items {
+            let Item::TypeDef(t) = item else { continue };
+            if let TypeDefBody::Enum(variants) = &t.body
+                && t.generics.is_empty()
+            {
+                let layout = variants
+                    .iter()
+                    .map(|v| (v.name.clone(), v.payload.as_ref().map(|p| Ty::from_ast(p))))
+                    .collect();
+                reg.layouts.insert(t.name.clone(), layout);
+            }
+        }
+        reg
+    }
+
+    /// バリアント名からタグインデックスを返す。
+    fn tag_of(&self, enum_name: &str, variant: &str) -> Option<usize> {
+        let vs = self.layouts.get(enum_name)?;
+        vs.iter().position(|(n, _)| n == variant)
+    }
+
+    /// enum 名 → バリアント一覧を返す。
+    fn variants(&self, enum_name: &str) -> Option<&Vec<(String, Option<Ty>)>> {
+        self.layouts.get(enum_name)
     }
 }
 
@@ -253,6 +293,22 @@ pub fn emit_module(
         module.push('\n');
     }
 
+    // 非ジェネリック enum の型宣言 `%Name = type { i8, i64 }` を出力する。
+    let enums = EnumReg::build(program);
+    let mut enum_decls_emitted = false;
+    for item in &program.items {
+        if let Item::TypeDef(t) = item
+            && let TypeDefBody::Enum(_) = &t.body
+            && t.generics.is_empty()
+        {
+            let _ = writeln!(module, "%{} = type {{ i8, i64 }}", t.name);
+            enum_decls_emitted = true;
+        }
+    }
+    if enum_decls_emitted {
+        module.push('\n');
+    }
+
     // 文字列リテラルのグローバル定数はここに集め、関数生成後に末尾へ出力する。
     let strings = RefCell::new(StringPool::default());
 
@@ -272,6 +328,8 @@ pub fn emit_module(
             method_collisions: &method_collisions,
             method_provider: &type_info.method_provider,
             structs: &structs,
+            enums: &enums,
+            variant_constructions: &type_info.variant_constructions,
             strings: &strings,
             body: String::new(),
             tmp: 0,
@@ -406,6 +464,9 @@ struct FnCodegen<'a> {
     /// メソッド呼び出しの解決済み提供元（typeck が記録。callee span → ラベル）。
     method_provider: &'a HashMap<Span, String>,
     structs: &'a StructReg,
+    enums: &'a EnumReg,
+    /// バリアント構築の情報（typeck が記録）。
+    variant_constructions: &'a HashMap<Span, (String, usize, bool)>,
     /// 文字列リテラルのグローバル定数プール（全関数で共有）。
     strings: &'a RefCell<StringPool>,
     body: String,
@@ -525,6 +586,17 @@ fn walk_expr_calls(expr: &Expr, out: &mut Vec<Span>) {
                 walk_expr_calls(&f.value, out);
             }
         }
+        ExprKind::EnumLit { payload, .. } => {
+            if let Some(p) = payload {
+                walk_expr_calls(p, out);
+            }
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            walk_expr_calls(scrutinee, out);
+            for arm in arms {
+                walk_expr_calls(&arm.body, out);
+            }
+        }
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -614,13 +686,29 @@ impl<'a> FnCodegen<'a> {
             }
         }
 
-        for stmt in &f.body.stmts {
+        let stmts = &f.body.stmts;
+        // 末尾式の暗黙 return 判定: 最後の stmt が Stmt::Expr で関数が非 void 返却型のとき、
+        // その値を ret に使う。それ以外は gen_stmt に任せる。
+        let tail_expr = if ret_ty != "void" {
+            if let Some(Stmt::Expr(e)) = stmts.last() { Some(e) } else { None }
+        } else {
+            None
+        };
+        let non_tail = if tail_expr.is_some() { &stmts[..stmts.len() - 1] } else { stmts.as_slice() };
+        for stmt in non_tail {
             self.gen_stmt(stmt)?;
         }
 
-        // 終端していなければ既定の return を補う。
+        // 末尾式があればその値で ret、なければ既定の return を補う。
         if !self.terminated {
-            if ret_ty == "void" {
+            if let Some(e) = tail_expr {
+                let (v, _) = self.gen_value(e, &self.ret_ty.clone())?;
+                // gen_value 内でブロックが終端している場合、または値が空（if 文など）は ret を出さない。
+                if !self.terminated && !v.is_empty() {
+                    self.emit(&format!("ret {ret_ty} {v}"));
+                    self.terminated = true;
+                }
+            } else if ret_ty == "void" {
                 self.emit("ret void");
             } else {
                 self.emit(&format!("ret {ret_ty} {}", zero_value(&ret_ty)));
@@ -982,8 +1070,113 @@ impl<'a> FnCodegen<'a> {
 
     // ---- 式 -------------------------------------------------------------
 
+    /// enum バリアントを構築し、`{ i8, i64 }` 値を返す。
+    /// `enum_name`・`tag`・ペイロード expr を受け取る。
+    fn gen_enum_construction(
+        &mut self,
+        enum_name: &str,
+        tag: usize,
+        payload_expr: Option<&Expr>,
+        span: Span,
+    ) -> Result<String, CodegenError> {
+        let slot = self.fresh_tmp();
+        self.emit(&format!("{slot} = alloca %{enum_name}"));
+        // タグを書き込む。
+        let tag_ptr = self.fresh_tmp();
+        self.emit(&format!(
+            "{tag_ptr} = getelementptr inbounds %{enum_name}, ptr {slot}, i32 0, i32 0"
+        ));
+        self.emit(&format!("store i8 {tag}, ptr {tag_ptr}"));
+        // ペイロードを書き込む（i64 にキャスト）。
+        if let Some(pe) = payload_expr {
+            let payload_ty = self.iris_ty(pe);
+            let (v, vllty) = self.gen_value(pe, &payload_ty)?;
+            let payload_i64 = self.cast_to_i64(&v, &vllty, span)?;
+            let payload_ptr = self.fresh_tmp();
+            self.emit(&format!(
+                "{payload_ptr} = getelementptr inbounds %{enum_name}, ptr {slot}, i32 0, i32 1"
+            ));
+            self.emit(&format!("store i64 {payload_i64}, ptr {payload_ptr}"));
+        } else {
+            // ペイロードなしは 0 を格納。
+            let payload_ptr = self.fresh_tmp();
+            self.emit(&format!(
+                "{payload_ptr} = getelementptr inbounds %{enum_name}, ptr {slot}, i32 0, i32 1"
+            ));
+            self.emit(&format!("store i64 0, ptr {payload_ptr}"));
+        }
+        let r = self.fresh_tmp();
+        self.emit(&format!("{r} = load %{enum_name}, ptr {slot}"));
+        Ok(r)
+    }
+
+    /// 値を i64 にキャストする（enum ペイロード格納用）。
+    fn cast_to_i64(&mut self, v: &str, llty: &str, span: Span) -> Result<String, CodegenError> {
+        if llty == "i64" {
+            return Ok(v.to_string());
+        }
+        let r = self.fresh_tmp();
+        let instr = match llty {
+            "i1" | "i8" | "i16" | "i32" => format!("{r} = zext {llty} {v} to i64"),
+            "f32" => {
+                let tmp = self.fresh_tmp();
+                self.emit(&format!("{tmp} = fpext float {v} to double"));
+                format!("{r} = bitcast double {tmp} to i64")
+            }
+            "f64" | "double" => format!("{r} = bitcast double {v} to i64"),
+            "ptr" => format!("{r} = ptrtoint ptr {v} to i64"),
+            other => {
+                return Err(CodegenError::new(
+                    span,
+                    format!("enum ペイロードの型 `{other}` は未対応です（i64 に変換できません）"),
+                ));
+            }
+        };
+        self.emit(&instr);
+        Ok(r)
+    }
+
+    /// i64 から元の型にキャストして戻す（enum ペイロード読み出し用）。
+    fn cast_from_i64(&mut self, v: &str, llty: &str, span: Span) -> Result<String, CodegenError> {
+        if llty == "i64" {
+            return Ok(v.to_string());
+        }
+        let r = self.fresh_tmp();
+        let instr = match llty {
+            "i1" | "i8" | "i16" | "i32" => format!("{r} = trunc i64 {v} to {llty}"),
+            "f32" => {
+                let tmp = self.fresh_tmp();
+                self.emit(&format!("{tmp} = bitcast i64 {v} to double"));
+                format!("{r} = fptrunc double {tmp} to float")
+            }
+            "f64" | "double" => format!("{r} = bitcast i64 {v} to double"),
+            "ptr" => format!("{r} = inttoptr i64 {v} to ptr"),
+            other => {
+                return Err(CodegenError::new(
+                    span,
+                    format!("enum ペイロードの型 `{other}` は未対応です（i64 から変換できません）"),
+                ));
+            }
+        };
+        self.emit(&instr);
+        Ok(r)
+    }
+
     /// 式を評価し、結果の値（レジスタまたは定数）を返す。`hint` はリテラルの型。
     fn gen_expr(&mut self, expr: &Expr, hint: &str) -> Result<String, CodegenError> {
+        // enum バリアント構築（typeck が記録。Ident/Call のどちらでも来る）。
+        if let Some((enum_name, tag, has_payload)) = self.variant_constructions.get(&expr.span).cloned() {
+            let payload_expr = if has_payload {
+                // Call の場合、最初の引数がペイロード。
+                match &expr.kind {
+                    ExprKind::Call { args, .. } => args.first().map(|e| e as &Expr),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            return self.gen_enum_construction(&enum_name, tag, payload_expr, expr.span);
+        }
         match &expr.kind {
             ExprKind::Int(v) => Ok(v.to_string()),
             ExprKind::Float(v) => Ok(float_const(*v, hint)),
@@ -1027,10 +1220,250 @@ impl<'a> FnCodegen<'a> {
                 self.gen_if(cond, then, otherwise.as_deref())?;
                 Ok(String::new())
             }
-            _ => Err(CodegenError::new(
-                expr.span,
-                "この式はコード生成に未対応です",
-            )),
+            ExprKind::Try(_) => {
+                Err(CodegenError::new(expr.span, "`!` 演算子のコード生成は未対応です"))
+            }
+            ExprKind::EnumLit { span, .. } => {
+                Err(CodegenError::new(*span, "この enum リテラルのコード生成は未対応です"))
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.gen_match(scrutinee, arms, expr.span)
+            }
+        }
+    }
+
+    /// match 式を生成する。結果型が void でなければ alloca+store+load で値を返す。
+    fn gen_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> Result<String, CodegenError> {
+        // 結果型の LLVM 型を求める（最初の非 void アームから判断）。
+        let result_llty = self.types.get(&span)
+            .cloned()
+            .unwrap_or(Ty::unit())
+            .defaulted();
+        let is_void = result_llty == Ty::unit();
+        let result_llty_str = if is_void {
+            "void".to_string()
+        } else {
+            llvm_ty(&result_llty, self.structs)
+                .map_err(|m| CodegenError::new(span, m))?
+        };
+
+        // 結果スロット（void でなければ確保）。
+        let result_slot = if !is_void {
+            let s = self.fresh_tmp();
+            self.emit(&format!("{s} = alloca {result_llty_str}"));
+            Some(s)
+        } else {
+            None
+        };
+
+        let merge_l = self.fresh_label("match.end");
+
+        // scrutinee の型から enum かどうか判定。
+        let scrut_ty = self.iris_ty(scrutinee);
+        let enum_name: Option<String> = match &scrut_ty {
+            Ty::Named { name, .. } if self.enums.variants(name).is_some() => Some(name.clone()),
+            _ => None,
+        };
+
+        // scrutinee を評価する。enum の場合はポインタ経由でタグを読みたいので alloca。
+        let (scrut_val, scrut_llty) = if let Some(ref ename) = enum_name {
+            // enum: alloca に格納してポインタ経由でタグを読む。
+            let ev = self.gen_value(scrutinee, &scrut_ty)?;
+            let slot = self.fresh_tmp();
+            self.emit(&format!("{slot} = alloca %{ename}"));
+            self.emit(&format!("store %{ename} {}, ptr {slot}", ev.0));
+            (slot, format!("%{ename}"))
+        } else {
+            let v = self.gen_value(scrutinee, &scrut_ty)?;
+            (v.0, v.1)
+        };
+
+        // タグを読み出す（enum の場合）。
+        let tag_val = if let Some(ref ename) = enum_name {
+            let tag_ptr = self.fresh_tmp();
+            self.emit(&format!(
+                "{tag_ptr} = getelementptr inbounds %{ename}, ptr {scrut_val}, i32 0, i32 0"
+            ));
+            let tv = self.fresh_tmp();
+            self.emit(&format!("{tv} = load i8, ptr {tag_ptr}"));
+            Some(tv)
+        } else {
+            None
+        };
+
+        // アームを if-else チェーンで出力。
+        for (i, arm) in arms.iter().enumerate() {
+            let is_last = i == arms.len() - 1;
+            let arm_l = self.fresh_label("match.arm");
+            let skip_l = if is_last {
+                merge_l.clone()
+            } else {
+                self.fresh_label("match.check")
+            };
+
+            // パターン条件チェック。
+            let cond = match &arm.pattern {
+                Pattern::Wildcard { .. } => {
+                    // ワイルドカードは常に一致。
+                    self.emit(&format!("br label %{arm_l}"));
+                    None
+                }
+                Pattern::Lit { value, .. } => {
+                    match value {
+                        // 文字列は NUL 終端 ptr 同士を strcmp で比較する（一致＝0）。
+                        LitPat::Str(s) => {
+                            let gref = self.strings.borrow_mut().intern(s);
+                            let r = self.fresh_tmp();
+                            self.emit(&format!(
+                                "{r} = call i32 @strcmp(ptr {scrut_val}, ptr {gref})"
+                            ));
+                            let cmp = self.fresh_tmp();
+                            self.emit(&format!("{cmp} = icmp eq i32 {r}, 0"));
+                            Some(cmp)
+                        }
+                        _ => {
+                            let pat_v = match value {
+                                LitPat::Int(n) => n.to_string(),
+                                LitPat::Float(f) => float_const(*f, &scrut_llty),
+                                LitPat::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                                LitPat::Str(_) => unreachable!(),
+                            };
+                            let cmp = self.fresh_tmp();
+                            if scrut_ty.is_float() {
+                                self.emit(&format!(
+                                    "{cmp} = fcmp oeq {scrut_llty} {scrut_val}, {pat_v}"
+                                ));
+                            } else {
+                                self.emit(&format!(
+                                    "{cmp} = icmp eq {scrut_llty} {scrut_val}, {pat_v}"
+                                ));
+                            }
+                            Some(cmp)
+                        }
+                    }
+                }
+                Pattern::Range { lo, hi, inclusive, .. } => {
+                    // 数値の範囲 `lo..hi` / `lo..=hi`: lo <= x && (x < hi | x <= hi)。
+                    let nk = num_kind(&scrut_ty);
+                    let const_of = |b: &LitPat| match b {
+                        LitPat::Int(n) => n.to_string(),
+                        LitPat::Float(f) => float_const(*f, &scrut_llty),
+                        LitPat::Bool(x) => if *x { "1" } else { "0" }.to_string(),
+                        LitPat::Str(_) => "0".to_string(),
+                    };
+                    let lo_v = const_of(lo);
+                    let hi_v = const_of(hi);
+                    let ge_pred = match nk {
+                        NumKind::Float => "fcmp oge",
+                        NumKind::UInt => "icmp uge",
+                        NumKind::SInt => "icmp sge",
+                    };
+                    let hi_pred = match (nk, *inclusive) {
+                        (NumKind::Float, false) => "fcmp olt",
+                        (NumKind::Float, true) => "fcmp ole",
+                        (NumKind::UInt, false) => "icmp ult",
+                        (NumKind::UInt, true) => "icmp ule",
+                        (NumKind::SInt, false) => "icmp slt",
+                        (NumKind::SInt, true) => "icmp sle",
+                    };
+                    let ge = self.fresh_tmp();
+                    self.emit(&format!("{ge} = {ge_pred} {scrut_llty} {scrut_val}, {lo_v}"));
+                    let lt = self.fresh_tmp();
+                    self.emit(&format!("{lt} = {hi_pred} {scrut_llty} {scrut_val}, {hi_v}"));
+                    let and = self.fresh_tmp();
+                    self.emit(&format!("{and} = and i1 {ge}, {lt}"));
+                    Some(and)
+                }
+                Pattern::Variant { name, binding, .. } => {
+                    // enum タグとの比較。
+                    let ename = enum_name.as_deref().ok_or_else(|| {
+                        CodegenError::new(span, "バリアントパターンを非 enum 型に使っています")
+                    })?;
+                    let tag = self.enums.tag_of(ename, name).ok_or_else(|| {
+                        CodegenError::new(span, format!("バリアント `{name}` が見つかりません"))
+                    })?;
+                    let cmp = self.fresh_tmp();
+                    let tv = tag_val.as_deref().unwrap();
+                    self.emit(&format!("{cmp} = icmp eq i8 {tv}, {tag}"));
+                    Some(cmp)
+                }
+            };
+
+            if let Some(c) = cond {
+                self.emit(&format!("br i1 {c}, label %{arm_l}, label %{skip_l}"));
+            }
+
+            self.emit_label(&arm_l);
+            self.terminated = false;
+
+            // バリアントパターンのペイロード束縛を設定する。
+            if let Pattern::Variant { name, binding: Some((bname, bspan)), .. } = &arm.pattern {
+                let ename = enum_name.as_deref().unwrap();
+                if let Some(vs) = self.enums.variants(ename) {
+                    if let Some((_, Some(payload_ty))) = vs.iter().find(|(n, _)| n == name) {
+                        let payload_ty = payload_ty.clone();
+                        let pllty = llvm_ty(&payload_ty, self.structs)
+                            .map_err(|m| CodegenError::new(span, m))?;
+                        // ペイロードを i64 フィールドから読み出してキャスト。
+                        let payload_ptr = self.fresh_tmp();
+                        self.emit(&format!(
+                            "{payload_ptr} = getelementptr inbounds %{ename}, ptr {scrut_val}, i32 0, i32 1"
+                        ));
+                        let raw = self.fresh_tmp();
+                        self.emit(&format!("{raw} = load i64, ptr {payload_ptr}"));
+                        let typed = self.cast_from_i64(&raw, &pllty, span)?;
+                        // 束縛変数を alloca に格納する。
+                        if let Some(&id) = self.def_spans.get(bspan) {
+                            let slot = format!("%{bname}.slot{id}");
+                            self.emit(&format!("{slot} = alloca {pllty}"));
+                            self.emit(&format!("store {pllty} {typed}, ptr {slot}"));
+                            self.locals.insert(id, (slot, pllty));
+                        }
+                    }
+                }
+            }
+
+            // ガード: 束縛変数を設定した後に評価し、不成立なら次のチェック（skip_l）へ
+            // フォールスルーする。
+            if let Some(g) = &arm.guard {
+                let (gv, _) = self.gen_value(g, &Ty::named("bool"))?;
+                let guarded_l = self.fresh_label("match.guarded");
+                self.emit(&format!("br i1 {gv}, label %{guarded_l}, label %{skip_l}"));
+                self.emit_label(&guarded_l);
+                self.terminated = false;
+            }
+
+            // アーム本体を生成して結果を格納。
+            if !is_void {
+                let rs = result_slot.as_deref().unwrap();
+                let (v, vty) = self.gen_value(&arm.body, &result_llty)?;
+                self.emit(&format!("store {vty} {v}, ptr {rs}"));
+            } else {
+                let llty = self.expr_llvm_ty(&arm.body).unwrap_or_else(|_| "i32".to_string());
+                self.gen_expr(&arm.body, &llty)?;
+            }
+
+            if !self.terminated {
+                self.emit(&format!("br label %{merge_l}"));
+            }
+
+            // 次のチェックラベルに移行（最後のアームは merge_l へ）。
+            if !is_last {
+                self.emit_label(&skip_l);
+                self.terminated = false;
+            }
+        }
+
+        self.emit_label(&merge_l);
+        self.terminated = false;
+
+        // 結果値を読み出す。
+        if let Some(rs) = result_slot {
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = load {result_llty_str}, ptr {rs}"));
+            Ok(r)
+        } else {
+            Ok(String::new())
         }
     }
 
@@ -1362,11 +1795,12 @@ impl<'a> FnCodegen<'a> {
         self.emit_label(&then_l);
         self.terminated = false;
         self.gen_block(then)?;
-        if !self.terminated {
+        let then_terminated = self.terminated;
+        if !then_terminated {
             self.emit(&format!("br label %{merge_l}"));
         }
 
-        if let Some(els) = otherwise {
+        let else_terminated = if let Some(els) = otherwise {
             self.emit_label(&else_l);
             self.terminated = false;
             match els {
@@ -1385,10 +1819,19 @@ impl<'a> FnCodegen<'a> {
             if !self.terminated {
                 self.emit(&format!("br label %{merge_l}"));
             }
-        }
+            self.terminated
+        } else {
+            false // else なしは merge へ必ず到達する
+        };
 
-        self.emit_label(&merge_l);
-        self.terminated = false;
+        // else あり・両分岐終端なら merge ブロックは到達不能。ラベルを出さない。
+        let both_terminated = otherwise.is_some() && then_terminated && else_terminated;
+        if both_terminated {
+            self.terminated = true;
+        } else {
+            self.emit_label(&merge_l);
+            self.terminated = false;
+        }
         Ok(())
     }
 
@@ -1545,7 +1988,7 @@ fn llvm_ty(ty: &Ty, reg: &StructReg) -> Result<String, String> {
             // 文字列は NUL 終端の C 文字列へのポインタ（opaque ポインタ）。
             "string" => Ok("ptr".to_string()),
             "void" => Ok("void".to_string()),
-            // 定義済み struct（別名チェーン越しを含む）は名前付き構造体型。
+            // 定義済み struct・enum（別名チェーン越しを含む）は名前付き構造体型。
             other => {
                 if let Some((canon, _)) = reg.struct_def(other) {
                     Ok(format!("%{canon}"))
@@ -1553,9 +1996,9 @@ fn llvm_ty(ty: &Ty, reg: &StructReg) -> Result<String, String> {
                     // struct でない別名（`type Meters = f64` など）は元の型へ。
                     llvm_ty(&Ty::named(target), reg)
                 } else {
-                    Err(format!(
-                        "型 `{other}` のコード生成は未対応です（数値プリミティブ・bool・struct のみ）"
-                    ))
+                    // enum 型は `%Name = type { i8, i64 }` として宣言済み。
+                    // 未知の型でも `%Name` として出力し、clang に任せる。
+                    Ok(format!("%{other}"))
                 }
             }
         },

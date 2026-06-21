@@ -353,12 +353,18 @@ fn parse_enum_body(input: Tokens) -> PResult<(Vec<Variant>, Span)> {
             break;
         }
         let (rest, (name, name_span)) = ident(input)?;
-        let (rest, payload) = match eat(rest, &TokenKind::Colon, "`:`") {
-            Ok((after, _)) => {
-                let (after, ty) = parse_type(after)?;
-                (after, Some(ty))
-            }
-            Err(_) => (rest, None),
+        // `Name: Type` または `Name(Type)` でペイロード型を指定できる。
+        let (rest, payload) = if eat(rest, &TokenKind::Colon, "`:`").is_ok() {
+            let (after, _) = eat(rest, &TokenKind::Colon, "`:`").unwrap();
+            let (after, ty) = parse_type(after)?;
+            (after, Some(ty))
+        } else if rest.peek() == &TokenKind::LParen {
+            let rest = rest.take_from(1);
+            let (rest, ty) = parse_type(rest)?;
+            let (rest, _) = expect(rest, &TokenKind::RParen, "`)`")?;
+            (rest, Some(ty))
+        } else {
+            (rest, None)
         };
         let span = payload
             .as_ref()
@@ -1169,8 +1175,152 @@ fn parse_primary(input: Tokens, no_struct: bool) -> PResult<Expr> {
             Ok((input, expr))
         }
         TokenKind::If => parse_if(input),
+        TokenKind::Match => parse_match(input),
         _ => Err(nom::Err::Error(ParseErr::expected("式", tok))),
     }
+}
+
+/// `match scrutinee { arm... }` を解析する。
+/// アームは `pattern -> expr` の形で、改行で区切る。
+fn parse_match(input: Tokens) -> PResult<Expr> {
+    let kw = input.first();
+    let start = kw.span;
+    // scrutinee では構造体リテラルを禁じる（`{` との曖昧性）。
+    let (input, scrutinee) = parse_expr_r(input.take_from(1), true)?;
+    let (mut input, _) = expect(input, &TokenKind::LBrace, "`{`")?;
+
+    let mut arms = Vec::new();
+    loop {
+        input = skip_newlines(input);
+        match input.peek() {
+            TokenKind::RBrace | TokenKind::Eof => break,
+            _ => {}
+        }
+        let arm_start = input.first().span;
+        let (rest, pat) = parse_pattern(input)?;
+        // ガード `if cond`（省略可）。条件位置では構造体リテラルを禁じる。
+        let (rest, guard) = if rest.peek() == &TokenKind::If {
+            let (rest, cond) = parse_expr_r(rest.take_from(1), true)?;
+            (rest, Some(cond))
+        } else {
+            (rest, None)
+        };
+        let (rest, _) = expect(rest, &TokenKind::Arrow, "`->`")?;
+        let (rest, body) = parse_expr(rest)?;
+        let arm_span = arm_start.merge(body.span);
+        arms.push(MatchArm { pattern: pat, guard, body, span: arm_span });
+        input = rest;
+        // アームの区切りは改行・カンマ・`}`。
+        match input.peek() {
+            TokenKind::Newline | TokenKind::Comma | TokenKind::RBrace => {}
+            _ => {
+                return Err(nom::Err::Failure(ParseErr::expected(
+                    "改行または `}` (アームの終わり)",
+                    input.first(),
+                )));
+            }
+        }
+    }
+    let (input, rbrace) = expect(input, &TokenKind::RBrace, "`}`")?;
+    let span = start.merge(rbrace.span);
+    Ok((
+        input,
+        Expr {
+            kind: ExprKind::Match {
+                scrutinee: Box::new(scrutinee),
+                arms,
+            },
+            span,
+        },
+    ))
+}
+
+/// パターンを 1 つ解析する。
+fn parse_pattern(input: Tokens) -> PResult<Pattern> {
+    let tok = input.first();
+    let span = tok.span;
+    match &tok.kind {
+        // ワイルドカード `_`
+        TokenKind::Ident(name) if name == "_" => {
+            Ok((input.take_from(1), Pattern::Wildcard { span }))
+        }
+        // 整数リテラル（負数は `-` を前置した単項として扱わない——パターンは単純な値）。
+        // `1..10` / `1..=10` の範囲パターンにもなる。
+        TokenKind::Int(v) => parse_range_or_lit(input.take_from(1), LitPat::Int(*v), span),
+        TokenKind::Float(v) => parse_range_or_lit(input.take_from(1), LitPat::Float(*v), span),
+        TokenKind::Bool(b) => {
+            let b = *b;
+            Ok((
+                input.take_from(1),
+                Pattern::Lit { value: LitPat::Bool(b), span },
+            ))
+        }
+        TokenKind::Str(s) => {
+            let s = s.clone();
+            Ok((
+                input.take_from(1),
+                Pattern::Lit { value: LitPat::Str(s), span },
+            ))
+        }
+        // `VariantName` または `VariantName(binding)`
+        TokenKind::Ident(name) => {
+            let name = name.clone();
+            let rest = input.take_from(1);
+            // `Name(binding)` — ペイロードの束縛。
+            if rest.peek() == &TokenKind::LParen {
+                let (rest, _) = eat(rest, &TokenKind::LParen, "`(`")?;
+                let (rest, (bname, bspan)) = ident(rest)?;
+                let (rest, rp) = expect(rest, &TokenKind::RParen, "`)`")?;
+                let full_span = span.merge(rp.span);
+                Ok((
+                    rest,
+                    Pattern::Variant {
+                        name,
+                        binding: Some((bname, bspan)),
+                        span: full_span,
+                    },
+                ))
+            } else {
+                Ok((
+                    rest,
+                    Pattern::Variant { name, binding: None, span },
+                ))
+            }
+        }
+        _ => Err(nom::Err::Error(ParseErr::expected(
+            "パターン (`_`・リテラル・バリアント名)",
+            tok,
+        ))),
+    }
+}
+
+/// 数値リテラル `lo` を読んだ直後の位置から、範囲パターン `lo..hi` / `lo..=hi`
+/// か単独リテラルパターンかを判定して解析する。`input` は `lo` の次のトークンを指す。
+fn parse_range_or_lit(input: Tokens, lo: LitPat, lo_span: Span) -> PResult<Pattern> {
+    let inclusive = match input.peek() {
+        TokenKind::DotDot => false,
+        TokenKind::DotDotEq => true,
+        // `..` でなければ単独リテラルパターン。
+        _ => return Ok((input, Pattern::Lit { value: lo, span: lo_span })),
+    };
+    let rest = input.take_from(1);
+    // 上限は整数・浮動小数リテラルのみ。
+    let hi_tok = rest.first();
+    let hi = match &hi_tok.kind {
+        TokenKind::Int(v) => LitPat::Int(*v),
+        TokenKind::Float(v) => LitPat::Float(*v),
+        _ => {
+            return Err(nom::Err::Failure(ParseErr::expected(
+                "範囲の上限 (整数・浮動小数リテラル)",
+                hi_tok,
+            )));
+        }
+    };
+    let full_span = lo_span.merge(hi_tok.span);
+    Ok((
+        rest.take_from(1),
+        Pattern::Range { lo, hi, inclusive, span: full_span },
+    ))
 }
 
 fn parse_if(input: Tokens) -> PResult<Expr> {

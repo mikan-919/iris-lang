@@ -299,6 +299,34 @@ impl Flow<'_> {
                 }
                 *st = merge(a, b);
             }
+            ExprKind::EnumLit { payload, .. } => {
+                if let Some(p) = payload {
+                    self.visit_expr(p, st);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                // scrutinee を消費する（move）。
+                self.visit_expr(scrutinee, st);
+                // 各アームは独立した分岐（if と同じ保守的な合流）。
+                let mut merged = st.clone();
+                // 全アームのムーブ集合を合流させる。
+                let arm_states: Vec<State> = arms
+                    .iter()
+                    .map(|arm| {
+                        let mut arm_st = st.clone();
+                        // ガードは本体より先に評価される（条件＝読み取り）。
+                        if let Some(g) = &arm.guard {
+                            self.visit_operand(g, &mut arm_st);
+                        }
+                        self.visit_expr(&arm.body, &mut arm_st);
+                        arm_st
+                    })
+                    .collect();
+                for arm_st in arm_states {
+                    merged = merge(merged, arm_st);
+                }
+                *st = merged;
+            }
         }
     }
 

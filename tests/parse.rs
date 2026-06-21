@@ -1,6 +1,6 @@
 //! 字句解析・構文解析の縦切り回帰テスト。
 
-use iris_lang::ast::{BinaryOp, ExprKind, Item, Stmt, Type};
+use iris_lang::ast::{BinaryOp, ExprKind, Item, LitPat, Pattern, Stmt, Type};
 use iris_lang::lexer::lex;
 use iris_lang::parser::parse;
 use iris_lang::token::TokenKind;
@@ -117,4 +117,55 @@ fn parses_while_loop_break_continue() {
         panic!("loop 文のはず");
     };
     assert!(matches!(&body.stmts[0], Stmt::Break { .. }));
+}
+
+#[test]
+fn lexes_range_operators() {
+    // `..` と `..=` は最長一致で正しくトークン化される（`.` と区別する）。
+    let kinds: Vec<_> = lex("1..10 1..=10")
+        .unwrap()
+        .into_iter()
+        .map(|t| t.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Int(1),
+            TokenKind::DotDot,
+            TokenKind::Int(10),
+            TokenKind::Int(1),
+            TokenKind::DotDotEq,
+            TokenKind::Int(10),
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
+fn parses_match_range_and_guard_arms() {
+    // 範囲パターン（排他・包含）とガード付きアームを解析する。
+    let program = parse_src(
+        "fn f(n: i32): i32 {\n    match n {\n        0..10 -> 1\n        10..=20 -> 2\n        _ if n > 100 -> 3\n        _ -> 0\n    }\n}",
+    );
+    let Item::Function(f) = &program.items[0] else { panic!("関数のはず") };
+    let Stmt::Expr(e) = &f.body.stmts[0] else { panic!("式文のはず") };
+    let ExprKind::Match { arms, .. } = &e.kind else { panic!("match 式のはず") };
+    assert_eq!(arms.len(), 4);
+    // 排他範囲 0..10。
+    assert!(matches!(
+        &arms[0].pattern,
+        Pattern::Range { lo: LitPat::Int(0), hi: LitPat::Int(10), inclusive: false, .. }
+    ));
+    assert!(arms[0].guard.is_none());
+    // 包含範囲 10..=20。
+    assert!(matches!(
+        &arms[1].pattern,
+        Pattern::Range { lo: LitPat::Int(10), hi: LitPat::Int(20), inclusive: true, .. }
+    ));
+    // ワイルドカード + ガード。
+    assert!(matches!(&arms[2].pattern, Pattern::Wildcard { .. }));
+    assert!(matches!(
+        arms[2].guard.as_ref().map(|g| &g.kind),
+        Some(ExprKind::Binary { op: BinaryOp::Gt, .. })
+    ));
 }

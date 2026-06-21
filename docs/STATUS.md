@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 
 ## パイプライン
 
@@ -51,7 +51,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 
 - 関数定義 `fn name(params): RetType { ... }`（`pub`、戻り値型省略可、末尾カンマ可）
 - 外部関数宣言 `extern fn name(params): RetType`（本体なし・C 関数を借りる。例: `putchar`）
-- 型定義 `type Name<T> = (別名 | struct { ... } | enum { ... })`（`pub`、ジェネリクス、フィールド/バリアントは改行・カンマ区切り）
+- 型定義 `type Name<T> = (別名 | struct { ... } | enum { ... })`（`pub`、ジェネリクス、フィールド/バリアントは改行・カンマ区切り）。enum バリアントのペイロード型指定は `Name: Type`（コロン）と `Name(Type)`（丸括弧）の両形式に対応
 - 固有メソッド `impl Type { fn m(self / &self / &mut self, ...): Ret { ... } }`（トレイト無し）。
   ドット呼び出し `x.m(args)` を静的ディスパッチで解決。`self` の三形（値＝ムーブ・`&self`＝
   共有借用・`&mut self`＝可変借用）に対応。`impl` は予約語ではなく識別子として扱う。
@@ -69,7 +69,9 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
   - 後置: 関数呼び出し `f(...)`、メンバアクセス `a.b`、エラー伝播 `expr!`
   - 三項演算子 `cond ? a : b`
   - if 式（`else if` / `else` 連鎖）
+  - **match 式** `match expr { Pattern [if guard] -> expr ... }`（アームは改行またはカンマ区切り。`->` は既存の `Arrow` トークンを流用）。パターンはワイルドカード `_`・リテラル（整数・浮動小数・bool・文字列）・**数値範囲 `1..10`（排他）/ `1..=10`（包含）**・enum バリアント（束縛あり）。各アームに**ガード `if cond`**（bool・束縛変数参照可）を付けられる
 - 改行による文区切り、空白・タブ・行コメント `//` の読み飛ばし
+- **関数本体の末尾式の暗黙 return**: `return` キーワードなしで最後の式が戻り値になる（`match` 式など）。両分岐とも `return` する `if-else` が末尾の場合も正しく処理する（到達不能な空の merge ブロックを生成しない）
 - 字句エラー・構文エラーの miette 表示（該当 span を指す）
 
 ### 意味解析（名前解決のみ実装済み）
@@ -116,7 +118,12 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
   型名そのもので引くため、`type Alias = Struct` の別名値からの呼び出しは現状解決しない（要 exact 名一致）。
   同じ型に同名メソッドがあれば（同一 impl・別 impl を問わず）**二重定義**として型検査で報告する
   （codegen に渡る前に止め、`@Type.method` 記号の衝突＝clang の再定義エラーを防ぐ）
-- enum: 定義・型名登録のみ（値の構築/分解は未対応）
+- **enum**: 定義・型名登録・バリアント構築・`match` 式によるアンラップを実装済み。ジェネリック enum は未対応
+  - **バリアント構築**: ペイロードなし（`Red` → `Ident` ノード）とペイロードあり（`Rect(5)` → `Call` ノード）の両形式。パーサは通常の `Ident`/`Call` として出力し、typeck が `variant_owners` マップ（`バリアント名 → (enum 名, タグ index, ペイロード型)`）を引いて enum 構築と判定。判定結果は `TypeInfo::variant_constructions`（式 span → `(enum 名, タグ, has_payload)`）として codegen へ渡す（AST を書き換えない設計）
+  - **`match` パターン**: ワイルドカード `_`、enum バリアント名（`Red`）、バリアント＋束縛変数（`Rect(side)` ← ペイロードを取り出してアーム本体スコープへ束縛）、整数・浮動小数・bool・文字列リテラル（**文字列は codegen で `strcmp` 比較を実装済み**）、**数値範囲 `lo..hi`（排他）/ `lo..=hi`（包含）**（境界は整数・浮動小数リテラル）。各アームに**ガード `if cond`** を付けられる
+  - **`match` の型検査**: scrutinee の型を確認し、各バリアントパターンが enum に存在するか検証。束縛変数には対応バリアントのペイロード型を付与。範囲パターンは下限・上限が同一数値クラスかつ scrutinee に適合するか検査。ガードは bool 型を要求（束縛変数を参照可）。全アームの結果型を `join` して `match` 式の型を決定
+  - **名前解決**: 非ジェネリック enum のバリアント名はグローバルスコープへ `DefKind::Builtin` として登録。バリアント束縛変数はアームごとの独立スコープへ `DefKind::Local` として登録。ガードはアームスコープ内で解決（束縛変数を参照できる）
+  - **所有権**: scrutinee はムーブ扱い。各アームは `if` の分岐と同様に独立した状態で評価し、全アームのムーブ集合を合流（flow.rs）。ガードは本体より先に読み取りとして評価。借用競合は各アームをブロックスコープとして扱い解放し、ガードもそのスコープ内で訪問（borrows.rs）
 - ジェネリックな型定義の本体・本体内のフィールド型は単一化未実装のため寛容（`Infer`）に扱う
 
 ### 所有権 DAG（実装済み）
@@ -186,15 +193,19 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
   リテラルの符号化は印字可能 ASCII 以外と `"` `\` を `\XX`（16進）でエスケープし末尾に NUL を付ける
   （マルチバイト UTF-8 はバイト単位）。値渡し（引数・戻り値・`let`）に対応。`extern fn puts`（std）で
   libc に渡して出力できる。**長さ・索引・連結・補間などの操作はまだ無い**（リテラルを渡す/返すのみ）
+- **enum**: LLVM 表現は全 enum 共通で `%EnumName = type { i8, i64 }`（i8 = タグ、i64 = ペイロードの記憶域）。ジェネリック enum は型宣言を出力しない
+  - **バリアント構築** `gen_enum_construction`: alloca → タグを `getelementptr` + `store i8` → ペイロードを `getelementptr` + `cast_to_i64` + `store i64` → `load %EnumName`。`cast_to_i64` は `i32`→`sext`、`bool`→`zext`、`f64`→`bitcast`、`ptr`→`ptrtoint` で i64 へ変換。typeck が `variant_constructions` に記録した span で `gen_expr` の先頭で命中したら `gen_enum_construction` へ分岐（AST ノード種を変えない）
+  - **`match` 式** `gen_match`: 結果を受け取る alloca（result slot）を確保 → scrutinee を alloca へ退避 → `getelementptr` でタグフィールドを load → アームを順に if-else 連鎖でチェック（ワイルドカードは無条件 `br`）→ 各アームでペイロード束縛変数（`cast_from_i64` で元の型へ変換し alloca に退避）を用意 → アーム本体を評価して result slot へ store → `match.end` ラベルで合流 → result slot を load して値を返す。`cast_from_i64` は `trunc`/`fptrunc`/`inttoptr` 等で元の型へ戻す
+    - **パターンの条件生成**: リテラルは `icmp eq`/`fcmp oeq`、enum バリアントはタグの `icmp eq`、**文字列は `call i32 @strcmp(...)` の結果を `icmp eq ..., 0`** で比較、**数値範囲は下限 `*ge` と上限 `*lt`/`*le`（排他/包含）を `and i1` で合成**（符号は `num_kind` で `s`/`u`/`fcmp o` を選択）
+    - **ガード**: パターン一致後、束縛変数を設定してからガード式を評価し、`br i1 guard, %match.guarded, %skip`（不成立なら次アームのチェックへフォールスルー）。最終アームのガード不成立は exhaustiveness 未検査のため result slot 未初期化のまま合流する（保守的に許容）
 - **struct**（上記）。**トレイト**（`impl Trait for Type` のメソッド emit・既定実装の合成・
-  ジェネリック関数の単相化・構造的 `==`）は実装済み（上記トレイト節）。enum・`!`・ジェネリック
+  ジェネリック関数の単相化・構造的 `==`）は実装済み（上記トレイト節）。`!`・ジェネリック
   **型**の単相化は未対応
 - `main(): i32` の戻り値が終了コードになり、`clang` で実行して検証できる
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
-- 未対応（今後）: enum（バリアント構築/分解は frontend も未対応）、
-  `!`（Result/Option 伝播）、文字列の操作（長さ・索引・連結・補間）、ジェネリック**型**の単相化
+- 未対応（今後）: `!`（Result/Option 伝播）、文字列の操作（長さ・索引・連結・補間）、ジェネリック**型**の単相化
   （ジェネリック**関数**の単相化は実装済み）
 
 ### 標準ライブラリ（最小・iris 自身で記述）
@@ -203,8 +214,9 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 ライブラリ。コンパイル時に各プログラムの先頭へ自動で前置される（単一の文字列として
 連結し span を一意に保つ）。
 
-- 提供: `putchar` / `puts`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`
+- 提供: `putchar` / `puts` / `strcmp`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`
 - `puts` は NUL 終端文字列を出力し末尾に改行を付ける（文字列リテラルの出力に使える）
+- `strcmp` は libc から借りる文字列比較。`match` の文字列リテラルパターンの codegen が呼び出す（未使用でも `declare` のみ出力され無害）
 - 現状のコード生成に合わせ `i32` / `bool` / `string` の範囲で記述
 - これにより `main(): i32` から実際に数値・真偽値を標準出力へ表示し、`clang` でビルドして実行できる
 
@@ -242,9 +254,8 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 
 ### 未実装
 
-- enum 値の構築・分解（バリアント値の生成構文、`match` でのアンラップ）
-- `match`（パターン: リテラル・範囲 `1..10`・enumアンラップ・ガード・`_`）
 - ループ `for`（イテレータ）— `while` / `loop` / `break` / `continue` は実装済み
+- `match` の拡張: リテラル（整数・浮動小数・bool・**文字列**）・**範囲 `1..10` / `1..=10`**・**ガード `if cond`**・ワイルドカード `_`・enum バリアント束縛・enum タグ比較による if-else 連鎖は実装済み。**残り**: 範囲の浮動小数境界の網羅性、識別子束縛パターン（`x ->` で scrutinee 全体を束縛）、ネストパターン、`|`（or パターン）、exhaustiveness 検査
 - ラムダ `(x): T -> expr`、関数型シグネチャ
 - 一般の型合成 `A + B`（ADR-0001。引数位置の匿名トレイト境界としては実装済み）
 - ジェネリックな**型**定義のコード生成（`type Box<T>` の単相化。関数のジェネリクス `fn f<T>` は実装済み）
@@ -257,7 +268,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 
 - 借用検査の高度化（NLL 風の精密なライフタイム領域推論・部分ムーブ・ループ）— `compiler.md` の Open Question 領域
 - 型推論の高度化（リテラルの後方からの確定、ジェネリクスの単一化）
-- コード生成の拡張（enum・文字列の操作・I/O）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
+- コード生成の拡張（文字列の操作・I/O）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
 - 並行処理 — `concurrency.md` 未設計
 
 ## 仕様未確定のため独自に決めた点（要確認）
@@ -267,6 +278,9 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 - **再代入の `mut` 位置**: `let mut x = ...`（Rust風）と仮定。docs は「mut は型修飾子」とも書くため `let x: mut T` の可能性もある。
 - **代入文**: `target = value` を文として追加（docs に文法記述がなかった）。
 - **`else`**: `}` と同じ行に必要（改行をまたぐ `else` は未対応）。
+- **範囲パターンの包含性**: docs は `1..10` の表記のみで上限の包含/排他を規定していないため、Rust に倣い `..` を排他（`lo <= x < hi`）・`..=` を包含（`lo <= x <= hi`）と仮定。
+- **match のガード構文**: `pattern if cond -> body`（Rust 風）と仮定。docs に文法記述がなかった。
+- **識別子束縛パターン未対応**: `match x { name -> ... }` の `name` は現状バリアント名として扱う（scrutinee 全体を束縛する識別子パターンは未実装）。そのため scrutinee 値を参照するガードは `_ if cond`（scrutinee を変数で持つ場合）の形で書く。
 
 ## ビルド・実行
 

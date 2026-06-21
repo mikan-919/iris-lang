@@ -22,8 +22,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, SelfKind, Stmt,
-    TraitRef, Type, TypeDef, TypeDefBody, UnaryOp,
+    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, LitPat, MatchArm, Pattern,
+    Program, SelfKind, Stmt, TraitRef, Type, TypeDef, TypeDefBody, UnaryOp,
 };
 use crate::sema::resolve::{DefId, DefKind, Resolution};
 use crate::sema::ty::{FLOAT_TYPES, INT_TYPES, Ty};
@@ -45,6 +45,9 @@ pub struct TypeInfo {
     /// メソッド呼び出しの解決済み提供元。callee の span → トレイト名 or 受け手の型名。
     /// コード生成が同名衝突時に正しい記号（`@Type.Trait.method`）を選ぶのに使う。
     pub method_provider: HashMap<Span, String>,
+    /// enum バリアント構築の情報。式の span → (enum型名, バリアントインデックス, has_payload)。
+    /// コード生成が `Ident`/`Call` を enum 構築に変換するのに使う。
+    pub variant_constructions: HashMap<Span, (String, usize, bool)>,
 }
 
 /// 型エラー。
@@ -115,8 +118,10 @@ enum TyDef {
         generics: usize,
         fields: Vec<(String, Ty)>,
     },
-    /// `type X = enum { ... }`。バリアントの構築/分解構文は未対応。
-    Enum,
+    /// `type X = enum { ... }`。バリアント一覧（名前, ペイロード型）を持つ。
+    Enum {
+        variants: Vec<(String, Option<Ty>)>,
+    },
 }
 
 /// プログラムの型検査を行う。
@@ -166,6 +171,7 @@ pub fn check(program: &Program, res: &Resolution) -> Result<TypeInfo, Vec<TypeEr
             expr_types: checker.expr_types,
             mono: checker.mono,
             method_provider: checker.method_provider,
+            variant_constructions: checker.variant_constructions,
         })
     } else {
         Err(checker.errors)
@@ -205,6 +211,10 @@ struct Checker<'a> {
     current_ret: Ty,
     /// 現在ネストしているループの深さ（`break`/`continue` のループ外使用の検出に使う）。
     loop_depth: usize,
+    /// バリアント名 → (enum型名, タグインデックス, ペイロード型)。非ジェネリック enum のみ。
+    variant_owners: HashMap<String, (String, usize, Option<Ty>)>,
+    /// enum バリアント構築の記録（TypeInfo へ引き渡す）。
+    variant_constructions: HashMap<Span, (String, usize, bool)>,
 }
 
 impl<'a> Checker<'a> {
@@ -358,6 +368,20 @@ impl<'a> Checker<'a> {
             .map(|(id, def)| (def.span, id))
             .collect();
 
+        // バリアント名 → (enum型名, タグ, ペイロード型)。非ジェネリック enum のみ。
+        let mut variant_owners: HashMap<String, (String, usize, Option<Ty>)> = HashMap::new();
+        for item in &program.items {
+            if let Item::TypeDef(t) = item
+                && t.generics.is_empty()
+                && let TypeDefBody::Enum(variants) = &t.body
+            {
+                for (idx, v) in variants.iter().enumerate() {
+                    let payload_ty = v.payload.as_ref().map(Ty::from_ast);
+                    variant_owners.insert(v.name.clone(), (t.name.clone(), idx, payload_ty));
+                }
+            }
+        }
+
         Checker {
             res,
             funcs,
@@ -377,6 +401,8 @@ impl<'a> Checker<'a> {
             errors: dup_errors,
             current_ret: Ty::unit(),
             loop_depth: 0,
+            variant_owners,
+            variant_constructions: HashMap::new(),
         }
     }
 
@@ -608,14 +634,30 @@ impl<'a> Checker<'a> {
             ExprKind::Float(_) => Ty::FloatLit,
             ExprKind::Str(_) => Ty::named("string"),
             ExprKind::Bool(_) => Ty::named("bool"),
-            ExprKind::Ident(_) => self
-                .res
-                .uses
-                .get(&expr.span)
-                .map_or(Ty::Infer, |&id| self.def_types[id].clone()),
+            ExprKind::Ident(name) => {
+                // ユーザー定義の非ジェネリック enum バリアント（ペイロードなし）。
+                if let Some((enum_name, tag, payload_ty)) = self.variant_owners.get(name.as_str()).cloned() {
+                    if let Some(&id) = self.res.uses.get(&expr.span)
+                        && self.res.defs[id].kind == DefKind::Builtin
+                    {
+                        if payload_ty.is_some() {
+                            self.error(
+                                expr.span,
+                                format!("バリアント `{name}` はペイロードが必要です（`{name}(value)` と書いてください）"),
+                            );
+                        }
+                        self.variant_constructions.insert(expr.span, (enum_name.clone(), tag, false));
+                        return Ty::named(&enum_name);
+                    }
+                }
+                self.res
+                    .uses
+                    .get(&expr.span)
+                    .map_or(Ty::Infer, |&id| self.def_types[id].clone())
+            }
             ExprKind::Unary { op, expr: inner } => self.infer_unary(*op, inner),
             ExprKind::Binary { op, lhs, rhs } => self.infer_binary(*op, lhs, rhs),
-            ExprKind::Call { callee, args } => self.infer_call(callee, args),
+            ExprKind::Call { callee, args } => self.infer_call(callee, args, expr.span),
             ExprKind::Member { object, field, .. } => self.infer_member(object, field, expr.span),
             ExprKind::Ternary {
                 cond,
@@ -647,6 +689,161 @@ impl<'a> Checker<'a> {
                 // ブロックは値を持たないため if 式は void。
                 Ty::unit()
             }
+            ExprKind::EnumLit { payload, .. } => {
+                // パーサは直接 EnumLit を出力しない（typeck 内部で記録するのみ）。
+                // 防御的に payload を検査し Infer を返す。
+                if let Some(p) = payload { self.check_expr(p); }
+                Ty::Infer
+            }
+            ExprKind::Match { scrutinee, arms } => self.infer_match(scrutinee, arms, expr.span),
+        }
+    }
+
+    fn infer_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> Ty {
+        let scrut_ty = self.check_expr(scrutinee).defaulted();
+
+        // scrutinee が enum 型なら、バリアント情報を取り出す。
+        let enum_variants: Option<Vec<(String, Option<Ty>)>> = match &scrut_ty {
+            Ty::Named { name, .. } => match self.types.get(name) {
+                Some(TyDef::Enum { variants }) => Some(variants.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let enum_name: Option<String> = match &scrut_ty {
+            Ty::Named { name, .. } if enum_variants.is_some() => Some(name.clone()),
+            _ => None,
+        };
+
+        let mut result_ty: Ty = Ty::Infer;
+
+        for arm in arms {
+            // パターン検証。
+            match &arm.pattern {
+                Pattern::Wildcard { .. } => {}
+                Pattern::Lit { value, span: pat_span } => {
+                    // リテラルパターンの型が scrutinee に適合するか確認。
+                    let pat_ty = match value {
+                        LitPat::Int(_) => Ty::IntLit,
+                        LitPat::Float(_) => Ty::FloatLit,
+                        LitPat::Bool(_) => Ty::named("bool"),
+                        LitPat::Str(_) => Ty::named("string"),
+                    };
+                    if !self.assignable(&scrut_ty, &pat_ty) && scrut_ty != Ty::Infer && scrut_ty != Ty::Error {
+                        self.error(
+                            *pat_span,
+                            format!(
+                                "パターンの型 `{}` が scrutinee の型 `{}` と一致しません",
+                                pat_ty.describe(),
+                                scrut_ty.describe()
+                            ),
+                        );
+                    }
+                }
+                Pattern::Range { lo, hi, span: pat_span, .. } => {
+                    // 範囲の境界は数値リテラル（整数または浮動小数）。
+                    let bound_ty = |b: &LitPat| match b {
+                        LitPat::Int(_) => Ty::IntLit,
+                        LitPat::Float(_) => Ty::FloatLit,
+                        _ => Ty::Error,
+                    };
+                    let lo_ty = bound_ty(lo);
+                    let hi_ty = bound_ty(hi);
+                    // 下限と上限は同じ数値クラスであること。
+                    if lo_ty != hi_ty {
+                        self.error(
+                            *pat_span,
+                            "範囲パターンの下限と上限は同じ数値型である必要があります".to_string(),
+                        );
+                    } else if !self.assignable(&scrut_ty, &lo_ty)
+                        && scrut_ty != Ty::Infer
+                        && scrut_ty != Ty::Error
+                    {
+                        self.error(
+                            *pat_span,
+                            format!(
+                                "範囲パターンの型 `{}` が scrutinee の型 `{}` と一致しません",
+                                lo_ty.describe(),
+                                scrut_ty.describe()
+                            ),
+                        );
+                    }
+                }
+                Pattern::Variant { name, binding, span: pat_span } => {
+                    if let Some(ref evs) = enum_variants {
+                        // バリアントが enum に存在するか確認。
+                        let found = evs.iter().find(|(vn, _)| vn == name);
+                        match found {
+                            None => {
+                                self.error(
+                                    *pat_span,
+                                    format!(
+                                        "`{}` は `{}` のバリアントではありません",
+                                        name,
+                                        enum_name.as_deref().unwrap_or("?")
+                                    ),
+                                );
+                            }
+                            Some((_, payload_ty)) => {
+                                // 束縛 x の型を登録。
+                                if let Some((bname, bspan)) = binding {
+                                    let bty = payload_ty.clone().unwrap_or(Ty::Infer);
+                                    if let Some(&id) = self.def_spans.get(bspan) {
+                                        self.def_types[id] = bty;
+                                    }
+                                } else if payload_ty.is_some() {
+                                    self.error(
+                                        *pat_span,
+                                        format!(
+                                            "バリアント `{name}` はペイロードを持ちます（`{name}(binding)` と書いてください）"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        // 非 enum に対するバリアントパターン（OK の場合も Infer 扱い）。
+                        // 束縛があれば Infer 型として登録する。
+                        if let Some((_, bspan)) = binding {
+                            if let Some(&id) = self.def_spans.get(bspan) {
+                                self.def_types[id] = Ty::Infer;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ガードは bool でなければならない（束縛変数の型は上で登録済み）。
+            if let Some(g) = &arm.guard {
+                let gt = self.check_expr(g);
+                self.expect_bool(&gt, g.span, "match ガード");
+            }
+
+            let arm_ty = self.check_expr(&arm.body).defaulted();
+            // 全アームの型を合流させる（Infer は無視、最初の具体型を採用）。
+            if result_ty == Ty::Infer || result_ty == Ty::Error {
+                result_ty = arm_ty;
+            } else if arm_ty != Ty::Infer && arm_ty != Ty::Error && arm_ty != result_ty {
+                // 型の不一致は警告程度（エラーにするとテストが壊れる）。
+                // 一致させようとするが、合わなければエラーのみ記録して Infer に戻す。
+                if !self.assignable(&result_ty, &arm_ty) {
+                    self.error(
+                        arm.body.span,
+                        format!(
+                            "match アームの型が一致しません: `{}` を期待しましたが `{}` でした",
+                            result_ty.describe(),
+                            arm_ty.describe()
+                        ),
+                    );
+                    result_ty = Ty::Error;
+                }
+            }
+        }
+
+        if result_ty == Ty::Infer {
+            Ty::unit()
+        } else {
+            result_ty
         }
     }
 
@@ -725,7 +922,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn infer_call(&mut self, callee: &Expr, args: &[Expr]) -> Ty {
+    fn infer_call(&mut self, callee: &Expr, args: &[Expr], call_span: Span) -> Ty {
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
 
         // メソッド呼び出し `object.method(args)`（callee がメンバアクセス）。
@@ -748,9 +945,47 @@ impl<'a> Checker<'a> {
         if let ExprKind::Ident(name) = &callee.kind
             && let Some(&id) = self.res.uses.get(&callee.span)
         {
+            // ユーザー定義の非ジェネリック enum バリアント（ペイロードあり）。
+            if self.res.defs[id].kind == DefKind::Builtin {
+                if let Some((enum_name, tag, payload_ty)) = self.variant_owners.get(name).cloned() {
+                    // ペイロード型検査。
+                    let payload_expr = args.first();
+                    if let Some(pt) = &payload_ty {
+                        if args.len() != 1 {
+                            self.error(
+                                callee.span,
+                                format!(
+                                    "バリアント `{name}` のペイロードは 1 個ですが {} 個渡されました",
+                                    args.len()
+                                ),
+                            );
+                        } else if let Some(a) = payload_expr {
+                            let at = self.check_expr(a);
+                            if !self.assignable(pt, &at) {
+                                self.error(
+                                    a.span,
+                                    format!(
+                                        "バリアント `{name}` のペイロードの型が一致しません: `{}` を期待しましたが `{}` でした",
+                                        pt.describe(),
+                                        at.describe()
+                                    ),
+                                );
+                            }
+                        }
+                    } else if !args.is_empty() {
+                        self.error(
+                            callee.span,
+                            format!("バリアント `{name}` はペイロードを持ちません"),
+                        );
+                    }
+                    // バリアント構築として記録（Call 式全体の span に記録）。
+                    self.variant_constructions.insert(call_span, (enum_name.clone(), tag, true));
+                    return Ty::named(&enum_name);
+                }
+                return builtin_ctor(name, &arg_tys);
+            }
             match self.res.defs[id].kind {
                 DefKind::Function => return self.check_func_call(name, callee.span, args, &arg_tys),
-                DefKind::Builtin => return builtin_ctor(name, &arg_tys),
                 _ => {}
             }
         }
@@ -1547,7 +1782,12 @@ fn lower_type_def(t: &TypeDef) -> TyDef {
                 .map(|f| (f.name.clone(), Ty::from_ast(&f.ty)))
                 .collect(),
         },
-        TypeDefBody::Enum(_) => TyDef::Enum,
+        TypeDefBody::Enum(variants) => TyDef::Enum {
+            variants: variants
+                .iter()
+                .map(|v| (v.name.clone(), v.payload.as_ref().map(Ty::from_ast)))
+                .collect(),
+        },
     }
 }
 

@@ -161,6 +161,54 @@ fn accepts_break_continue_inside_loop() {
 }
 
 #[test]
+fn accepts_match_guard_with_bool() {
+    // ガードが bool なら通る。ペイロード束縛をガードから参照できる。
+    typecheck(
+        "type Shape = enum {\n    Circle\n    Rect(i32)\n}\nfn f(s: Shape): i32 {\n    match s {\n        Rect(side) if side > 0 -> 1\n        _ -> 0\n    }\n}",
+    )
+    .expect("bool ガードの match は通る");
+}
+
+#[test]
+fn rejects_non_bool_match_guard() {
+    // ガードは bool でなければならない。
+    let errs = typecheck(
+        "fn f(n: i32): i32 {\n    match n {\n        _ if n + 1 -> 1\n        _ -> 0\n    }\n}",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("match ガード")));
+}
+
+#[test]
+fn accepts_numeric_range_pattern() {
+    // 数値の範囲パターンは scrutinee の型に適合すれば通る。
+    typecheck(
+        "fn f(n: i32): i32 {\n    match n {\n        0..10 -> 1\n        10..=20 -> 2\n        _ -> 0\n    }\n}",
+    )
+    .expect("数値範囲パターンは通る");
+}
+
+#[test]
+fn rejects_range_pattern_type_mismatch() {
+    // 文字列 scrutinee に整数範囲パターンは不可。
+    let errs = typecheck(
+        "fn f(s: string): i32 {\n    match s {\n        0..10 -> 1\n        _ -> 0\n    }\n}",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("範囲パターンの型")));
+}
+
+#[test]
+fn rejects_mixed_range_bounds() {
+    // 範囲の下限・上限の数値クラスが異なるのは不可。
+    let errs = typecheck(
+        "fn f(n: i32): i32 {\n    match n {\n        0..10.5 -> 1\n        _ -> 0\n    }\n}",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("同じ数値型")));
+}
+
+#[test]
 fn example_hello_typechecks() {
     let src = include_str!("../examples/hello.iris");
     typecheck(src).expect("サンプルは型検査を通るはず");

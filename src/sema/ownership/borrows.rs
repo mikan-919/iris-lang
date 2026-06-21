@@ -129,6 +129,25 @@ impl Borrows<'_> {
         }
     }
 
+    /// match アームのガード・本体式（式）をスコープ付きで訪問する。
+    fn visit_block_arm(&mut self, guard: Option<&Expr>, body: &Expr) {
+        self.scopes.push(Vec::new());
+        if let Some(g) = guard {
+            self.descend_expr(g);
+        }
+        self.descend_expr(body);
+        let depth = self.scopes.len();
+        let roots = self.scopes.pop().expect("スコープが存在するはず");
+        for root in roots {
+            if let Some(v) = self.active.get_mut(&root) {
+                v.retain(|b| b.depth != depth);
+                if v.is_empty() {
+                    self.active.remove(&root);
+                }
+            }
+        }
+    }
+
     /// 名前付き借用を現在のスコープに登録する。
     fn push_borrow(&mut self, root: DefId, mutable: bool, span: Span, binding: Option<DefId>) {
         let depth = self.scopes.len();
@@ -347,6 +366,18 @@ impl Borrows<'_> {
             ExprKind::StructLit { fields, .. } => {
                 for f in fields {
                     self.descend_expr(&f.value);
+                }
+            }
+            ExprKind::EnumLit { payload, .. } => {
+                if let Some(p) = payload {
+                    self.descend_expr(p);
+                }
+            }
+            ExprKind::Match { scrutinee, arms } => {
+                self.descend_expr(scrutinee);
+                for arm in arms {
+                    // 各アームは独立したスコープ（反復ごとに借用を解放）。
+                    self.visit_block_arm(arm.guard.as_ref(), &arm.body);
                 }
             }
             _ => {}

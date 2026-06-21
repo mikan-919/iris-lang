@@ -28,6 +28,7 @@ pub enum TokenKind {
     Struct,
     Enum,
     Extern,
+    Match,
 
     // 区切り・括弧
     LParen,   // (
@@ -39,6 +40,8 @@ pub enum TokenKind {
     Comma,    // ,
     Colon,    // :
     Dot,      // .
+    DotDot,   // ..  (範囲パターン・排他上限)
+    DotDotEq, // ..= (範囲パターン・包含上限)
     Arrow,    // ->
 
     // 演算子
@@ -91,6 +94,7 @@ impl TokenKind {
             TokenKind::Struct => "`struct`".into(),
             TokenKind::Enum => "`enum`".into(),
             TokenKind::Extern => "`extern`".into(),
+            TokenKind::Match => "`match`".into(),
             TokenKind::LParen => "`(`".into(),
             TokenKind::RParen => "`)`".into(),
             TokenKind::LBrace => "`{`".into(),
@@ -100,6 +104,8 @@ impl TokenKind {
             TokenKind::Comma => "`,`".into(),
             TokenKind::Colon => "`:`".into(),
             TokenKind::Dot => "`.`".into(),
+            TokenKind::DotDot => "`..`".into(),
+            TokenKind::DotDotEq => "`..=`".into(),
             TokenKind::Arrow => "`->`".into(),
             TokenKind::Plus => "`+`".into(),
             TokenKind::Minus => "`-`".into(),

@@ -321,3 +321,93 @@ fn runs_while_with_continue() {
         assert_eq!(code, 30);
     }
 }
+
+#[test]
+fn runs_enum_match_no_payload() {
+    // ペイロードなし enum と match 式の縦断テスト。
+    // Red=1, Green=2, Blue=3 → color_code(Green) = 2。
+    let src = "type Color = enum {\n    Red\n    Green\n    Blue\n}\nfn color_code(c: Color): i32 {\n    match c {\n        Red -> 1\n        Green -> 2\n        Blue -> 3\n        _ -> 0\n    }\n}\nfn main(): i32 {\n    return color_code(Green)\n}";
+    if let Some(code) = run_exit_code(src, "enum_no_payload") {
+        assert_eq!(code, 2);
+    }
+}
+
+#[test]
+fn runs_enum_match_with_payload() {
+    // ペイロードあり enum: Rect(5) → side * side = 25。
+    let src = "type Shape = enum {\n    Circle\n    Rect(i32)\n}\nfn area(s: Shape): i32 {\n    match s {\n        Circle -> 0\n        Rect(side) -> side * side\n        _ -> -1\n    }\n}\nfn main(): i32 {\n    return area(Rect(5))\n}";
+    if let Some(code) = run_exit_code(src, "enum_payload") {
+        assert_eq!(code, 25);
+    }
+}
+
+#[test]
+fn runs_enum_match_wildcard_fallthrough() {
+    // ワイルドカードアームが正しく機能する。
+    let src = "type Dir = enum {\n    North\n    South\n    East\n    West\n}\nfn is_north(d: Dir): i32 {\n    match d {\n        North -> 1\n        _ -> 0\n    }\n}\nfn main(): i32 {\n    let a = is_north(North)\n    let b = is_north(South)\n    return a * 10 + b\n}";
+    if let Some(code) = run_exit_code(src, "enum_wildcard") {
+        assert_eq!(code, 10);
+    }
+}
+
+#[test]
+fn emits_strcmp_for_string_pattern() {
+    // 文字列リテラルパターンは strcmp 呼び出しで比較し、結果を 0 と比べる。
+    let ir = emit(
+        "fn r(s: string): i32 {\n    match s {\n        \"hi\" -> 1\n        _ -> 0\n    }\n}",
+    );
+    assert!(ir.contains("declare i32 @strcmp(ptr, ptr)"));
+    assert!(ir.contains("call i32 @strcmp(ptr"));
+    assert!(ir.contains("icmp eq i32"));
+}
+
+#[test]
+fn runs_string_pattern_match() {
+    // 文字列パターンの分岐: rank("silver")=2, rank("none")=0 → 2*10+0 = 20。
+    let src = "fn rank(s: string): i32 {\n    match s {\n        \"gold\" -> 3\n        \"silver\" -> 2\n        \"bronze\" -> 1\n        _ -> 0\n    }\n}\nfn main(): i32 {\n    return rank(\"silver\") * 10 + rank(\"none\")\n}";
+    if let Some(code) = run_exit_code(src, "match_str") {
+        assert_eq!(code, 20);
+    }
+}
+
+#[test]
+fn emits_range_pattern_comparison() {
+    // 範囲パターンは下限・上限の 2 比較を and で合成する（排他は slt、包含は sle）。
+    let ir = emit(
+        "fn g(n: i32): i32 {\n    match n {\n        0..10 -> 1\n        10..=20 -> 2\n        _ -> 0\n    }\n}",
+    );
+    assert!(ir.contains("icmp sge i32"));
+    assert!(ir.contains("icmp slt i32"));
+    assert!(ir.contains("icmp sle i32"));
+    assert!(ir.contains("and i1"));
+}
+
+#[test]
+fn runs_range_pattern_match() {
+    // 排他 `..` と包含 `..=`: grade(45)=1, grade(60)=2, grade(79)=2, grade(80)=3, grade(100)=3。
+    // 1 + 2*10 + 2*100 + 3*1000 + 3*10000 = 33221、終了コードは下位 8 ビット = 197。
+    let src = "fn grade(n: i32): i32 {\n    match n {\n        0..60 -> 1\n        60..=79 -> 2\n        80..=100 -> 3\n        _ -> 0\n    }\n}\nfn main(): i32 {\n    return grade(45) + grade(60) * 10 + grade(79) * 100 + grade(80) * 1000 + grade(100) * 10000\n}";
+    if let Some(code) = run_exit_code(src, "match_range") {
+        assert_eq!(code, 197);
+    }
+}
+
+#[test]
+fn emits_guard_branch() {
+    // ガード付きアームは束縛設定の後にガードを評価し、専用ブロックへ分岐する。
+    let ir = emit(
+        "type Shape = enum {\n    Circle\n    Rect(i32)\n}\nfn f(s: Shape): i32 {\n    match s {\n        Rect(side) if side > 10 -> 2\n        _ -> 0\n    }\n}",
+    );
+    assert!(ir.contains("match.guarded"));
+}
+
+#[test]
+fn runs_match_guard() {
+    // ペイロード束縛を参照するガードと、scrutinee を参照するワイルドカードガード。
+    // classify(Rect(20))=3, classify(Rect(5))=2, classify(Rect(0))=1 → 321。
+    // pick(0)=200（0 アーム）, pick(5)=300（_ アーム）→ 321 + 200 - 300 = 221。
+    let src = "type Shape = enum {\n    Circle\n    Rect(i32)\n}\nfn classify(s: Shape): i32 {\n    match s {\n        Rect(side) if side > 10 -> 3\n        Rect(side) if side > 0 -> 2\n        Rect(side) -> 1\n        Circle -> 0\n        _ -> -1\n    }\n}\nfn pick(n: i32): i32 {\n    match n {\n        _ if n < 0 -> 100\n        0 -> 200\n        _ -> 300\n    }\n}\nfn main(): i32 {\n    let a = classify(Rect(20))\n    let b = classify(Rect(5))\n    let c = classify(Rect(0))\n    return a * 100 + b * 10 + c + pick(0) - pick(5)\n}";
+    if let Some(code) = run_exit_code(src, "match_guard") {
+        assert_eq!(code, 221);
+    }
+}

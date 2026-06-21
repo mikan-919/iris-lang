@@ -242,6 +242,73 @@ pub enum ExprKind {
         name_span: Span,
         fields: Vec<FieldInit>,
     },
+    /// enum バリアント構築 `VariantName` / `VariantName(payload)`。
+    /// パーサは `Call` / `Ident` として生成し、typeck が認識して型を付ける。
+    /// コード生成ではこのノードとして扱う（typeck が TypeInfo へ記録する）。
+    EnumLit {
+        variant: String,
+        payload: Option<Box<Expr>>,
+        span: Span,
+    },
+    /// match 式 `match scrutinee { pattern -> expr ... }`。
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
+}
+
+/// match 式のアーム `pattern [if guard] -> body`。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: Pattern,
+    /// ガード条件 `if cond`。なければ `None`。bool 型で、パターンの束縛変数を参照できる。
+    pub guard: Option<Expr>,
+    pub body: Expr,
+    pub span: Span,
+}
+
+/// match のパターン。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pattern {
+    /// `_`
+    Wildcard { span: Span },
+    /// リテラル `0`, `true`, `"str"`, `3.14`
+    Lit { value: LitPat, span: Span },
+    /// 数値の範囲 `1..10`（排他）/ `1..=10`（包含）。境界は整数または浮動小数リテラル。
+    Range {
+        lo: LitPat,
+        hi: LitPat,
+        /// `..=`（上限を含む）なら true、`..`（上限を含まない）なら false。
+        inclusive: bool,
+        span: Span,
+    },
+    /// `VariantName` または `VariantName(binding)`
+    Variant {
+        name: String,
+        /// ペイロードを束縛する変数名と宣言 span。ペイロードなしのバリアントでは `None`。
+        binding: Option<(String, Span)>,
+        span: Span,
+    },
+}
+
+impl Pattern {
+    pub fn span(&self) -> Span {
+        match self {
+            Pattern::Wildcard { span }
+            | Pattern::Lit { span, .. }
+            | Pattern::Range { span, .. }
+            | Pattern::Variant { span, .. } => *span,
+        }
+    }
+}
+
+/// リテラルパターンの値。
+#[derive(Debug, Clone, PartialEq)]
+pub enum LitPat {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
 }
 
 /// 構造体リテラルのフィールド初期化 `name: value`。

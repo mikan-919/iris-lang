@@ -204,6 +204,7 @@ fn lex_ident_or_keyword(input: LSpan) -> nom::IResult<LSpan, Token> {
         "struct" => TokenKind::Struct,
         "enum" => TokenKind::Enum,
         "extern" => TokenKind::Extern,
+        "match" => TokenKind::Match,
         "true" => TokenKind::Bool(true),
         "false" => TokenKind::Bool(false),
         _ => TokenKind::Ident(text.to_string()),
@@ -215,7 +216,15 @@ fn lex_ident_or_keyword(input: LSpan) -> nom::IResult<LSpan, Token> {
 fn lex_symbol(input: LSpan) -> nom::IResult<LSpan, Token> {
     let start = input;
 
-    // 2 文字以上の記号を先に試す。
+    // 3 文字の記号を最優先で試す（最長一致）。`..=` は `..` より先に判定する。
+    let three_char: &[(&str, TokenKind)] = &[("..=", TokenKind::DotDotEq)];
+    for (sym, kind) in three_char {
+        if let Ok((rest, _)) = tag::<_, _, ()>(*sym)(input) {
+            return Ok((rest, Token::new(kind.clone(), mk_span(&start, &rest))));
+        }
+    }
+
+    // 2 文字以上の記号を先に試す。`..` は `.` より先に判定する。
     let two_char: &[(&str, TokenKind)] = &[
         ("->", TokenKind::Arrow),
         ("==", TokenKind::EqEq),
@@ -224,6 +233,7 @@ fn lex_symbol(input: LSpan) -> nom::IResult<LSpan, Token> {
         (">=", TokenKind::GtEq),
         ("&&", TokenKind::AndAnd),
         ("||", TokenKind::OrOr),
+        ("..", TokenKind::DotDot),
     ];
     for (sym, kind) in two_char {
         if let Ok((rest, _)) = tag::<_, _, ()>(*sym)(input) {
