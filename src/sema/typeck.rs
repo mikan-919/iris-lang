@@ -266,16 +266,41 @@ impl<'a> Checker<'a> {
             Stmt::Assign { target, value, .. } => {
                 let target_ty = self.check_expr(target);
                 let value_ty = self.check_expr(value);
-                self.check_assignable_target(target);
-                if !self.assignable(&target_ty, &value_ty) {
-                    self.error(
-                        value.span,
-                        format!(
-                            "代入の型が一致しません: `{}` に `{}` は代入できません",
-                            target_ty.describe(),
-                            value_ty.describe()
-                        ),
-                    );
+                // 参照越し代入（write-through）: 代入先が参照型 `&mut T` で、右辺が
+                // 値型 T のとき、参照先へ書き込む。右辺が参照型なら束縛の付け替え
+                // （rebind）として target_ty 全体で判定する（RHS の型で振り分ける）。
+                if let Ty::Ref { mutable, inner } = &target_ty
+                    && !matches!(value_ty, Ty::Ref { .. })
+                {
+                    // 可変性は参照（`&mut`）に依存する。束縛 r 自体の mut は不要。
+                    if !*mutable {
+                        self.error(
+                            target.span,
+                            "不変参照 `&T` の参照先には書き込めません（`&mut` が必要）"
+                                .to_string(),
+                        );
+                    } else if !self.assignable(inner, &value_ty) {
+                        self.error(
+                            value.span,
+                            format!(
+                                "代入の型が一致しません: `{}` に `{}` は代入できません",
+                                inner.describe(),
+                                value_ty.describe()
+                            ),
+                        );
+                    }
+                } else {
+                    self.check_assignable_target(target);
+                    if !self.assignable(&target_ty, &value_ty) {
+                        self.error(
+                            value.span,
+                            format!(
+                                "代入の型が一致しません: `{}` に `{}` は代入できません",
+                                target_ty.describe(),
+                                value_ty.describe()
+                            ),
+                        );
+                    }
                 }
             }
             Stmt::While { cond, body, .. } => {

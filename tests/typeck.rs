@@ -98,6 +98,33 @@ fn allows_reassign_mutable() {
 }
 
 #[test]
+fn write_through_mut_ref_typechecks() {
+    // `&mut T` への値型 T の代入は参照越し書き込み（write-through）。inner 型で判定。
+    typecheck("fn set(r: &mut i32) {\n    r = 99\n}").expect("&mut への write-through は通る");
+}
+
+#[test]
+fn rejects_write_through_immutable_ref() {
+    // 不変参照 `&T` の参照先には書き込めない。
+    let errs = typecheck("fn set(r: &i32) {\n    r = 99\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("不変参照")));
+}
+
+#[test]
+fn rejects_write_through_inner_type_mismatch() {
+    // write-through は参照の inner 型と右辺を突き合わせる（`&mut i32` に bool は不可）。
+    let errs = typecheck("fn set(r: &mut i32) {\n    r = true\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("型が一致しません")));
+}
+
+#[test]
+fn ref_rebind_still_typechecks() {
+    // 右辺が参照型なら write-through ではなく束縛の付け替え（rebind）。target 全体で判定。
+    typecheck("fn f() {\n    let a = 1\n    let b = 2\n    let mut r = &a\n    r = &b\n}")
+        .expect("参照の付け替えは通る");
+}
+
+#[test]
 fn rejects_ternary_branch_mismatch() {
     let errs = typecheck("fn f(c: bool) {\n    let x = c ? 1 : true\n}").unwrap_err();
     assert!(errs.iter().any(|m| m.contains("三項演算子の分岐")));

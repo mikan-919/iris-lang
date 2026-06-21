@@ -133,7 +133,15 @@ impl Flow<'_> {
             Stmt::Assign { target, value, .. } => {
                 self.visit_expr(value, st);
                 if let ExprKind::Ident(_) = &target.kind {
-                    if let Some(&id) = self.res.uses.get(&target.span) {
+                    // 参照越し代入（write-through）: 代入先が参照型で右辺が値型のとき、
+                    // 束縛 r は変わらず参照先へ書き込むだけ。r をムーブせず借用として
+                    // 使い（ムーブ済み/ダングリングでないことを確認）、provenance も保つ。
+                    let target_is_ref = matches!(self.types.get(&target.span), Some(Ty::Ref { .. }));
+                    let value_is_ref = matches!(self.types.get(&value.span), Some(Ty::Ref { .. }));
+                    if target_is_ref && !value_is_ref {
+                        self.use_place(target, st);
+                    } else if let Some(&id) = self.res.uses.get(&target.span) {
+                        // 通常の再代入 / 参照の付け替え（rebind）。
                         st.moved.remove(&id);
                         st.dangling.remove(&id);
                         // 参照への再代入は provenance を更新する。

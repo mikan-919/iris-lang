@@ -143,8 +143,12 @@ impl Borrows<'_> {
                 }
             }
             Stmt::Assign { target, value, .. } => {
+                // 参照の付け替え（rebind, `r = &mut y`）のときだけ借用を更新する。
+                // 参照越し代入（write-through, `r = 5`）は r の借用を生かしたまま
+                // 参照先へ書くだけなので、古い借用を解放してはならない（健全性）。
                 if let ExprKind::Ident(_) = &target.kind
                     && let Some(&bid) = self.res.uses.get(&target.span)
+                    && let Some((root, mutable)) = borrow_of(value, self.res)
                 {
                     // 借用変数への再代入は古い借用を解放する。
                     if let Some(old_root) = self.binding_root.remove(&bid)
@@ -155,9 +159,7 @@ impl Borrows<'_> {
                             self.active.remove(&old_root);
                         }
                     }
-                    if let Some((root, mutable)) = borrow_of(value, self.res) {
-                        self.push_borrow(root, mutable, value.span, Some(bid));
-                    }
+                    self.push_borrow(root, mutable, value.span, Some(bid));
                 }
             }
             _ => {}

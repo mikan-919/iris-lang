@@ -277,6 +277,25 @@ fn runs_struct_field_assignment() {
 }
 
 #[test]
+fn emits_write_through_store() {
+    // `&mut i32` への代入は、参照値（ptr）を load してその指す先へ store する（rebind ではない）。
+    let ir = emit("fn set(r: &mut i32) {\n    r = 99\n}");
+    assert!(ir.contains("define void @set(ptr %arg0)"));
+    // r（ptr）を読み出し、その先へ i32 を書き込む。
+    assert!(ir.contains("load ptr, ptr %r.addr"));
+    assert!(ir.contains("store i32 99, ptr %t0"));
+}
+
+#[test]
+fn runs_write_through_mut_ref() {
+    // 参照越し代入で呼び出し側のローカルが書き換わる。
+    let src = "fn set(r: &mut i32) {\n    r = 99\n}\nfn main(): i32 {\n    let mut x = 1\n    set(&mut x)\n    return x\n}";
+    if let Some(code) = run_exit_code(src, "write_through") {
+        assert_eq!(code, 99);
+    }
+}
+
+#[test]
 fn runs_nested_struct_and_call_return_member() {
     // ネストした struct のチェーンアクセスと、関数戻り値（場所でない値）のメンバアクセス。
     let src = "type Point = struct {\n    x: i32\n    y: i32\n}\ntype Line = struct {\n    a: Point\n    b: Point\n}\nfn origin(): Point {\n    return Point { x: 2, y: 5 }\n}\nfn main(): i32 {\n    let l = Line { a: Point { x: 1, y: 2 }, b: Point { x: 3, y: 4 } }\n    return l.a.x * 10 + l.b.y + origin().y\n}";

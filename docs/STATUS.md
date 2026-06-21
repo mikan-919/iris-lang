@@ -154,21 +154,21 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
   - 構造体リテラル `Name { ... }`: alloca → 各フィールドへ `getelementptr` + `store` → 全体を `load`
   - メンバアクセス `a.b`: フィールドの `getelementptr` から `load`（ネストした `a.b.c` のチェーン、
     参照越し `(&a).b`、関数戻り値など場所でない値からのアクセスにも対応＝一時 alloca へ退避）
-  - フィールド代入 `a.b = v`（ローカル struct への書き込み。参照越し write-through は別途）
+  - フィールド代入 `a.b = v`（ローカル struct への書き込み）
   - `type X = Y` の別名は struct/プリミティブ双方とも末尾までたどって解決する
-- **参照 `&T` / `&mut T`**: opaque ポインタ（`ptr`）で表現。`&x` / `&mut x` は場所（ローカル/引数の alloca）のアドレスを値として返す。値が期待される文脈（算術・比較・条件・引数・`return`・注釈付き `let`）では**暗黙にデリファレンス**（`load`）して指す先の値を取り出す。多段参照も剥がす。typeck 側も `&T` を `T` の位置で受け入れる（`assignable` / `join_numeric` / `expect_bool` で参照を剥がす）。参照越しの代入（write-through）は未対応で、参照変数への再代入は束縛の付け替えになる
+- **参照 `&T` / `&mut T`**: opaque ポインタ（`ptr`）で表現。`&x` / `&mut x` は場所（ローカル/引数の alloca）のアドレスを値として返す。値が期待される文脈（算術・比較・条件・引数・`return`・注釈付き `let`）では**暗黙にデリファレンス**（`load`）して指す先の値を取り出す。多段参照も剥がす。typeck 側も `&T` を `T` の位置で受け入れる（`assignable` / `join_numeric` / `expect_bool` で参照を剥がす）。**参照越しの代入（write-through）に対応**：代入先が `&mut T` で右辺が値型 T のとき、参照値（`ptr`）を load してその指す先へ `store` する（`&T` の参照先への書き込みは型検査で拒否）。右辺が参照型のときは従来どおり束縛の付け替え（rebind）。typeck / flow（r をムーブせず借用として使用し provenance を保つ）/ borrows（write-through は借用を解放しない）の三層で整合
 - **文字列 `string`**: C 風の **NUL 終端**表現。文字列リテラルは `[N x i8]` のグローバル定数
   `@.str.N = private unnamed_addr constant [N x i8] c"...\00"` にし、文字列値は opaque ポインタ
   `ptr`（先頭バイトのアドレス）として扱う（`llvm_ty("string") = ptr`、`zero_value(ptr) = null`）。
   リテラルの符号化は印字可能 ASCII 以外と `"` `\` を `\XX`（16進）でエスケープし末尾に NUL を付ける
   （マルチバイト UTF-8 はバイト単位）。値渡し（引数・戻り値・`let`）に対応。`extern fn puts`（std）で
   libc に渡して出力できる。**長さ・索引・連結・補間などの操作はまだ無い**（リテラルを渡す/返すのみ）
-- **struct**（上記）。enum・参照越し代入（write-through）・`!`・ジェネリクスは未対応
+- **struct**（上記）。enum・`!`・ジェネリクスは未対応
 - `main(): i32` の戻り値が終了コードになり、`clang` で実行して検証できる
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
-- 未対応（今後）: enum（バリアント構築/分解は frontend も未対応）、参照越しの代入（write-through）、
+- 未対応（今後）: enum（バリアント構築/分解は frontend も未対応）、
   `!`（Result/Option 伝播）、文字列の操作（長さ・索引・連結・補間）、ジェネリクス
 
 ### 標準ライブラリ（最小・iris 自身で記述）
@@ -199,7 +199,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 
 - 借用検査の高度化（NLL 風の精密なライフタイム領域推論・部分ムーブ・ループ）— `compiler.md` の Open Question 領域
 - 型推論の高度化（リテラルの後方からの確定、ジェネリクスの単一化）
-- コード生成の拡張（enum・参照越し代入・文字列の操作・I/O）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
+- コード生成の拡張（enum・文字列の操作・I/O）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
 - 並行処理 — `concurrency.md` 未設計
 
 ## 仕様未確定のため独自に決めた点（要確認）

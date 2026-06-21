@@ -65,6 +65,17 @@ fn reassign_releases_old_borrow() {
 }
 
 #[test]
+fn write_through_keeps_borrow_alive() {
+    // 参照越し代入（write-through, `r = P{..}`）は r の借用を解放しない。
+    // よって r が p を可変借用したまま再度 `&mut p` すると競合する。
+    let src = format!(
+        "{P}fn run() {{\n    let mut p = P {{ x: 1 }}\n    let mut r = &mut p\n    r = P {{ x: 5 }}\n    let s = &mut p\n}}"
+    );
+    let errs = ownck(&src).unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("二重で可変借用")));
+}
+
+#[test]
 fn shared_then_mut_conflicts() {
     let src = format!("{P}fn use2(a: &P, b: &mut P): i32 {{\n    return a.x\n}}\nfn run(): i32 {{\n    let mut p = P {{ x: 1 }}\n    let r = &p\n    let s = &mut p\n    return use2(r, s)\n}}");
     let errs = ownck(&src).unwrap_err();

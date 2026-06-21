@@ -21,7 +21,8 @@
 //!
 //! ローカルは alloca + load/store で扱う（SSA 化は LLVM の mem2reg に任せられる）。
 //! enum・`!`・ジェネリクスなどは未対応（エラーにする）。参照越しの代入
-//! （write-through `&mut x = v`）はまだ無く、参照への再代入は束縛の付け替えになる。
+//! （write-through `r = v`、`r: &mut T`）は参照値（`ptr`）の指す先へ `store` する。
+//! 右辺が参照型のときは束縛の付け替え（rebind）になる。
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -362,10 +363,22 @@ impl<'a> FnCodegen<'a> {
                 Ok(())
             }
             Stmt::Assign { target, value, .. } => {
-                let (ptr, llty) = self.place_ptr(target)?;
-                let want = self.raw_ty(target).defaulted();
-                let (v, _) = self.gen_value(value, &want)?;
-                self.emit(&format!("store {llty} {v}, ptr {ptr}"));
+                let target_ty = self.raw_ty(target).defaulted();
+                let value_ty = self.raw_ty(value).defaulted();
+                // 参照越し代入（write-through）: 代入先が参照型で右辺が値型のとき、
+                // target を参照値（`ptr`）として評価し、その参照先へ store する。
+                if let Ty::Ref { inner, .. } = &target_ty
+                    && !matches!(value_ty, Ty::Ref { .. })
+                {
+                    let dest = self.gen_expr(target, "ptr")?;
+                    let inner_ty = (**inner).clone();
+                    let (v, vllty) = self.gen_value(value, &inner_ty)?;
+                    self.emit(&format!("store {vllty} {v}, ptr {dest}"));
+                } else {
+                    let (ptr, llty) = self.place_ptr(target)?;
+                    let (v, _) = self.gen_value(value, &target_ty)?;
+                    self.emit(&format!("store {llty} {v}, ptr {ptr}"));
+                }
                 Ok(())
             }
             Stmt::While { cond, body, .. } => self.gen_while(cond, body),
