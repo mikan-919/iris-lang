@@ -106,8 +106,16 @@ impl Resolver {
             }
         }
         for item in &program.items {
-            if let Item::Function(f) = item {
-                self.resolve_function(f);
+            match item {
+                Item::Function(f) => self.resolve_function(f),
+                // impl のメソッドは値の名前空間には登録しない（`x.m()` で型から解決）。
+                // 本体だけ解決する。`self` は合成された引数として登録される。
+                Item::Impl(im) => {
+                    for m in &im.methods {
+                        self.resolve_function(m);
+                    }
+                }
+                Item::TypeDef(_) => {}
             }
         }
         self.pop_scope();

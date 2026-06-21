@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Block, Else, Expr, ExprKind, Function, Item, Program, Stmt, UnaryOp};
+use crate::ast::{Block, Else, Expr, ExprKind, Function, Item, Program, SelfKind, Stmt, UnaryOp};
 use crate::sema::resolve::{DefId, DefKind, Resolution};
 use crate::sema::ty::{FLOAT_TYPES, INT_TYPES, Ty};
 use crate::sema::typeck::TypeInfo;
@@ -58,20 +58,45 @@ pub fn check_functions(
         .map(|(id, d)| (d.span, id))
         .collect();
 
+    // 固有メソッドの self の受け方（受け手がムーブか借用かを決める）。
+    let method_self = collect_method_self(program);
+
     let mut a = Flow {
         res,
         types: &type_info.expr_types,
         aliases,
         def_type,
         def_spans,
+        method_self,
         prov: HashMap::new(),
         errors,
     };
     for item in &program.items {
-        if let Item::Function(f) = item {
-            a.run_function(f);
+        match item {
+            Item::Function(f) => a.run_function(f),
+            Item::Impl(im) => {
+                for m in &im.methods {
+                    a.run_function(m);
+                }
+            }
+            Item::TypeDef(_) => {}
         }
     }
+}
+
+/// 固有メソッドの `(型名, メソッド名) → self の受け方` を集める。
+fn collect_method_self(program: &Program) -> HashMap<(String, String), SelfKind> {
+    let mut m = HashMap::new();
+    for item in &program.items {
+        if let Item::Impl(im) = item {
+            for method in &im.methods {
+                if let Some(kind) = method.self_kind {
+                    m.insert((im.type_name.clone(), method.name.clone()), kind);
+                }
+            }
+        }
+    }
+    m
 }
 
 /// フロー状態（分岐で複製・合流する）。
@@ -89,6 +114,8 @@ struct Flow<'a> {
     aliases: HashMap<String, Ty>,
     def_type: HashMap<DefId, Ty>,
     def_spans: HashMap<Span, DefId>,
+    /// 固有メソッドの self の受け方（受け手のムーブ/借用の判定に使う）。
+    method_self: HashMap<(String, String), SelfKind>,
     /// 参照束縛 DefId → その出所（関数所有の束縛集合）。借用グラフ。
     prov: HashMap<DefId, HashSet<DefId>>,
     errors: &'a mut Vec<OwnershipError>,
@@ -205,7 +232,15 @@ impl Flow<'_> {
             ExprKind::Call { callee, args } => {
                 match &callee.kind {
                     ExprKind::Ident(_) if self.is_callable(callee) => {}
-                    ExprKind::Member { object, .. } => self.use_place(object, st),
+                    // メソッド呼び出しの受け手: `self`（値）はムーブ、`&self`/`&mut self`
+                    // は借用。self の受け方が分からなければ保守的に借用扱い。
+                    ExprKind::Member { object, field } => {
+                        if self.method_takes_value_self(object, field) {
+                            self.visit_expr(object, st);
+                        } else {
+                            self.use_place(object, st);
+                        }
+                    }
                     _ => self.visit_expr(callee, st),
                 }
                 for arg in args {
@@ -373,6 +408,17 @@ impl Flow<'_> {
             ExprKind::Member { object, .. } => self.prov_of(object),
             _ => HashSet::new(),
         }
+    }
+
+    /// `object.method(...)` のメソッドが `self`（値）を取るか。値なら受け手はムーブ。
+    fn method_takes_value_self(&self, object: &Expr, method: &str) -> bool {
+        let Some(Ty::Named { name, .. }) = self.types.get(&object.span).map(Ty::peel_refs) else {
+            return false;
+        };
+        matches!(
+            self.method_self.get(&(name.clone(), method.to_string())),
+            Some(SelfKind::Value)
+        )
     }
 
     fn is_callable(&self, callee: &Expr) -> bool {

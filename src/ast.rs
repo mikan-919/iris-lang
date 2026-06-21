@@ -12,6 +12,30 @@ pub struct Program {
 pub enum Item {
     Function(Function),
     TypeDef(TypeDef),
+    /// 固有メソッドの実装ブロック `impl Type { fn ... }`（トレイト無し）。
+    Impl(Impl),
+}
+
+/// `impl Type { メソッド... }`。型固有のメソッドをまとめる（トレイト境界は未対応）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Impl {
+    /// 実装対象の型名（`impl Point` の `Point`）。
+    pub type_name: String,
+    pub type_name_span: Span,
+    /// メソッド群。第一引数の `self`（[`SelfKind`]）は `params` の先頭に合成される。
+    pub methods: Vec<Function>,
+    pub span: Span,
+}
+
+/// メソッドの `self` の受け方。`None`（self なし）は関連関数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfKind {
+    /// `self`（値で受ける＝ムーブ）
+    Value,
+    /// `&self`（不変参照で借用）
+    Ref,
+    /// `&mut self`（可変参照で借用）
+    RefMut,
 }
 
 /// 型定義 `type Name<generics> = (別名 | struct | enum)`。
@@ -65,6 +89,9 @@ pub struct Function {
     pub is_extern: bool,
     pub name: String,
     pub name_span: Span,
+    /// メソッドの `self` の受け方。`self` を取るとき `params` の先頭が合成 self。
+    /// 自由関数・self なしの関連関数では `None`。
+    pub self_kind: Option<SelfKind>,
     pub params: Vec<Param>,
     pub ret: Option<Type>,
     pub body: Block,

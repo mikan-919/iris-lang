@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::ast::{
-    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, Stmt, Type,
+    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, SelfKind, Stmt, Type,
     TypeDefBody, UnaryOp,
 };
 use crate::sema::resolve::{DefId, Resolution};
@@ -169,6 +169,16 @@ pub fn emit_module(
         }
     }
 
+    // (型名, メソッド名) → メソッド定義（ドット呼び出しのシグネチャ解決用）。
+    let mut method_table: HashMap<(String, String), &Function> = HashMap::new();
+    for item in &program.items {
+        if let Item::Impl(im) = item {
+            for m in &im.methods {
+                method_table.insert((im.type_name.clone(), m.name.clone()), m);
+            }
+        }
+    }
+
     let structs = StructReg::build(program);
 
     let mut module = String::from("; iris-lang が生成した LLVM IR\n\n");
@@ -197,27 +207,38 @@ pub fn emit_module(
     // 文字列リテラルのグローバル定数はここに集め、関数生成後に末尾へ出力する。
     let strings = RefCell::new(StringPool::default());
 
+    // 関数 / メソッドをまとめて出力する。メソッドの記号は `Type.method` に変える。
+    let mut emit_one = |f: &Function, symbol: &str| -> Result<(), CodegenError> {
+        let mut cg = FnCodegen {
+            res,
+            types: &type_info.expr_types,
+            def_spans: &def_spans,
+            func_table: &func_table,
+            method_table: &method_table,
+            structs: &structs,
+            strings: &strings,
+            body: String::new(),
+            tmp: 0,
+            label: 0,
+            locals: HashMap::new(),
+            terminated: false,
+            loops: Vec::new(),
+            ret_ty: Ty::unit(),
+        };
+        let func_ir = cg.emit_function(f, symbol)?;
+        module.push_str(&func_ir);
+        module.push('\n');
+        Ok(())
+    };
+
     for item in &program.items {
         match item {
-            Item::Function(f) => {
-                let mut cg = FnCodegen {
-                    res,
-                    types: &type_info.expr_types,
-                    def_spans: &def_spans,
-                    func_table: &func_table,
-                    structs: &structs,
-                    strings: &strings,
-                    body: String::new(),
-                    tmp: 0,
-                    label: 0,
-                    locals: HashMap::new(),
-                    terminated: false,
-                    loops: Vec::new(),
-                    ret_ty: Ty::unit(),
-                };
-                let func_ir = cg.emit_function(f)?;
-                module.push_str(&func_ir);
-                module.push('\n');
+            Item::Function(f) => emit_one(f, &f.name)?,
+            Item::Impl(im) => {
+                for m in &im.methods {
+                    let symbol = format!("{}.{}", im.type_name, m.name);
+                    emit_one(m, &symbol)?;
+                }
             }
             // 型定義はコード生成では型情報としてのみ使い、IR には出さない。
             Item::TypeDef(_) => {}
@@ -242,6 +263,8 @@ struct FnCodegen<'a> {
     types: &'a HashMap<Span, Ty>,
     def_spans: &'a HashMap<Span, DefId>,
     func_table: &'a HashMap<String, &'a Function>,
+    /// (型名, メソッド名) → メソッド定義。
+    method_table: &'a HashMap<(String, String), &'a Function>,
     structs: &'a StructReg,
     /// 文字列リテラルのグローバル定数プール（全関数で共有）。
     strings: &'a RefCell<StringPool>,
@@ -258,7 +281,9 @@ struct FnCodegen<'a> {
 }
 
 impl<'a> FnCodegen<'a> {
-    fn emit_function(&mut self, f: &Function) -> Result<String, CodegenError> {
+    /// 関数（メソッド）を生成する。`symbol` は LLVM の関数記号（メソッドは
+    /// `Type.method`）。self は `f.params` の先頭に合成済みなので通常の引数として扱う。
+    fn emit_function(&mut self, f: &Function, symbol: &str) -> Result<String, CodegenError> {
         self.ret_ty = match &f.ret {
             Some(t) => Ty::from_ast(t),
             None => Ty::unit(),
@@ -276,7 +301,7 @@ impl<'a> FnCodegen<'a> {
                     llvm_ty(&Ty::from_ast(&p.ty), self.structs).map_err(|m| CodegenError::new(p.span, m))?,
                 );
             }
-            return Ok(format!("declare {ret_ty} @{}({})\n", f.name, tys.join(", ")));
+            return Ok(format!("declare {ret_ty} @{}({})\n", symbol, tys.join(", ")));
         }
 
         // 引数リスト。
@@ -312,7 +337,7 @@ impl<'a> FnCodegen<'a> {
         let _ = writeln!(
             out,
             "define {ret_ty} @{}({}) {{",
-            f.name,
+            symbol,
             params_sig.join(", ")
         );
         out.push_str("entry:\n");
@@ -733,6 +758,10 @@ impl<'a> FnCodegen<'a> {
         args: &[Expr],
         span: Span,
     ) -> Result<String, CodegenError> {
+        // メソッド呼び出し `object.method(args)`。
+        if let ExprKind::Member { object, field } = &callee.kind {
+            return self.gen_method_call(object, field, args, span);
+        }
         let ExprKind::Ident(name) = &callee.kind else {
             return Err(CodegenError::new(span, "この呼び出しはコード生成に未対応です"));
         };
@@ -764,6 +793,89 @@ impl<'a> FnCodegen<'a> {
             let r = self.fresh_tmp();
             self.emit(&format!("{r} = {call}"));
             Ok(r)
+        }
+    }
+
+    /// メソッド呼び出し `object.method(args)` を直接呼び出しに落とす。
+    /// self は受け方に応じて先頭引数として渡す（値＝struct値、`&self`/`&mut self`＝ptr）。
+    fn gen_method_call(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        args: &[Expr],
+        span: Span,
+    ) -> Result<String, CodegenError> {
+        let recv_ty = self.raw_ty(object).defaulted();
+        let ty_name = struct_name_of(&recv_ty)
+            .ok_or_else(|| CodegenError::new(span, "メソッド呼び出しの受け手が型を持ちません"))?;
+        let func = *self
+            .method_table
+            .get(&(ty_name.clone(), method.to_string()))
+            .ok_or_else(|| {
+                CodegenError::new(span, format!("メソッド `{ty_name}.{method}` が見つかりません"))
+            })?;
+        let self_kind = func
+            .self_kind
+            .ok_or_else(|| CodegenError::new(span, format!("`{method}` は self を取りません")))?;
+
+        let ret_ty = match &func.ret {
+            Some(t) => llvm_ty(&Ty::from_ast(t), self.structs)
+                .map_err(|m| CodegenError::new(t.span(), m))?,
+            None => "void".to_string(),
+        };
+
+        // 第一引数 self。
+        let mut arg_strs = Vec::new();
+        match self_kind {
+            SelfKind::Value => {
+                let (sv, sty) = self.gen_value(object, &Ty::named(&ty_name))?;
+                arg_strs.push(format!("{sty} {sv}"));
+            }
+            SelfKind::Ref | SelfKind::RefMut => {
+                let ptr = self.self_pointer(object, &recv_ty)?;
+                arg_strs.push(format!("ptr {ptr}"));
+            }
+        }
+
+        // 残りの引数。`func.params` の先頭は合成 self なので 1 つずらして対応づける。
+        for (i, a) in args.iter().enumerate() {
+            let want = func
+                .params
+                .get(i + 1)
+                .map(|p| Ty::from_ast(&p.ty))
+                .unwrap_or(Ty::Infer);
+            let (v, pty) = self.gen_value(a, &want)?;
+            arg_strs.push(format!("{pty} {v}"));
+        }
+
+        let call = format!("call {ret_ty} @{ty_name}.{method}({})", arg_strs.join(", "));
+        if ret_ty == "void" {
+            self.emit(&call);
+            Ok(String::new())
+        } else {
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = {call}"));
+            Ok(r)
+        }
+    }
+
+    /// `&self`/`&mut self` メソッドへ渡す self ポインタを求める。受け手が参照なら
+    /// その参照値（ptr）、場所ならアドレス、それ以外は一時 alloca へ退避する。
+    fn self_pointer(&mut self, object: &Expr, recv_ty: &Ty) -> Result<String, CodegenError> {
+        if matches!(recv_ty, Ty::Ref { .. }) {
+            return self.gen_expr(object, "ptr");
+        }
+        match self.place_ptr(object) {
+            Ok((p, _)) => Ok(p),
+            Err(_) => {
+                let llty = llvm_ty(recv_ty, self.structs)
+                    .map_err(|m| CodegenError::new(object.span, m))?;
+                let val = self.gen_expr(object, &llty)?;
+                let slot = self.fresh_tmp();
+                self.emit(&format!("{slot} = alloca {llty}"));
+                self.emit(&format!("store {llty} {val}, ptr {slot}"));
+                Ok(slot)
+            }
         }
     }
 

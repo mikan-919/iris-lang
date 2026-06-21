@@ -56,7 +56,7 @@ pub fn check(
     let mut errors = Vec::new();
     typegraph::check_cycles(program, &mut errors);
     flow::check_functions(program, res, type_info, &mut errors);
-    borrows::check_borrows(program, res, &mut errors);
+    borrows::check_borrows(program, res, type_info, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {

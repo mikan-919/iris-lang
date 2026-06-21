@@ -22,8 +22,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, Stmt, Type, TypeDef,
-    TypeDefBody, UnaryOp,
+    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, SelfKind, Stmt, Type,
+    TypeDef, TypeDefBody, UnaryOp,
 };
 use crate::sema::resolve::{DefId, DefKind, Resolution};
 use crate::sema::ty::{FLOAT_TYPES, INT_TYPES, Ty};
@@ -53,6 +53,15 @@ struct FuncSig {
     ret: Ty,
 }
 
+/// メソッドのシグネチャ。`params` は self を除いた引数の型。
+#[derive(Clone)]
+struct MethodSig {
+    /// self の受け方。`None` は self なし（関連関数）。
+    self_kind: Option<SelfKind>,
+    params: Vec<Ty>,
+    ret: Ty,
+}
+
 /// 型定義の情報。
 enum TyDef {
     /// `type X = T`（名前的型付け）。元の型を持つ。
@@ -70,8 +79,14 @@ enum TyDef {
 pub fn check(program: &Program, res: &Resolution) -> Result<TypeInfo, Vec<TypeError>> {
     let mut checker = Checker::new(program, res);
     for item in &program.items {
-        if let Item::Function(f) = item {
-            checker.check_function(f);
+        match item {
+            Item::Function(f) => checker.check_function(f),
+            Item::Impl(im) => {
+                for m in &im.methods {
+                    checker.check_function(m);
+                }
+            }
+            Item::TypeDef(_) => {}
         }
     }
     if checker.errors.is_empty() {
@@ -86,6 +101,8 @@ pub fn check(program: &Program, res: &Resolution) -> Result<TypeInfo, Vec<TypeEr
 struct Checker<'a> {
     res: &'a Resolution,
     funcs: HashMap<String, FuncSig>,
+    /// 型名 → メソッド名 → シグネチャ（固有メソッド）。
+    methods: HashMap<String, HashMap<String, MethodSig>>,
     /// 型定義（別名・struct・enum）。
     types: HashMap<String, TyDef>,
     /// 既知の型名（プリミティブ＋組み込み＋定義済み）。型名検証に使う。
@@ -135,6 +152,36 @@ impl<'a> Checker<'a> {
             }
         }
 
+        // 固有メソッドのシグネチャ（型名 → メソッド名 → sig）。self は params から除く。
+        // 同じ型に同名メソッドがあれば（同一 impl・別 impl を問わず）二重定義として報告する。
+        let mut methods: HashMap<String, HashMap<String, MethodSig>> = HashMap::new();
+        let mut dup_errors = Vec::new();
+        for item in &program.items {
+            if let Item::Impl(im) = item {
+                let table = methods.entry(im.type_name.clone()).or_default();
+                for m in &im.methods {
+                    // self_kind が Some のとき params[0] は合成 self なので飛ばす。
+                    let skip = usize::from(m.self_kind.is_some());
+                    let params = m.params[skip..].iter().map(|p| Ty::from_ast(&p.ty)).collect();
+                    let ret = m.ret.as_ref().map_or_else(Ty::unit, Ty::from_ast);
+                    let sig = MethodSig {
+                        self_kind: m.self_kind,
+                        params,
+                        ret,
+                    };
+                    if table.insert(m.name.clone(), sig).is_some() {
+                        dup_errors.push(TypeError {
+                            span: m.name_span,
+                            message: format!(
+                                "型 `{}` にメソッド `{}` が二重に定義されています",
+                                im.type_name, m.name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         // 定義位置 span → DefId。ビルトインの span (0,0) は引かないため衝突しても無害。
         let def_spans = res
             .defs
@@ -146,12 +193,13 @@ impl<'a> Checker<'a> {
         Checker {
             res,
             funcs,
+            methods,
             types,
             known_types,
             def_types: vec![Ty::Infer; res.defs.len()],
             def_spans,
             expr_types: HashMap::new(),
-            errors: Vec::new(),
+            errors: dup_errors,
             current_ret: Ty::unit(),
             loop_depth: 0,
         }
@@ -195,10 +243,8 @@ impl<'a> Checker<'a> {
         if let Some(ret) = &f.ret {
             self.validate_type(ret);
         }
-        self.current_ret = self
-            .funcs
-            .get(&f.name)
-            .map_or_else(Ty::unit, |s| s.ret.clone());
+        // メソッドは `funcs` に無いので、関数自身の戻り値型から設定する。
+        self.current_ret = f.ret.as_ref().map_or_else(Ty::unit, Ty::from_ast);
         self.check_block(&f.body);
     }
 
@@ -478,6 +524,11 @@ impl<'a> Checker<'a> {
     fn infer_call(&mut self, callee: &Expr, args: &[Expr]) -> Ty {
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
 
+        // メソッド呼び出し `object.method(args)`（callee がメンバアクセス）。
+        if let ExprKind::Member { object, field } = &callee.kind {
+            return self.infer_method_call(object, field, callee.span, args, &arg_tys);
+        }
+
         if let ExprKind::Ident(name) = &callee.kind
             && let Some(&id) = self.res.uses.get(&callee.span)
         {
@@ -522,6 +573,99 @@ impl<'a> Checker<'a> {
             }
         }
         ret
+    }
+
+    /// メソッド呼び出し `object.method(args)` を静的ディスパッチで型付けする。
+    fn infer_method_call(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        span: Span,
+        args: &[Expr],
+        arg_tys: &[Ty],
+    ) -> Ty {
+        let obj_ty = self.check_expr(object);
+        // 受け手の型名（参照は剥がす）。
+        let Ty::Named { name: ty_name, .. } = obj_ty.peel_refs().clone() else {
+            if !matches!(obj_ty, Ty::Infer | Ty::Error) {
+                self.error(
+                    span,
+                    format!("型 `{}` にメソッドはありません", obj_ty.describe()),
+                );
+            }
+            return Ty::Infer;
+        };
+
+        let Some(sig) = self.methods.get(&ty_name).and_then(|m| m.get(method)).cloned() else {
+            self.error(
+                span,
+                format!("型 `{ty_name}` にメソッド `{method}` はありません"),
+            );
+            return Ty::Error;
+        };
+
+        // self を取らない関連関数は、値からのドット呼び出しでは呼べない。
+        if sig.self_kind.is_none() {
+            self.error(
+                span,
+                format!("`{method}` は self を取らないため `値.{method}()` で呼べません"),
+            );
+        }
+        // `&mut self` は可変な受け手を要する。
+        if sig.self_kind == Some(SelfKind::RefMut) {
+            self.check_mut_receiver(object, &obj_ty, method);
+        }
+
+        if sig.params.len() != arg_tys.len() {
+            self.error(
+                span,
+                format!(
+                    "メソッド `{method}` の引数は {} 個ですが {} 個渡されました",
+                    sig.params.len(),
+                    arg_tys.len()
+                ),
+            );
+            return sig.ret;
+        }
+        for ((expected, actual), arg) in sig.params.iter().zip(arg_tys).zip(args) {
+            if !self.assignable(expected, actual) {
+                self.error(
+                    arg.span,
+                    format!(
+                        "引数の型が一致しません: `{}` を期待しましたが `{}` でした",
+                        expected.describe(),
+                        actual.describe()
+                    ),
+                );
+            }
+        }
+        sig.ret
+    }
+
+    /// `&mut self` メソッドの受け手が可変か検査する。不変参照越し・不変束縛は不可。
+    fn check_mut_receiver(&mut self, object: &Expr, obj_ty: &Ty, method: &str) {
+        // 受け手が不変参照 `&T` のとき、そこから `&mut self` は取れない。
+        if let Ty::Ref { mutable: false, .. } = obj_ty {
+            self.error(
+                object.span,
+                format!("不変参照からは可変メソッド `{method}` を呼べません（`&mut` が必要）"),
+            );
+            return;
+        }
+        // 受け手が値で、不変な束縛のときは可変借用できない。
+        if let ExprKind::Ident(name) = &object.kind
+            && let Some(&id) = self.res.uses.get(&object.span)
+        {
+            let def = &self.res.defs[id];
+            if def.kind == DefKind::Local && !def.mutable {
+                self.error(
+                    object.span,
+                    format!(
+                        "不変な変数 `{name}` では可変メソッド `{method}` を呼べません（`let mut` が必要）"
+                    ),
+                );
+            }
+        }
     }
 
     /// メンバアクセス `object.field` の型を求める。

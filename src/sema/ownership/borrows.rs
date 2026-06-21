@@ -17,34 +17,58 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Block, Else, Expr, ExprKind, Item, Program, Stmt, UnaryOp};
+use crate::ast::{Block, Else, Expr, ExprKind, Item, Program, SelfKind, Stmt, UnaryOp};
 use crate::sema::resolve::{DefId, DefKind, Resolution};
+use crate::sema::ty::Ty;
+use crate::sema::typeck::TypeInfo;
 use crate::span::Span;
 
 use super::OwnershipError;
 
-pub fn check_borrows(program: &Program, res: &Resolution, errors: &mut Vec<OwnershipError>) {
+pub fn check_borrows(
+    program: &Program,
+    res: &Resolution,
+    type_info: &TypeInfo,
+    errors: &mut Vec<OwnershipError>,
+) {
     let def_spans: HashMap<Span, DefId> = res
         .defs
         .iter()
         .enumerate()
         .map(|(id, d)| (d.span, id))
         .collect();
+    // 固有メソッドの self の受け方（受け手への借用イベントを起こすため）。
+    let mut method_self: HashMap<(String, String), SelfKind> = HashMap::new();
+    for item in &program.items {
+        if let Item::Impl(im) = item {
+            for m in &im.methods {
+                if let Some(kind) = m.self_kind {
+                    method_self.insert((im.type_name.clone(), m.name.clone()), kind);
+                }
+            }
+        }
+    }
     let mut bc = Borrows {
         res,
+        types: &type_info.expr_types,
+        method_self,
         def_spans,
         active: HashMap::new(),
         scopes: Vec::new(),
         binding_root: HashMap::new(),
         errors,
     };
-    for item in &program.items {
-        if let Item::Function(f) = item {
-            bc.active.clear();
-            bc.scopes.clear();
-            bc.binding_root.clear();
-            bc.visit_block(&f.body);
-        }
+    // 自由関数と固有メソッドの本体を検査する。
+    let bodies = program.items.iter().flat_map(|item| match item {
+        Item::Function(f) => std::slice::from_ref(f),
+        Item::Impl(im) => im.methods.as_slice(),
+        Item::TypeDef(_) => &[],
+    });
+    for f in bodies {
+        bc.active.clear();
+        bc.scopes.clear();
+        bc.binding_root.clear();
+        bc.visit_block(&f.body);
     }
 }
 
@@ -66,6 +90,10 @@ struct Event {
 
 struct Borrows<'a> {
     res: &'a Resolution,
+    /// 式 span → 型（メソッド受け手の型名解決に使う）。
+    types: &'a HashMap<Span, Ty>,
+    /// 固有メソッドの self の受け方。
+    method_self: HashMap<(String, String), SelfKind>,
     def_spans: HashMap<Span, DefId>,
     /// 場所（基底束縛 DefId）→ その場所への生存中の借用。
     active: HashMap<DefId, Vec<ActiveBorrow>>,
@@ -191,7 +219,25 @@ impl Borrows<'_> {
                 self.gather(rhs, out);
             }
             ExprKind::Call { callee, args } => {
-                self.gather(callee, out);
+                // メソッド呼び出し `x.m(...)` の受け手は、`&self`/`&mut self` のとき
+                // その文の間だけ `x` を借用する（`&mut self` は可変借用）。
+                if let ExprKind::Member { object, field } = &callee.kind {
+                    match self.receiver_borrow(object, field) {
+                        Some(mutable) => {
+                            if let Some(root) = base_root(object, self.res) {
+                                out.push(Event {
+                                    root,
+                                    mutable,
+                                    span: callee.span,
+                                });
+                            }
+                            self.gather(object, out);
+                        }
+                        None => self.gather(callee, out),
+                    }
+                } else {
+                    self.gather(callee, out);
+                }
                 for a in args {
                     self.gather(a, out);
                 }
@@ -215,6 +261,19 @@ impl Borrows<'_> {
             // if の条件だけ集め、ブロックは descend で扱う。
             ExprKind::If { cond, .. } => self.gather(cond, out),
             _ => {}
+        }
+    }
+
+    /// メソッド `object.method` が `&self`/`&mut self` を取るとき、受け手の借用の
+    /// 可変性（`&mut self` なら true）を返す。値 self・解決不能は `None`。
+    fn receiver_borrow(&self, object: &Expr, method: &str) -> Option<bool> {
+        let Ty::Named { name, .. } = self.types.get(&object.span)?.peel_refs() else {
+            return None;
+        };
+        match self.method_self.get(&(name.clone(), method.to_string()))? {
+            SelfKind::Ref => Some(false),
+            SelfKind::RefMut => Some(true),
+            SelfKind::Value => None,
         }
     }
 

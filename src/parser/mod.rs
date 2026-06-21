@@ -92,18 +92,59 @@ fn parse_item(input: Tokens) -> PResult<Item> {
     };
 
     let tok = input.first();
-    match tok.kind {
-        TokenKind::Fn => parse_function(input, is_pub, false).map(|(i, f)| (i, Item::Function(f))),
+    match &tok.kind {
+        TokenKind::Fn => {
+            parse_function(input, is_pub, false, None).map(|(i, f)| (i, Item::Function(f)))
+        }
         TokenKind::Extern => {
             let (input, _) = eat(input, &TokenKind::Extern, "`extern`")?;
-            parse_function(input, is_pub, true).map(|(i, f)| (i, Item::Function(f)))
+            parse_function(input, is_pub, true, None).map(|(i, f)| (i, Item::Function(f)))
         }
         TokenKind::Type => parse_type_def(input, is_pub).map(|(i, t)| (i, Item::TypeDef(t))),
+        // `impl Type { ... }`（固有メソッド）。`impl` は予約語ではなく識別子で扱う。
+        TokenKind::Ident(name) if name == "impl" => parse_impl(input).map(|(i, m)| (i, Item::Impl(m))),
         _ => Err(nom::Err::Error(ParseErr::expected(
-            "宣言 (`fn`・`extern fn`・`type`)",
+            "宣言 (`fn`・`extern fn`・`type`・`impl`)",
             input.first(),
         ))),
     }
+}
+
+/// `impl Type { メソッド... }` を解析する。メソッドは `fn ...`（`self` 可）。
+fn parse_impl(input: Tokens) -> PResult<Impl> {
+    let impl_kw = input.first();
+    let start = impl_kw.span;
+    let (input, (type_name, type_name_span)) = ident(input.take_from(1))?;
+    let (mut input, _) = expect(input, &TokenKind::LBrace, "`{`")?;
+
+    let mut methods = Vec::new();
+    loop {
+        input = skip_newlines(input);
+        match input.peek() {
+            TokenKind::RBrace => break,
+            TokenKind::Eof => return Err(nom::Err::Failure(ParseErr::expected("`}`", input.first()))),
+            _ => {}
+        }
+        // メソッドの可視性（省略可）。
+        let (rest, is_pub) = match eat(input, &TokenKind::Pub, "`pub`") {
+            Ok((r, _)) => (r, true),
+            Err(_) => (input, false),
+        };
+        let (rest, method) = parse_function(rest, is_pub, false, Some((&type_name, type_name_span)))?;
+        methods.push(method);
+        input = rest;
+    }
+    let (input, rbrace) = expect(input, &TokenKind::RBrace, "`}`")?;
+    let span = start.merge(rbrace.span);
+    Ok((
+        input,
+        Impl {
+            type_name,
+            type_name_span,
+            methods,
+            span,
+        },
+    ))
 }
 
 // ---- 型定義 -------------------------------------------------------------
@@ -237,7 +278,14 @@ fn require_separator(input: Tokens) -> Result<Tokens, nom::Err<ParseErr>> {
     }
 }
 
-fn parse_function(input: Tokens, is_pub: bool, is_extern: bool) -> PResult<Function> {
+/// 関数（メソッド）を解析する。`impl_type` が `Some` のときは impl ブロック内の
+/// メソッドとして、先頭の `self` / `&self` / `&mut self` を受け付ける。
+fn parse_function<'a>(
+    input: Tokens<'a>,
+    is_pub: bool,
+    is_extern: bool,
+    impl_type: Option<(&str, Span)>,
+) -> PResult<'a, Function> {
     let (input, fn_kw) = eat(input, &TokenKind::Fn, "`fn`")?;
     let start = fn_kw.span;
 
@@ -245,8 +293,20 @@ fn parse_function(input: Tokens, is_pub: bool, is_extern: bool) -> PResult<Funct
 
     let (mut input, _) = expect(input, &TokenKind::LParen, "`(`")?;
 
-    // パラメータ列
+    // パラメータ列。メソッドでは先頭に self を許す（`params` の先頭へ合成する）。
     let mut params = Vec::new();
+    let mut self_kind = None;
+    if let Some((ty_name, ty_span)) = impl_type
+        && let Some((kind, self_param, rest)) = parse_self_param(input, ty_name, ty_span)
+    {
+        self_kind = Some(kind);
+        params.push(self_param);
+        input = rest;
+        // self の後ろにカンマがあれば残りの引数へ。
+        if input.peek() == &TokenKind::Comma {
+            input = input.take_from(1);
+        }
+    }
     if input.peek() != &TokenKind::RParen {
         loop {
             let (rest, param) = parse_param(input)?;
@@ -297,12 +357,67 @@ fn parse_function(input: Tokens, is_pub: bool, is_extern: bool) -> PResult<Funct
             is_extern,
             name,
             name_span,
+            self_kind,
             params,
             ret,
             body,
             span,
         },
     ))
+}
+
+/// メソッド先頭の `self` / `&self` / `&mut self` を解析する。
+/// 型は impl 対象の型から合成する（注釈は書かない）。self でなければ `None`。
+fn parse_self_param<'a>(
+    input: Tokens<'a>,
+    ty_name: &str,
+    ty_span: Span,
+) -> Option<(SelfKind, Param, Tokens<'a>)> {
+    let tok = input.first();
+    let inner = || Type::Named {
+        name: ty_name.to_string(),
+        args: Vec::new(),
+        span: ty_span,
+    };
+    match &tok.kind {
+        // `self`（値）。`self: T` のような注釈付きは通常の引数として扱う。
+        TokenKind::Ident(n) if n == "self" && input.take_from(1).peek() != &TokenKind::Colon => {
+            let param = Param {
+                name: "self".to_string(),
+                ty: inner(),
+                span: tok.span,
+            };
+            Some((SelfKind::Value, param, input.take_from(1)))
+        }
+        // `&self` / `&mut self`。
+        TokenKind::Amp => {
+            let after = input.take_from(1);
+            let (after, mutable) = if after.peek() == &TokenKind::Mut {
+                (after.take_from(1), true)
+            } else {
+                (after, false)
+            };
+            let self_tok = after.first();
+            match &self_tok.kind {
+                TokenKind::Ident(n) if n == "self" => {
+                    let span = tok.span.merge(self_tok.span);
+                    let param = Param {
+                        name: "self".to_string(),
+                        ty: Type::Ref {
+                            mutable,
+                            inner: Box::new(inner()),
+                            span,
+                        },
+                        span,
+                    };
+                    let kind = if mutable { SelfKind::RefMut } else { SelfKind::Ref };
+                    Some((kind, param, after.take_from(1)))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn parse_param(input: Tokens) -> PResult<Param> {
