@@ -15,10 +15,15 @@
 //! - struct（名前付き LLVM 構造体型）。構造体リテラル `Name { ... }`・メンバアクセス
 //!   `a.b`・フィールドへの代入 `a.b = v`。値は first-class な構造体値として扱う
 //!
+//! - 文字列 `string`（C 風の **NUL 終端**表現。リテラルは `[N x i8]` のグローバル定数
+//!   `@.str.N` にし、文字列値は opaque ポインタ `ptr` として扱う。`extern fn puts` 等で
+//!   libc に渡して出力できる。長さ・索引・連結などの操作はまだ無い）
+//!
 //! ローカルは alloca + load/store で扱う（SSA 化は LLVM の mem2reg に任せられる）。
-//! enum・`!`・文字列・ジェネリクスなどは未対応（エラーにする）。参照越しの代入
+//! enum・`!`・ジェネリクスなどは未対応（エラーにする）。参照越しの代入
 //! （write-through `&mut x = v`）はまだ無く、参照への再代入は束縛の付け替えになる。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -99,6 +104,49 @@ impl StructReg {
     }
 }
 
+/// 文字列リテラルのグローバル定数プール。
+///
+/// 文字列は C 風の **NUL 終端**表現を採る（文字列値 = `[N x i8]` 定数へのポインタ）。
+/// `intern` で内容ごとに `@.str.N` を割り当て、定義行を貯めておき、モジュール末尾へ
+/// まとめて出力する（LLVM IR ではグローバル定義の順序は問わない）。
+#[derive(Default)]
+struct StringPool {
+    defs: Vec<String>,
+}
+
+impl StringPool {
+    /// 文字列の内容にグローバル定数を割り当て、その記号（`@.str.N`）を返す。
+    /// opaque ポインタなので記号はそのまま `ptr` 値（先頭バイトのアドレス）に使える。
+    fn intern(&mut self, content: &str) -> String {
+        let id = self.defs.len();
+        let name = format!("@.str.{id}");
+        let (encoded, len) = encode_cstr(content);
+        self.defs.push(format!(
+            "{name} = private unnamed_addr constant [{len} x i8] c\"{encoded}\""
+        ));
+        name
+    }
+}
+
+/// 文字列を LLVM IR の `c"..."` 表記へ符号化し、(符号化済み文字列, バイト長) を返す。
+/// 印字可能 ASCII 以外と `"` `\` は `\XX`（16進）でエスケープし、末尾に NUL を付ける。
+/// マルチバイト UTF-8 はバイト単位でエスケープされる。
+fn encode_cstr(s: &str) -> (String, usize) {
+    let mut out = String::new();
+    let mut len = 0;
+    for &b in s.as_bytes() {
+        len += 1;
+        if b == b'"' || b == b'\\' || !(0x20..=0x7e).contains(&b) {
+            let _ = write!(out, "\\{b:02X}");
+        } else {
+            out.push(b as char);
+        }
+    }
+    out.push_str("\\00");
+    len += 1;
+    (out, len)
+}
+
 /// プログラム全体を LLVM IR のテキストへ変換する。
 pub fn emit_module(
     program: &Program,
@@ -145,6 +193,9 @@ pub fn emit_module(
         module.push('\n');
     }
 
+    // 文字列リテラルのグローバル定数はここに集め、関数生成後に末尾へ出力する。
+    let strings = RefCell::new(StringPool::default());
+
     for item in &program.items {
         match item {
             Item::Function(f) => {
@@ -154,6 +205,7 @@ pub fn emit_module(
                     def_spans: &def_spans,
                     func_table: &func_table,
                     structs: &structs,
+                    strings: &strings,
                     body: String::new(),
                     tmp: 0,
                     label: 0,
@@ -170,6 +222,17 @@ pub fn emit_module(
             Item::TypeDef(_) => {}
         }
     }
+
+    // 文字列リテラルのグローバル定数を末尾にまとめて出力する。
+    let pool = strings.into_inner();
+    if !pool.defs.is_empty() {
+        module.push('\n');
+        for d in &pool.defs {
+            module.push_str(d);
+            module.push('\n');
+        }
+    }
+
     Ok(module)
 }
 
@@ -179,6 +242,8 @@ struct FnCodegen<'a> {
     def_spans: &'a HashMap<Span, DefId>,
     func_table: &'a HashMap<String, &'a Function>,
     structs: &'a StructReg,
+    /// 文字列リテラルのグローバル定数プール（全関数で共有）。
+    strings: &'a RefCell<StringPool>,
     body: String,
     tmp: usize,
     label: usize,
@@ -517,6 +582,8 @@ impl<'a> FnCodegen<'a> {
             ExprKind::Int(v) => Ok(v.to_string()),
             ExprKind::Float(v) => Ok(float_const(*v, hint)),
             ExprKind::Bool(b) => Ok(if *b { "1" } else { "0" }.to_string()),
+            // 文字列リテラルはグローバル定数（NUL 終端）にし、その記号を `ptr` 値として返す。
+            ExprKind::Str(s) => Ok(self.strings.borrow_mut().intern(s)),
             ExprKind::Ident(_) => {
                 let (ptr, ty) = self.lookup(expr)?;
                 let r = self.fresh_tmp();
@@ -926,6 +993,8 @@ fn llvm_ty(ty: &Ty, reg: &StructReg) -> Result<String, String> {
             "f32" => Ok("float".to_string()),
             "f64" => Ok("double".to_string()),
             "bool" => Ok("i1".to_string()),
+            // 文字列は NUL 終端の C 文字列へのポインタ（opaque ポインタ）。
+            "string" => Ok("ptr".to_string()),
             "void" => Ok("void".to_string()),
             // 定義済み struct（別名チェーン越しを含む）は名前付き構造体型。
             other => {

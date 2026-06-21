@@ -10,7 +10,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 ```
 
 現状はフロントエンドの **字句解析 → 構文解析 → AST → 名前解決 → 型検査 → 所有権 DAG 検査** までを縦切りで実装済み。
-さらに **LLVM IR（テキスト `.ll`）生成**に着手済み（数値プリミティブ `i8..u64` / `f32` / `f64`、`bool`、参照、struct）。`clang` で実行ファイル化できる。
+さらに **LLVM IR（テキスト `.ll`）生成**に着手済み（数値プリミティブ `i8..u64` / `f32` / `f64`、`bool`、参照、struct、文字列）。`clang` で実行ファイル化できる。
 エラーはすべて [miette](https://github.com/zkat/miette) でソース位置付きで表示する。
 字句・構文解析には [nom 8](https://github.com/rust-bakery/nom)（+ nom_locate）を用いる。
 
@@ -29,7 +29,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 | `src/sema/ty.rs` | 型検査の内部型表現 `Ty` | ✅（縦切り範囲） |
 | `src/sema/typeck.rs` | 型検査（型付け・整合性検査・可変性検査） | ✅（縦切り範囲） |
 | `src/sema/ownership/` | 所有権 DAG（型グラフ循環検出＋ムーブ/借用グラフ＋借用競合） | ✅（縦切り範囲） |
-| `src/codegen.rs` | LLVM IR（テキスト）生成 | ✅（数値プリミティブ / bool / 参照 / struct） |
+| `src/codegen.rs` | LLVM IR（テキスト）生成 | ✅（数値プリミティブ / bool / 参照 / struct / 文字列） |
 | `std/std.iris` | 最小の標準ライブラリ（iris 自身で記述・自動前置） | ✅ |
 | `src/diagnostics.rs` | miette 診断 | ✅ |
 | `src/lib.rs` / `src/main.rs` | ライブラリ / CLI（AST 表示・`--emit-llvm`・`build`/`run`） | ✅ |
@@ -157,13 +157,19 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
   - フィールド代入 `a.b = v`（ローカル struct への書き込み。参照越し write-through は別途）
   - `type X = Y` の別名は struct/プリミティブ双方とも末尾までたどって解決する
 - **参照 `&T` / `&mut T`**: opaque ポインタ（`ptr`）で表現。`&x` / `&mut x` は場所（ローカル/引数の alloca）のアドレスを値として返す。値が期待される文脈（算術・比較・条件・引数・`return`・注釈付き `let`）では**暗黙にデリファレンス**（`load`）して指す先の値を取り出す。多段参照も剥がす。typeck 側も `&T` を `T` の位置で受け入れる（`assignable` / `join_numeric` / `expect_bool` で参照を剥がす）。参照越しの代入（write-through）は未対応で、参照変数への再代入は束縛の付け替えになる
-- **struct**（上記）。enum・参照越し代入（write-through）・`!`・文字列・ジェネリクスは未対応
+- **文字列 `string`**: C 風の **NUL 終端**表現。文字列リテラルは `[N x i8]` のグローバル定数
+  `@.str.N = private unnamed_addr constant [N x i8] c"...\00"` にし、文字列値は opaque ポインタ
+  `ptr`（先頭バイトのアドレス）として扱う（`llvm_ty("string") = ptr`、`zero_value(ptr) = null`）。
+  リテラルの符号化は印字可能 ASCII 以外と `"` `\` を `\XX`（16進）でエスケープし末尾に NUL を付ける
+  （マルチバイト UTF-8 はバイト単位）。値渡し（引数・戻り値・`let`）に対応。`extern fn puts`（std）で
+  libc に渡して出力できる。**長さ・索引・連結・補間などの操作はまだ無い**（リテラルを渡す/返すのみ）
+- **struct**（上記）。enum・参照越し代入（write-through）・`!`・ジェネリクスは未対応
 - `main(): i32` の戻り値が終了コードになり、`clang` で実行して検証できる
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
 - 未対応（今後）: enum（バリアント構築/分解は frontend も未対応）、参照越しの代入（write-through）、
-  `!`（Result/Option 伝播）、文字列、ジェネリクス
+  `!`（Result/Option 伝播）、文字列の操作（長さ・索引・連結・補間）、ジェネリクス
 
 ### 標準ライブラリ（最小・iris 自身で記述）
 
@@ -171,8 +177,9 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 ライブラリ。コンパイル時に各プログラムの先頭へ自動で前置される（単一の文字列として
 連結し span を一意に保つ）。
 
-- 提供: `putchar`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`
-- 現状のコード生成に合わせ `i32` / `bool` のみで記述
+- 提供: `putchar` / `puts`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`
+- `puts` は NUL 終端文字列を出力し末尾に改行を付ける（文字列リテラルの出力に使える）
+- 現状のコード生成に合わせ `i32` / `bool` / `string` の範囲で記述
 - これにより `main(): i32` から実際に数値・真偽値を標準出力へ表示し、`clang` でビルドして実行できる
 
 ### 未実装
@@ -192,7 +199,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-21。
 
 - 借用検査の高度化（NLL 風の精密なライフタイム領域推論・部分ムーブ・ループ）— `compiler.md` の Open Question 領域
 - 型推論の高度化（リテラルの後方からの確定、ジェネリクスの単一化）
-- コード生成の拡張（`f64` など他の型・struct/enum・参照・文字列・I/O）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
+- コード生成の拡張（enum・参照越し代入・文字列の操作・I/O）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
 - 並行処理 — `concurrency.md` 未設計
 
 ## 仕様未確定のため独自に決めた点（要確認）

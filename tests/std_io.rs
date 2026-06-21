@@ -82,3 +82,22 @@ fn user_can_call_putchar_directly() {
         assert_eq!(stdout, "AB\n");
     }
 }
+
+#[test]
+fn prints_string_literal_with_puts() {
+    // 文字列リテラルを puts（extern, libc）へ渡して標準出力へ書ける。puts は末尾に改行を付ける。
+    let src = "fn main(): i32 {\n    let r = puts(\"hello, iris\")\n    return 0\n}";
+    if let Some((stdout, code)) = run(src, "puts") {
+        assert_eq!(stdout, "hello, iris\n");
+        assert_eq!(code, 0);
+    }
+}
+
+#[test]
+fn returns_and_passes_string_through_a_function() {
+    // 文字列を関数の戻り値・引数として渡せる（値は NUL 終端ポインタ）。
+    let src = "fn greeting(): string {\n    return \"hi there\"\n}\nfn main(): i32 {\n    let r = puts(greeting())\n    return 0\n}";
+    if let Some((stdout, _)) = run(src, "strfn") {
+        assert_eq!(stdout, "hi there\n");
+    }
+}

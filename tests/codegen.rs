@@ -63,9 +63,26 @@ fn emits_short_circuit_for_logical_and() {
 
 #[test]
 fn unsupported_type_is_reported() {
-    // 文字列はまだコード生成に未対応。
-    let err = iris_lang::compile_ir("test", "fn f(): string {\n    return \"hi\"\n}");
+    // ジェネリック型（Vec など）はまだコード生成に未対応。
+    let err = iris_lang::compile_ir("test", "fn f(v: Vec<i32>): i32 {\n    return 0\n}");
     assert!(err.is_err());
+}
+
+#[test]
+fn emits_string_literal_as_global() {
+    // 文字列リテラルは NUL 終端のグローバル定数になり、値は `ptr` として返る。
+    let ir = emit("fn greet(): string {\n    return \"hi\"\n}");
+    assert!(ir.contains("define ptr @greet()"));
+    assert!(ir.contains(r#"@.str.0 = private unnamed_addr constant [3 x i8] c"hi\00""#));
+    assert!(ir.contains("ret ptr @.str.0"));
+}
+
+#[test]
+fn string_literal_escapes_special_bytes() {
+    // 改行・引用符・バックスラッシュは `\XX`（16進）でエスケープされる。
+    let ir = emit("fn s(): string {\n    return \"a\\n\\\"b\"\n}");
+    // a \n " b \00 = 5 バイト
+    assert!(ir.contains(r#"[5 x i8] c"a\0A\22b\00""#));
 }
 
 #[test]
