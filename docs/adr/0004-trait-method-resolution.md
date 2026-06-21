@@ -1,8 +1,10 @@
 # ADR-0004: メソッド名衝突は呼び出し側で `x.m#Qualifier()` により明示する
 
 ## Status
-Accepted（設計確定。固有メソッド `impl Type { ... }` と `x.m()` は実装済み。
-trait 定義・`impl Trait for Type`・`#` 修飾子は実装待ち。）
+Accepted・実装済み（固有メソッド・trait 定義・`impl Trait for Type`・`#` 修飾子による解決と
+曖昧性解消・固有 vs trait 同名の曖昧（D2）まで `tests/traits.rs` で縦断検証。記号衝突時は
+固有 `@Type.method` / trait `@Type.Trait.method` を別記号で emit し `#` で振り分ける。
+`for x#i32 in c` は `for` 未実装のため保留。）
 
 ## Context
 trait を導入すると、ひとつの型が複数の trait を実装したときにメソッド名が衝突しうる。

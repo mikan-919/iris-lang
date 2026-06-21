@@ -62,6 +62,8 @@ impl Ty {
             },
             Type::Array { inner, .. } => Ty::Array(Box::new(Ty::from_ast(inner))),
             Type::Tuple { elems, .. } => Ty::Tuple(elems.iter().map(Ty::from_ast).collect()),
+            // 匿名境界はパーサが匿名ジェネリックへ脱糖するため通常ここには来ない（防御的に Infer）。
+            Type::Bound { .. } => Ty::Infer,
         }
     }
 

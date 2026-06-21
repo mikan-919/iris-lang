@@ -101,20 +101,35 @@ fn parse_item(input: Tokens) -> PResult<Item> {
             parse_function(input, is_pub, true, None).map(|(i, f)| (i, Item::Function(f)))
         }
         TokenKind::Type => parse_type_def(input, is_pub).map(|(i, t)| (i, Item::TypeDef(t))),
-        // `impl Type { ... }`（固有メソッド）。`impl` は予約語ではなく識別子で扱う。
+        // `impl [Trait for] Type { ... }`。`impl` は予約語ではなく識別子で扱う。
         TokenKind::Ident(name) if name == "impl" => parse_impl(input).map(|(i, m)| (i, Item::Impl(m))),
+        // `trait Name { ... }`。`trait` も識別子で扱う。
+        TokenKind::Ident(name) if name == "trait" => {
+            parse_trait(input, is_pub).map(|(i, t)| (i, Item::Trait(t)))
+        }
         _ => Err(nom::Err::Error(ParseErr::expected(
-            "宣言 (`fn`・`extern fn`・`type`・`impl`)",
+            "宣言 (`fn`・`extern fn`・`type`・`trait`・`impl`)",
             input.first(),
         ))),
     }
 }
 
-/// `impl Type { メソッド... }` を解析する。メソッドは `fn ...`（`self` 可）。
+/// `impl [Trait for] Type { メソッド... }` を解析する。メソッドは `fn ...`（`self` 可）。
+/// 先頭の `Name<Args>` を読み、続く `for` の有無で固有 impl / `impl Trait for Type` を判別する。
 fn parse_impl(input: Tokens) -> PResult<Impl> {
-    let impl_kw = input.first();
-    let start = impl_kw.span;
-    let (input, (type_name, type_name_span)) = ident(input.take_from(1))?;
+    let start = input.first().span;
+    // 先頭の名前（トレイトか型かはこの時点で未確定）。
+    let (input, first) = parse_trait_ref(input.take_from(1))?;
+    // `for` が続けば `impl Trait for Type`、なければ固有 `impl Type`。
+    let is_for = matches!(input.peek(), TokenKind::Ident(n) if n == "for");
+    let (input, trait_ref, type_name, type_name_span) = if is_for {
+        let (input, (tname, tspan)) = ident(input.take_from(1))?;
+        (input, Some(first), tname, tspan)
+    } else {
+        let span = first.span;
+        (input, None, first.name, span)
+    };
+
     let (mut input, _) = expect(input, &TokenKind::LBrace, "`{`")?;
 
     let mut methods = Vec::new();
@@ -139,10 +154,60 @@ fn parse_impl(input: Tokens) -> PResult<Impl> {
     Ok((
         input,
         Impl {
+            trait_ref,
             type_name,
             type_name_span,
             methods,
             span,
+        },
+    ))
+}
+
+/// `trait Name<T>: Super { メソッド... }` を解析する。
+/// メソッドはシグネチャのみ、または既定実装（`{ ... }` 付き）。
+fn parse_trait(input: Tokens, is_pub: bool) -> PResult<TraitDef> {
+    let start = input.first().span; // `trait`
+    let (input, (name, name_span)) = ident(input.take_from(1))?;
+    let (input, generics) = parse_generics(input)?;
+    // スーパートレイト `: Super + Show`
+    let (mut input, supertraits) = if input.peek() == &TokenKind::Colon {
+        let (rest, bs) = parse_bounds(input.take_from(1))?;
+        (rest, bs)
+    } else {
+        (input, Vec::new())
+    };
+    input = skip_newlines(input);
+    input = expect(input, &TokenKind::LBrace, "`{`")?.0;
+
+    let mut methods = Vec::new();
+    loop {
+        input = skip_newlines(input);
+        match input.peek() {
+            TokenKind::RBrace => break,
+            TokenKind::Eof => return Err(nom::Err::Failure(ParseErr::expected("`}`", input.first()))),
+            _ => {}
+        }
+        // トレイトメソッド: `fn ...`。本体があれば既定実装、なければシグネチャのみ。
+        // self の型は実装型（`Self`）として合成する。
+        let (rest, (func, had_body)) =
+            parse_function_opt_body(input, false, false, Some(("Self", name_span)), true)?;
+        methods.push(TraitMethod {
+            func,
+            default: had_body,
+        });
+        input = rest;
+    }
+    let (input, rbrace) = expect(input, &TokenKind::RBrace, "`}`")?;
+    Ok((
+        input,
+        TraitDef {
+            is_pub,
+            name,
+            name_span,
+            generics,
+            supertraits,
+            methods,
+            span: start.merge(rbrace.span),
         },
     ))
 }
@@ -186,7 +251,7 @@ fn parse_type_def(input: Tokens, is_pub: bool) -> PResult<TypeDef> {
     ))
 }
 
-/// 省略可能な型パラメータ列 `<T, U>` を解析する。
+/// 省略可能な型パラメータ列 `<T, U: Bound + Bound>` を解析する。
 fn parse_generics(input: Tokens) -> PResult<Vec<Generic>> {
     if input.peek() != &TokenKind::Lt {
         return Ok((input, Vec::new()));
@@ -195,8 +260,15 @@ fn parse_generics(input: Tokens) -> PResult<Vec<Generic>> {
     let mut generics = Vec::new();
     loop {
         let (rest, (name, span)) = ident(input)?;
-        generics.push(Generic { name, span });
         input = rest;
+        // 省略可能なトレイト境界 `: Bound + Bound`
+        let mut bounds = Vec::new();
+        if input.peek() == &TokenKind::Colon {
+            let (rest, bs) = parse_bounds(input.take_from(1))?;
+            bounds = bs;
+            input = rest;
+        }
+        generics.push(Generic { name, bounds, span });
         if input.peek() == &TokenKind::Comma {
             input = input.take_from(1);
         } else {
@@ -205,6 +277,49 @@ fn parse_generics(input: Tokens) -> PResult<Vec<Generic>> {
     }
     let (input, _) = expect(input, &TokenKind::Gt, "`>`")?;
     Ok((input, generics))
+}
+
+/// トレイト参照 `Name<Args>` を解析する（`impl Trait for`・スーパートレイト・境界・修飾子で共通）。
+fn parse_trait_ref(input: Tokens) -> PResult<TraitRef> {
+    let (mut input, (name, start)) = ident(input)?;
+    let mut end = start;
+    let mut args = Vec::new();
+    if input.peek() == &TokenKind::Lt {
+        input = input.take_from(1);
+        loop {
+            let (rest, t) = parse_type(input)?;
+            args.push(t);
+            input = rest;
+            if input.peek() == &TokenKind::Comma {
+                input = input.take_from(1);
+            } else {
+                break;
+            }
+        }
+        let (rest, gt) = expect(input, &TokenKind::Gt, "`>`")?;
+        end = gt.span;
+        input = rest;
+    }
+    Ok((
+        input,
+        TraitRef {
+            name,
+            args,
+            span: start.merge(end),
+        },
+    ))
+}
+
+/// 1 個以上のトレイト境界を `+` 区切りで解析する（`: A + B` の `:` は呼び出し側が消費済み）。
+fn parse_bounds(input: Tokens) -> PResult<Vec<TraitRef>> {
+    let (mut input, first) = parse_trait_ref(input)?;
+    let mut bounds = vec![first];
+    while input.peek() == &TokenKind::Plus {
+        let (rest, b) = parse_trait_ref(input.take_from(1))?;
+        bounds.push(b);
+        input = rest;
+    }
+    Ok((input, bounds))
 }
 
 /// `{ field... }` を解析する。フィールドは改行またはカンマで区切る。
@@ -286,10 +401,27 @@ fn parse_function<'a>(
     is_extern: bool,
     impl_type: Option<(&str, Span)>,
 ) -> PResult<'a, Function> {
+    let (input, (func, _)) = parse_function_opt_body(input, is_pub, is_extern, impl_type, false)?;
+    Ok((input, func))
+}
+
+/// 関数本体。`body_optional` が true で本体（`{`）が無ければシグネチャのみとして空本体を合成し、
+/// `had_body=false` を返す（トレイトのシグネチャ専用メソッドに使う）。
+/// 戻り値の bool は本体（既定実装）が存在したか。
+fn parse_function_opt_body<'a>(
+    input: Tokens<'a>,
+    is_pub: bool,
+    is_extern: bool,
+    impl_type: Option<(&str, Span)>,
+    body_optional: bool,
+) -> PResult<'a, (Function, bool)> {
     let (input, fn_kw) = eat(input, &TokenKind::Fn, "`fn`")?;
     let start = fn_kw.span;
 
     let (input, (name, name_span)) = ident(input)?;
+
+    // 型パラメータ `<T: Bound>`（省略可）。
+    let (input, mut generics) = parse_generics(input)?;
 
     let (mut input, _) = expect(input, &TokenKind::LParen, "`(`")?;
 
@@ -335,8 +467,26 @@ fn parse_function<'a>(
         Err(_) => (input, None),
     };
 
-    // extern は本体を持たない。空ブロックを合成する。
-    let (input, body) = if is_extern {
+    // 引数位置の匿名トレイト境界 `x: A + B`（ADR-0006）を、新規ジェネリックパラメータへ脱糖する。
+    for (i, p) in params.iter_mut().enumerate() {
+        if let Type::Bound { bounds, span } = p.ty.clone() {
+            let g_name = format!("__Bound{i}");
+            generics.push(Generic {
+                name: g_name.clone(),
+                bounds,
+                span,
+            });
+            p.ty = Type::Named {
+                name: g_name,
+                args: Vec::new(),
+                span,
+            };
+        }
+    }
+
+    // 本体。extern は本体なし。body_optional でシグネチャのみも許す。
+    let no_brace = input.peek() != &TokenKind::LBrace;
+    let (input, body, had_body) = if is_extern || (body_optional && no_brace) {
         let end = ret.as_ref().map_or(name_span, Type::span);
         (
             input,
@@ -344,25 +494,31 @@ fn parse_function<'a>(
                 stmts: Vec::new(),
                 span: end,
             },
+            false,
         )
     } else {
-        parse_block(input)?
+        let (rest, b) = parse_block(input)?;
+        (rest, b, true)
     };
     let span = start.merge(body.span);
 
     Ok((
         input,
-        Function {
-            is_pub,
-            is_extern,
-            name,
-            name_span,
-            self_kind,
-            params,
-            ret,
-            body,
-            span,
-        },
+        (
+            Function {
+                is_pub,
+                is_extern,
+                name,
+                name_span,
+                generics,
+                self_kind,
+                params,
+                ret,
+                body,
+                span,
+            },
+            had_body,
+        ),
     ))
 }
 
@@ -444,7 +600,35 @@ fn parse_type(input: Tokens) -> PResult<Type> {
         };
         input = rest;
     }
+    // 匿名トレイト境界 `A + B`（ADR-0006、主に引数位置）。`+` は型構文に他用途が無いため曖昧なし。
+    if input.peek() == &TokenKind::Plus {
+        let first = named_to_trait_ref(ty)?;
+        let start = first.span;
+        let mut bounds = vec![first];
+        let mut end = start;
+        while input.peek() == &TokenKind::Plus {
+            let (rest, tr) = parse_trait_ref(input.take_from(1))?;
+            end = tr.span;
+            bounds.push(tr);
+            input = rest;
+        }
+        ty = Type::Bound {
+            bounds,
+            span: start.merge(end),
+        };
+    }
     Ok((input, ty))
+}
+
+/// `Type::Named` をトレイト参照へ変換する（匿名境界 `A + B` の各項用）。
+fn named_to_trait_ref(ty: Type) -> Result<TraitRef, nom::Err<ParseErr>> {
+    match ty {
+        Type::Named { name, args, span } => Ok(TraitRef { name, args, span }),
+        other => Err(nom::Err::Failure(ParseErr::new(
+            other.span(),
+            "トレイト境界には型名のみ書けます",
+        ))),
+    }
 }
 
 fn parse_type_base(input: Tokens) -> PResult<Type> {
@@ -892,15 +1076,24 @@ fn parse_postfix(input: Tokens, no_struct: bool) -> PResult<Expr> {
                 };
                 input = rest;
             }
-            // メンバアクセス
+            // メンバアクセス（メソッド呼び出しの被メンバを含む）。
+            // `.field#Trait<Args>` の修飾子（ADR-0004）を省略可で受ける。
             TokenKind::Dot => {
                 let after_dot = input.take_from(1);
                 let (rest, (field, field_span)) = ident(after_dot)?;
-                let span = expr.span.merge(field_span);
+                let (rest, qualifier, end_span) = if rest.peek() == &TokenKind::Hash {
+                    let (r, tr) = parse_trait_ref(rest.take_from(1))?;
+                    let sp = tr.span;
+                    (r, Some(tr), sp)
+                } else {
+                    (rest, None, field_span)
+                };
+                let span = expr.span.merge(end_span);
                 expr = Expr {
                     kind: ExprKind::Member {
                         object: Box::new(expr),
                         field,
+                        qualifier,
                     },
                     span,
                 };

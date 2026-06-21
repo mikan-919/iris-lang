@@ -115,6 +115,15 @@ impl Resolver {
                         self.resolve_function(m);
                     }
                 }
+                // トレイトの既定実装（本体付きメソッド）だけ解決する。
+                // メソッド名は値の名前空間に登録しない（`x.m()` で型から解決）。
+                Item::Trait(tr) => {
+                    for m in &tr.methods {
+                        if m.default {
+                            self.resolve_function(&m.func);
+                        }
+                    }
+                }
                 Item::TypeDef(_) => {}
             }
         }

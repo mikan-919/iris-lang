@@ -1,7 +1,9 @@
 # ADR-0007: トレイトはジェネリック・関連型なし・複数 instantiation 可・スーパートレイトあり
 
 ## Status
-Accepted（設計確定。トレイト本体の実装はこれから。）
+Accepted・実装済み（ジェネリックトレイト `trait Iterator<T>`・スーパートレイト `trait Sub: Super`
+を実装。適合検査がスーパートレイト実装を要求し、`<T: Sub>` 境界からスーパートレイトのメソッドを
+解決できる。複数 instantiation・`#Iterator<i32>` 修飾は型検査レベルで対応。関連型なし。）
 
 ## Context
 トレイトの「形」を決める: 要素型（Iterator の要素など）をどう表すか、同じトレイトを

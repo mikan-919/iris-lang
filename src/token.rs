@@ -59,6 +59,7 @@ pub enum TokenKind {
     Bang,     // !  (エラー伝播の後置演算子)
     Question, // ?  (三項演算子)
     Amp,      // &  (参照)
+    Hash,     // #  (メソッド名衝突の修飾子。ADR-0004)
 
     // 構造
     Newline,
@@ -117,6 +118,7 @@ impl TokenKind {
             TokenKind::Bang => "`!`".into(),
             TokenKind::Question => "`?`".into(),
             TokenKind::Amp => "`&`".into(),
+            TokenKind::Hash => "`#`".into(),
             TokenKind::Newline => "改行".into(),
             TokenKind::Eof => "入力の終端".into(),
         }

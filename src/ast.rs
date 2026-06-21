@@ -12,13 +12,50 @@ pub struct Program {
 pub enum Item {
     Function(Function),
     TypeDef(TypeDef),
-    /// 固有メソッドの実装ブロック `impl Type { fn ... }`（トレイト無し）。
+    /// トレイト定義 `trait Name<T>: Super { fn ... }`（ADR-0007）。
+    Trait(TraitDef),
+    /// 実装ブロック `impl [Trait for] Type { fn ... }`。
+    /// `trait_ref` が `None` なら固有メソッド、`Some` なら `impl Trait for Type`。
     Impl(Impl),
 }
 
-/// `impl Type { メソッド... }`。型固有のメソッドをまとめる（トレイト境界は未対応）。
+/// トレイト定義 `trait Name<T>: Super1 + Super2 { メソッド... }`。
+/// メソッドはシグネチャのみ、または既定実装（本体付き）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitDef {
+    pub is_pub: bool,
+    pub name: String,
+    pub name_span: Span,
+    /// トレイトの型パラメータ `trait Iterator<T>`（ADR-0007）。
+    pub generics: Vec<Generic>,
+    /// スーパートレイト `trait Sub: Super`（ADR-0007）。要求集合。
+    pub supertraits: Vec<TraitRef>,
+    pub methods: Vec<TraitMethod>,
+    pub span: Span,
+}
+
+/// トレイトのメソッド。`default` が true のとき `func.body` が既定実装。
+/// false のときシグネチャのみ（`func.body` は空ブロック）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitMethod {
+    pub func: Function,
+    pub default: bool,
+}
+
+/// トレイト参照 `Name<Args>`。`impl Trait for`・スーパートレイト・境界 `<T: Bound>`・
+/// 呼び出し修飾子 `#Trait<Args>` で共通に使う（ADR-0004 / 0007）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitRef {
+    pub name: String,
+    pub args: Vec<Type>,
+    pub span: Span,
+}
+
+/// `impl [Trait for] Type { メソッド... }`。型へメソッドをまとめる。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Impl {
+    /// `impl Trait for Type` の `Trait<Args>`。固有メソッドの `impl Type` では `None`。
+    pub trait_ref: Option<TraitRef>,
     /// 実装対象の型名（`impl Point` の `Point`）。
     pub type_name: String,
     pub type_name_span: Span,
@@ -49,10 +86,12 @@ pub struct TypeDef {
     pub span: Span,
 }
 
-/// 型パラメータ `<T>`（トレイト境界は未対応）。
+/// 型パラメータ `<T>` / `<T: Bound1 + Bound2>`。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Generic {
     pub name: String,
+    /// トレイト境界 `<T: Greet + Serialize>`（ADR-0006）。空なら無制約。
+    pub bounds: Vec<TraitRef>,
     pub span: Span,
 }
 
@@ -89,6 +128,8 @@ pub struct Function {
     pub is_extern: bool,
     pub name: String,
     pub name_span: Span,
+    /// 関数の型パラメータ `fn f<T: Bound>(...)`（ADR-0006・単相化）。
+    pub generics: Vec<Generic>,
     /// メソッドの `self` の受け方。`self` を取るとき `params` の先頭が合成 self。
     /// 自由関数・self なしの関連関数では `None`。
     pub self_kind: Option<SelfKind>,
@@ -173,10 +214,13 @@ pub enum ExprKind {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
-    /// メンバアクセス `object.field`
+    /// メンバアクセス `object.field`、またはメソッド呼び出しの被メンバ。
+    /// `qualifier` はメソッド名衝突の修飾子 `object.field#Trait<Args>`（ADR-0004）。
+    /// フィールドアクセスでは常に `None`。
     Member {
         object: Box<Expr>,
         field: String,
+        qualifier: Option<TraitRef>,
     },
     /// 三項演算子 `cond ? then : else`
     Ternary {
@@ -262,6 +306,9 @@ pub enum Type {
     Array { inner: Box<Type>, span: Span },
     /// タプル型。`(A, B)`
     Tuple { elems: Vec<Type>, span: Span },
+    /// 引数位置の匿名トレイト境界 `x: Greet + Serialize`（ADR-0006）。
+    /// parse_function が匿名ジェネリックパラメータへ脱糖するため、通常は引数型としてのみ現れる。
+    Bound { bounds: Vec<TraitRef>, span: Span },
 }
 
 impl Type {
@@ -270,7 +317,8 @@ impl Type {
             Type::Named { span, .. }
             | Type::Ref { span, .. }
             | Type::Array { span, .. }
-            | Type::Tuple { span, .. } => *span,
+            | Type::Tuple { span, .. }
+            | Type::Bound { span, .. } => *span,
         }
     }
 }

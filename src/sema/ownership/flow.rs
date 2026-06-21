@@ -19,7 +19,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Block, Else, Expr, ExprKind, Function, Item, Program, SelfKind, Stmt, UnaryOp};
+use crate::ast::{
+    BinaryOp, Block, Else, Expr, ExprKind, Function, Item, Program, SelfKind, Stmt, UnaryOp,
+};
 use crate::sema::resolve::{DefId, DefKind, Resolution};
 use crate::sema::ty::{FLOAT_TYPES, INT_TYPES, Ty};
 use crate::sema::typeck::TypeInfo;
@@ -77,6 +79,14 @@ pub fn check_functions(
             Item::Impl(im) => {
                 for m in &im.methods {
                     a.run_function(m);
+                }
+            }
+            // トレイトの既定実装（本体付き）も検査する。
+            Item::Trait(tr) => {
+                for m in &tr.methods {
+                    if m.default {
+                        a.run_function(&m.func);
+                    }
                 }
             }
             Item::TypeDef(_) => {}
@@ -223,18 +233,24 @@ impl Flow<'_> {
                 UnaryOp::Ref | UnaryOp::RefMut => self.use_place(inner, st),
                 UnaryOp::Neg => self.visit_operand(inner, st),
             },
-            ExprKind::Binary { lhs, rhs, .. } => {
-                // 算術・比較・論理のオペランドは auto-deref される文脈。参照は
-                // デリファレンス読み（借用）であってムーブではない。
-                self.visit_operand(lhs, st);
-                self.visit_operand(rhs, st);
+            ExprKind::Binary { op, lhs, rhs } => {
+                // `==` / `!=` は読みのみで被演算子を消費しない（構造的等価。ADR-0009）。
+                if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
+                    self.use_place(lhs, st);
+                    self.use_place(rhs, st);
+                } else {
+                    // 算術・比較・論理のオペランドは auto-deref される文脈。参照は
+                    // デリファレンス読み（借用）であってムーブではない。
+                    self.visit_operand(lhs, st);
+                    self.visit_operand(rhs, st);
+                }
             }
             ExprKind::Call { callee, args } => {
                 match &callee.kind {
                     ExprKind::Ident(_) if self.is_callable(callee) => {}
                     // メソッド呼び出しの受け手: `self`（値）はムーブ、`&self`/`&mut self`
                     // は借用。self の受け方が分からなければ保守的に借用扱い。
-                    ExprKind::Member { object, field } => {
+                    ExprKind::Member { object, field, .. } => {
                         if self.method_takes_value_self(object, field) {
                             self.visit_expr(object, st);
                         } else {

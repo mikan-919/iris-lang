@@ -15,9 +15,10 @@ iris-lang の意味解析は AskUserQuestion で「名前解決から」を選�
   1. 型レベルの所有権グラフ＋循環検出（無限サイズ型）。`&`/Box/Vec/Map/Set は所有辺なし、Named/Option/Result/タプル/配列/別名はインライン所有辺。
   2. 値レベルのムーブ＋借用グラフ。use-after-move、Copy判定（数値/bool/char/`&T`/全Copyタプル・別名は元型）、`&`/`&mut`・メソッド受け手は借用、再代入で再初期化、if/三項は保守的合流。ライフタイムは provenance（参照の出所）を借用グラフで追跡し到達可能性で判定 → ダングリング返却と「指す先ムーブ後の参照使用」を検出。参照引数経由は呼び出し側所有で安全。
   3. 借用競合（エイリアス規則）。同一の場所で `&mut` 排他・`&` 複数可。生存期間はスコープベース（保守的・健全だが多めに報告）。二重`&mut`・`&mut`と`&`の同時・同一呼び出し内競合を検出。再代入で借用解放。
-- lib.rs: lex→parse→resolve→typeck→ownership。テスト総数 71。
+- 完了: **トレイトシステム**（ADR-0004〜0009、`tests/traits.rs`）。typeck に `traits`/`trait_impls`/`generics`/`self_ty` を追加。`check_conformance`（メソッド提供・シグネチャ一致・スーパートレイト要求・重複実装拒否）、`collect_providers`+`resolve_trait_method`（具象型＝固有＋実装トレイト直接メソッド、ジェネリック型パラメータ＝境界をスーパートレイト辿り）でメソッド解決＋`#`修飾子＋曖昧性。ジェネリック関数 `fn f<T: Bound>` は `unify` で型引数推論＋境界充足検査。`Self`・トレイト型引数は `subst` で置換。typeck が単相化情報（`mono`: callee span→型引数）と解決済み提供元（`method_provider`: span→ラベル）を `TypeInfo` に記録しコード生成へ渡す。所有権は `==`/`!=` を読み（use_place）扱いにしてムーブしない。
+- lib.rs: lex→parse→resolve→typeck→ownership。テスト総数 162（traits 17 本含む）。
 - 未対応（所有権の次段）: NLL風の精密なライフタイム領域推論（最後の使用で借用終了）、参照を返却以外の長寿命の場所へ格納する一般ケース、部分ムーブ、ループ内ムーブ/借用。
-- 次の候補: コード生成（LLVM/WASM/JIT）着手、または enum値＋match・関数ジェネリクス・ループなど構文拡張。
+- 次の候補: enum値＋match（`!`・`for`・イテレータの前提）、ジェネリック**型**の単相化、`Eq`/順序/算術トレイト、`Type.func()`（self なし関連関数）、モジュール `use`。
 
 **Why:** 仕様の「所有権DAG」を名前通りグラフで実装。ライフタイムもグラフ到達可能性で処理（ユーザー要望）。借用競合も追加済み。
 **How to apply:** NLL風領域推論が次の難所。意味解析は一通り揃ったのでコード生成も選択肢。関連する構文未確定点は [[parser-slice-assumptions]]。

@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Block, Else, Expr, ExprKind, Item, Program, SelfKind, Stmt, UnaryOp};
+use crate::ast::{Block, Else, Expr, ExprKind, Function, Item, Program, SelfKind, Stmt, UnaryOp};
 use crate::sema::resolve::{DefId, DefKind, Resolution};
 use crate::sema::ty::Ty;
 use crate::sema::typeck::TypeInfo;
@@ -58,12 +58,18 @@ pub fn check_borrows(
         binding_root: HashMap::new(),
         errors,
     };
-    // 自由関数と固有メソッドの本体を検査する。
-    let bodies = program.items.iter().flat_map(|item| match item {
-        Item::Function(f) => std::slice::from_ref(f),
-        Item::Impl(im) => im.methods.as_slice(),
-        Item::TypeDef(_) => &[],
-    });
+    // 自由関数・固有/トレイトメソッド・トレイト既定実装の本体を検査する。
+    let mut bodies: Vec<&Function> = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Function(f) => bodies.push(f),
+            Item::Impl(im) => bodies.extend(im.methods.iter()),
+            Item::Trait(tr) => {
+                bodies.extend(tr.methods.iter().filter(|m| m.default).map(|m| &m.func));
+            }
+            Item::TypeDef(_) => {}
+        }
+    }
     for f in bodies {
         bc.active.clear();
         bc.scopes.clear();
@@ -221,7 +227,7 @@ impl Borrows<'_> {
             ExprKind::Call { callee, args } => {
                 // メソッド呼び出し `x.m(...)` の受け手は、`&self`/`&mut self` のとき
                 // その文の間だけ `x` を借用する（`&mut self` は可変借用）。
-                if let ExprKind::Member { object, field } = &callee.kind {
+                if let ExprKind::Member { object, field, .. } = &callee.kind {
                     match self.receiver_borrow(object, field) {
                         Some(mutable) => {
                             if let Some(root) = base_root(object, self.res) {

@@ -161,5 +161,7 @@ fn collect_owned(ty: &Type, defs: &HashMap<&str, Span>, out: &mut Vec<String>) {
                 collect_owned(e, defs, out);
             }
         }
+        // 匿名境界（ジェネリック）は所有辺を作らない。
+        Type::Bound { .. } => {}
     }
 }

@@ -25,7 +25,7 @@
 //! 右辺が参照型のときは束縛の付け替え（rebind）になる。
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::ast::{
@@ -169,15 +169,64 @@ pub fn emit_module(
         }
     }
 
-    // (型名, メソッド名) → メソッド定義（ドット呼び出しのシグネチャ解決用）。
-    let mut method_table: HashMap<(String, String), &Function> = HashMap::new();
+    // トレイト名 → トレイト定義（既定実装の合成に使う）。
+    let mut trait_table: HashMap<String, &crate::ast::TraitDef> = HashMap::new();
+    for item in &program.items {
+        if let Item::Trait(t) = item {
+            trait_table.insert(t.name.clone(), t);
+        }
+    }
+
+    // (型名, メソッド名, 提供元ラベル) → メソッド定義。提供元ラベルは固有メソッドでは
+    // 型名、トレイト実装/既定実装ではトレイト名。同名衝突時に記号を分けるための鍵。
+    // 固有/トレイト impl のメソッドに加え、上書きされていないトレイト既定実装も登録する。
+    let mut method_defs: HashMap<(String, String, String), &Function> = HashMap::new();
+    // (型名, メソッド名) → 提供元ラベル集合。要素 2 個以上なら同名衝突（記号を分ける）。
+    let mut method_labels: HashMap<(String, String), HashSet<String>> = HashMap::new();
     for item in &program.items {
         if let Item::Impl(im) = item {
+            // 提供元ラベル: 固有 impl は型名、`impl Trait for` はトレイト名。
+            let label = im
+                .trait_ref
+                .as_ref()
+                .map_or_else(|| im.type_name.clone(), |t| t.name.clone());
             for m in &im.methods {
-                method_table.insert((im.type_name.clone(), m.name.clone()), m);
+                method_defs.insert(
+                    (im.type_name.clone(), m.name.clone(), label.clone()),
+                    m,
+                );
+                method_labels
+                    .entry((im.type_name.clone(), m.name.clone()))
+                    .or_default()
+                    .insert(label.clone());
+            }
+            // `impl Trait for Type` の未提供の既定実装をこの型のメソッドとして登録。
+            if let Some(tr) = &im.trait_ref
+                && let Some(tdef) = trait_table.get(&tr.name)
+            {
+                let provided: HashSet<&str> =
+                    im.methods.iter().map(|m| m.name.as_str()).collect();
+                for tm in &tdef.methods {
+                    if tm.default && !provided.contains(tm.func.name.as_str()) {
+                        method_defs.insert(
+                            (im.type_name.clone(), tm.func.name.clone(), label.clone()),
+                            &tm.func,
+                        );
+                        method_labels
+                            .entry((im.type_name.clone(), tm.func.name.clone()))
+                            .or_default()
+                            .insert(label.clone());
+                    }
+                }
             }
         }
     }
+    // 同名衝突した (型名, メソッド名) の集合。
+    let method_collisions: HashSet<(String, String)> = method_labels
+        .iter()
+        .filter(|(_, labels)| labels.len() > 1)
+        .map(|(k, _)| k.clone())
+        .collect();
 
     let structs = StructReg::build(program);
 
@@ -208,13 +257,20 @@ pub fn emit_module(
     let strings = RefCell::new(StringPool::default());
 
     // 関数 / メソッドをまとめて出力する。メソッドの記号は `Type.method` に変える。
-    let mut emit_one = |f: &Function, symbol: &str| -> Result<(), CodegenError> {
+    // `subst` は単相化中の型パラメータ束縛（非ジェネリックでは空）。
+    let empty_subst: HashMap<String, Ty> = HashMap::new();
+    let mut emit_one = |f: &Function,
+                        symbol: &str,
+                        subst: &HashMap<String, Ty>|
+     -> Result<(), CodegenError> {
         let mut cg = FnCodegen {
             res,
             types: &type_info.expr_types,
             def_spans: &def_spans,
             func_table: &func_table,
-            method_table: &method_table,
+            method_defs: &method_defs,
+            method_collisions: &method_collisions,
+            method_provider: &type_info.method_provider,
             structs: &structs,
             strings: &strings,
             body: String::new(),
@@ -224,6 +280,8 @@ pub fn emit_module(
             terminated: false,
             loops: Vec::new(),
             ret_ty: Ty::unit(),
+            type_subst: subst,
+            mono: &type_info.mono,
         };
         let func_ir = cg.emit_function(f, symbol)?;
         module.push_str(&func_ir);
@@ -231,18 +289,96 @@ pub fn emit_module(
         Ok(())
     };
 
-    for item in &program.items {
-        match item {
-            Item::Function(f) => emit_one(f, &f.name)?,
-            Item::Impl(im) => {
-                for m in &im.methods {
-                    let symbol = format!("{}.{}", im.type_name, m.name);
-                    emit_one(m, &symbol)?;
+    // ジェネリック関数のテンプレートはここでは出さず、単相化して必要な実体だけを出す。
+    let generic_funcs: HashMap<&str, &Function> = program
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Function(f) if !f.generics.is_empty() => Some((f.name.as_str(), f)),
+            _ => None,
+        })
+        .collect();
+
+    // 非ジェネリック関数・全 impl メソッド・未上書きの既定実装を出力する。
+    // あわせて、各本体に現れるジェネリック呼び出しを単相化の種として集める。
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut worklist: Vec<(String, Vec<Ty>)> = Vec::new();
+    let seed = |body: &Block, subst: &HashMap<String, Ty>, seen: &mut HashSet<String>, wl: &mut Vec<(String, Vec<Ty>)>| {
+        let mut spans = Vec::new();
+        collect_call_callees(body, &mut spans);
+        for s in spans {
+            if let Some((gname, gargs)) = type_info.mono.get(&s) {
+                let concrete: Vec<Ty> = gargs.iter().map(|a| subst_ty(a, subst)).collect();
+                let sym = mono_symbol(gname, &concrete);
+                if seen.insert(sym) {
+                    wl.push((gname.clone(), concrete));
                 }
             }
+        }
+    };
+
+    for item in &program.items {
+        match item {
+            Item::Function(f) if f.generics.is_empty() => {
+                seed(&f.body, &empty_subst, &mut seen, &mut worklist);
+                emit_one(f, &f.name, &empty_subst)?;
+            }
+            // ジェネリックテンプレートは単相化時にのみ出す。
+            Item::Function(_) => {}
+            Item::Impl(im) => {
+                let label = im
+                    .trait_ref
+                    .as_ref()
+                    .map_or_else(|| im.type_name.clone(), |t| t.name.clone());
+                for m in &im.methods {
+                    let colliding =
+                        method_collisions.contains(&(im.type_name.clone(), m.name.clone()));
+                    let symbol = method_symbol(&im.type_name, &m.name, &label, colliding);
+                    seed(&m.body, &empty_subst, &mut seen, &mut worklist);
+                    emit_one(m, &symbol, &empty_subst)?;
+                }
+                // 未上書きの既定実装を合成する（Self → 実装型）。
+                if let Some(tr) = &im.trait_ref
+                    && let Some(tdef) = trait_table.get(&tr.name)
+                {
+                    let provided: HashSet<&str> =
+                        im.methods.iter().map(|m| m.name.as_str()).collect();
+                    let mut dsubst: HashMap<String, Ty> = HashMap::new();
+                    dsubst.insert("Self".to_string(), Ty::named(&im.type_name));
+                    for (g, a) in tdef.generics.iter().zip(&tr.args) {
+                        dsubst.insert(g.name.clone(), Ty::from_ast(a));
+                    }
+                    for tm in &tdef.methods {
+                        if tm.default && !provided.contains(tm.func.name.as_str()) {
+                            let colliding = method_collisions
+                                .contains(&(im.type_name.clone(), tm.func.name.clone()));
+                            let symbol =
+                                method_symbol(&im.type_name, &tm.func.name, &label, colliding);
+                            seed(&tm.func.body, &dsubst, &mut seen, &mut worklist);
+                            emit_one(&tm.func, &symbol, &dsubst)?;
+                        }
+                    }
+                }
+            }
+            // トレイト定義そのものは IR に出さない（既定実装は impl ごとに合成済み）。
+            Item::Trait(_) => {}
             // 型定義はコード生成では型情報としてのみ使い、IR には出さない。
             Item::TypeDef(_) => {}
         }
+    }
+
+    // 単相化ワークリストを処理する（入れ子のジェネリック呼び出しも閉包に含める）。
+    while let Some((name, args)) = worklist.pop() {
+        let Some(f) = generic_funcs.get(name.as_str()) else {
+            continue;
+        };
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        for (g, a) in f.generics.iter().zip(&args) {
+            subst.insert(g.name.clone(), a.clone());
+        }
+        seed(&f.body, &subst, &mut seen, &mut worklist);
+        let symbol = mono_symbol(&name, &args);
+        emit_one(f, &symbol, &subst)?;
     }
 
     // 文字列リテラルのグローバル定数を末尾にまとめて出力する。
@@ -263,8 +399,12 @@ struct FnCodegen<'a> {
     types: &'a HashMap<Span, Ty>,
     def_spans: &'a HashMap<Span, DefId>,
     func_table: &'a HashMap<String, &'a Function>,
-    /// (型名, メソッド名) → メソッド定義。
-    method_table: &'a HashMap<(String, String), &'a Function>,
+    /// (型名, メソッド名, 提供元ラベル) → メソッド定義。
+    method_defs: &'a HashMap<(String, String, String), &'a Function>,
+    /// 同名衝突した (型名, メソッド名)。記号を提供元で分ける必要があるもの。
+    method_collisions: &'a HashSet<(String, String)>,
+    /// メソッド呼び出しの解決済み提供元（typeck が記録。callee span → ラベル）。
+    method_provider: &'a HashMap<Span, String>,
     structs: &'a StructReg,
     /// 文字列リテラルのグローバル定数プール（全関数で共有）。
     strings: &'a RefCell<StringPool>,
@@ -278,27 +418,181 @@ struct FnCodegen<'a> {
     loops: Vec<(String, String)>,
     /// 現在の関数の戻り値の内部型（`return` での暗黙 deref 判定に使う）。
     ret_ty: Ty,
+    /// 単相化中の型パラメータ束縛（`T` → 具体型）。具体化された関数本体で使う。
+    /// 空なら非ジェネリック関数。
+    type_subst: &'a HashMap<String, Ty>,
+    /// 単相化情報（callee span → (関数名, 型引数)）。ジェネリック呼び出しの記号解決に使う。
+    mono: &'a HashMap<Span, (String, Vec<Ty>)>,
+}
+
+/// 型パラメータ名を具体型へ置換する（単相化）。
+fn subst_ty(ty: &Ty, map: &HashMap<String, Ty>) -> Ty {
+    if map.is_empty() {
+        return ty.clone();
+    }
+    match ty {
+        Ty::Named { name, args } => {
+            if args.is_empty()
+                && let Some(rep) = map.get(name)
+            {
+                return rep.clone();
+            }
+            Ty::Named {
+                name: name.clone(),
+                args: args.iter().map(|a| subst_ty(a, map)).collect(),
+            }
+        }
+        Ty::Ref { mutable, inner } => Ty::Ref {
+            mutable: *mutable,
+            inner: Box::new(subst_ty(inner, map)),
+        },
+        Ty::Array(i) => Ty::Array(Box::new(subst_ty(i, map))),
+        Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| subst_ty(e, map)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// ブロック中のすべての関数呼び出しの callee span を集める（単相化の探索用）。
+fn collect_call_callees(block: &Block, out: &mut Vec<Span>) {
+    for s in &block.stmts {
+        walk_stmt_calls(s, out);
+    }
+}
+
+fn walk_stmt_calls(stmt: &Stmt, out: &mut Vec<Span>) {
+    match stmt {
+        Stmt::Let { value, .. } => walk_expr_calls(value, out),
+        Stmt::Return { value, .. } => {
+            if let Some(v) = value {
+                walk_expr_calls(v, out);
+            }
+        }
+        Stmt::Assign { target, value, .. } => {
+            walk_expr_calls(target, out);
+            walk_expr_calls(value, out);
+        }
+        Stmt::While { cond, body, .. } => {
+            walk_expr_calls(cond, out);
+            collect_call_callees(body, out);
+        }
+        Stmt::Loop { body, .. } => collect_call_callees(body, out),
+        Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        Stmt::Expr(e) => walk_expr_calls(e, out),
+    }
+}
+
+fn walk_expr_calls(expr: &Expr, out: &mut Vec<Span>) {
+    match &expr.kind {
+        ExprKind::Unary { expr: e, .. } => walk_expr_calls(e, out),
+        ExprKind::Binary { lhs, rhs, .. } => {
+            walk_expr_calls(lhs, out);
+            walk_expr_calls(rhs, out);
+        }
+        ExprKind::Call { callee, args } => {
+            out.push(callee.span);
+            walk_expr_calls(callee, out);
+            for a in args {
+                walk_expr_calls(a, out);
+            }
+        }
+        ExprKind::Member { object, .. } => walk_expr_calls(object, out),
+        ExprKind::Ternary {
+            cond,
+            then,
+            otherwise,
+        } => {
+            walk_expr_calls(cond, out);
+            walk_expr_calls(then, out);
+            walk_expr_calls(otherwise, out);
+        }
+        ExprKind::Try(e) => walk_expr_calls(e, out),
+        ExprKind::If {
+            cond,
+            then,
+            otherwise,
+        } => {
+            walk_expr_calls(cond, out);
+            collect_call_callees(then, out);
+            if let Some(els) = otherwise {
+                match els.as_ref() {
+                    Else::If(e) => walk_expr_calls(e, out),
+                    Else::Block(b) => collect_call_callees(b, out),
+                }
+            }
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for f in fields {
+                walk_expr_calls(&f.value, out);
+            }
+        }
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Ident(_) => {}
+    }
+}
+
+/// メソッドの LLVM 記号を作る。同名衝突が無ければ `Type.method`、衝突時は固有メソッドは
+/// `Type.method`、トレイトメソッドは `Type.Trait.method` で一意化する（ADR-0004 の `#`）。
+/// `label` は提供元（固有なら型名 = `type_name`、トレイトならトレイト名）。
+fn method_symbol(type_name: &str, method: &str, label: &str, colliding: bool) -> String {
+    if !colliding || label == type_name {
+        format!("{type_name}.{method}")
+    } else {
+        format!("{type_name}.{label}.{method}")
+    }
+}
+
+/// 単相化の記号を作る（`greet_all` × `[Point]` → `greet_all.Point`）。
+fn mono_symbol(name: &str, args: &[Ty]) -> String {
+    let mut s = name.to_string();
+    for a in args {
+        s.push('.');
+        s.push_str(&mangle_ty(a));
+    }
+    s
+}
+
+/// 型を記号に使える名前へ変換する。
+fn mangle_ty(ty: &Ty) -> String {
+    match ty {
+        Ty::Named { name, args } if args.is_empty() => name.clone(),
+        Ty::Named { name, args } => {
+            let inner: Vec<_> = args.iter().map(mangle_ty).collect();
+            format!("{name}_{}", inner.join("_"))
+        }
+        Ty::Ref { inner, .. } => format!("ref_{}", mangle_ty(inner)),
+        Ty::Array(i) => format!("arr_{}", mangle_ty(i)),
+        Ty::Tuple(es) => {
+            let inner: Vec<_> = es.iter().map(mangle_ty).collect();
+            format!("tup_{}", inner.join("_"))
+        }
+        other => other.describe(),
+    }
 }
 
 impl<'a> FnCodegen<'a> {
+    /// AST の型注釈を、単相化置換を適用して内部型へ変換する。
+    fn lower(&self, t: &Type) -> Ty {
+        subst_ty(&Ty::from_ast(t), self.type_subst)
+    }
     /// 関数（メソッド）を生成する。`symbol` は LLVM の関数記号（メソッドは
     /// `Type.method`）。self は `f.params` の先頭に合成済みなので通常の引数として扱う。
     fn emit_function(&mut self, f: &Function, symbol: &str) -> Result<String, CodegenError> {
         self.ret_ty = match &f.ret {
-            Some(t) => Ty::from_ast(t),
+            Some(t) => self.lower(t),
             None => Ty::unit(),
         };
-        let ret_ty = match &f.ret {
-            Some(t) => llvm_ty(&Ty::from_ast(t), self.structs).map_err(|m| CodegenError::new(t.span(), m))?,
-            None => "void".to_string(),
-        };
+        let ret_ty = llvm_ty(&self.ret_ty, self.structs)
+            .map_err(|m| CodegenError::new(f.name_span, m))?;
 
         // extern は C 関数の宣言だけを出す。
         if f.is_extern {
             let mut tys = Vec::new();
             for p in &f.params {
                 tys.push(
-                    llvm_ty(&Ty::from_ast(&p.ty), self.structs).map_err(|m| CodegenError::new(p.span, m))?,
+                    llvm_ty(&self.lower(&p.ty), self.structs).map_err(|m| CodegenError::new(p.span, m))?,
                 );
             }
             return Ok(format!("declare {ret_ty} @{}({})\n", symbol, tys.join(", ")));
@@ -308,7 +602,7 @@ impl<'a> FnCodegen<'a> {
         let mut params_sig = Vec::new();
         let mut param_setup = Vec::new();
         for (i, p) in f.params.iter().enumerate() {
-            let ty = llvm_ty(&Ty::from_ast(&p.ty), self.structs)
+            let ty = llvm_ty(&self.lower(&p.ty), self.structs)
                 .map_err(|m| CodegenError::new(p.span, m))?;
             params_sig.push(format!("{ty} %arg{i}"));
             // 引数を alloca に退避して、ローカルと同様に扱う。
@@ -363,7 +657,7 @@ impl<'a> FnCodegen<'a> {
             } => {
                 // 注釈があればその型、無ければ値の型（参照はそのまま束縛する）。
                 let want = match ty {
-                    Some(t) => Ty::from_ast(t),
+                    Some(t) => self.lower(t),
                     None => self.raw_ty(value).defaulted(),
                 };
                 let (v, llty) = self.gen_value(value, &want)?;
@@ -488,7 +782,7 @@ impl<'a> FnCodegen<'a> {
                 }
             }
             // フィールドの場所（`a.b`）はその struct のフィールドアドレス。
-            ExprKind::Member { object, field } => {
+            ExprKind::Member { object, field, .. } => {
                 let (ptr, fllty, _) = self.field_ptr(object, field, target.span)?;
                 return Ok((ptr, fllty));
             }
@@ -575,6 +869,80 @@ impl<'a> FnCodegen<'a> {
         }
     }
 
+    /// struct の `==` / `!=` を構造的に生成する（ADR-0009）。各フィールドを再帰的に
+    /// 比較し AND で合成する。`negate` のとき結果を反転（`!=`）。
+    fn gen_struct_eq(
+        &mut self,
+        lhs: &Expr,
+        rhs: &Expr,
+        sname: &str,
+        negate: bool,
+        span: Span,
+    ) -> Result<String, CodegenError> {
+        let (lbase, _) = self.struct_base_ptr(lhs, span)?;
+        let (rbase, _) = self.struct_base_ptr(rhs, span)?;
+        let ty = Ty::named(sname);
+        let eq = self.gen_eq_at(&lbase, &rbase, &ty, span)?;
+        if negate {
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = xor i1 {eq}, true"));
+            Ok(r)
+        } else {
+            Ok(eq)
+        }
+    }
+
+    /// 2 つのポインタが指す型 `ty` の値の等価性（i1）を生成する。struct は再帰的に、
+    /// プリミティブ・参照は load して比較する。
+    fn gen_eq_at(
+        &mut self,
+        lptr: &str,
+        rptr: &str,
+        ty: &Ty,
+        span: Span,
+    ) -> Result<String, CodegenError> {
+        if let Some(sname) = struct_name_of(ty)
+            && let Some((canon, fields)) =
+                self.structs.struct_def(&sname).map(|(c, f)| (c, f.clone()))
+        {
+            let mut acc: Option<String> = None;
+            for (idx, (_, fty)) in fields.iter().enumerate() {
+                let lp = self.fresh_tmp();
+                self.emit(&format!(
+                    "{lp} = getelementptr inbounds %{canon}, ptr {lptr}, i32 0, i32 {idx}"
+                ));
+                let rp = self.fresh_tmp();
+                self.emit(&format!(
+                    "{rp} = getelementptr inbounds %{canon}, ptr {rptr}, i32 0, i32 {idx}"
+                ));
+                let cmp = self.gen_eq_at(&lp, &rp, fty, span)?;
+                acc = Some(match acc {
+                    None => cmp,
+                    Some(a) => {
+                        let r = self.fresh_tmp();
+                        self.emit(&format!("{r} = and i1 {a}, {cmp}"));
+                        r
+                    }
+                });
+            }
+            // フィールドの無い struct は常に等しい。
+            return Ok(acc.unwrap_or_else(|| "true".to_string()));
+        }
+        // プリミティブ・参照: load して比較する。
+        let llty = llvm_ty(ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        let lv = self.fresh_tmp();
+        self.emit(&format!("{lv} = load {llty}, ptr {lptr}"));
+        let rv = self.fresh_tmp();
+        self.emit(&format!("{rv} = load {llty}, ptr {rptr}"));
+        let r = self.fresh_tmp();
+        if ty.is_float() {
+            self.emit(&format!("{r} = fcmp oeq {llty} {lv}, {rv}"));
+        } else {
+            self.emit(&format!("{r} = icmp eq {llty} {lv}, {rv}"));
+        }
+        Ok(r)
+    }
+
     /// 構造体リテラル `Name { field: value, ... }` を生成し、構造体値を返す。
     fn gen_struct_lit(
         &mut self,
@@ -632,7 +1000,7 @@ impl<'a> FnCodegen<'a> {
             ExprKind::Binary { op, lhs, rhs } => self.gen_binary(*op, lhs, rhs, expr.span),
             ExprKind::Call { callee, args } => self.gen_call(callee, args, expr.span),
             // メンバアクセス `a.b`: フィールドのアドレスを求めて load する。
-            ExprKind::Member { object, field } => {
+            ExprKind::Member { object, field, .. } => {
                 let (ptr, fllty, _) = self.field_ptr(object, field, expr.span)?;
                 let r = self.fresh_tmp();
                 self.emit(&format!("{r} = load {fllty}, ptr {ptr}"));
@@ -708,6 +1076,16 @@ impl<'a> FnCodegen<'a> {
             _ => {}
         }
 
+        // struct の `==` / `!=` は構造的フィールド比較（ADR-0009）。
+        if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
+            let lty = self.raw_ty(lhs).peel_refs().clone();
+            if let Some(sname) = struct_name_of(&lty)
+                && self.structs.struct_def(&sname).is_some()
+            {
+                return self.gen_struct_eq(lhs, rhs, &sname, op == BinaryOp::NotEq, span);
+            }
+        }
+
         let (chosen, opnd_ty, kind) = self.operand_ty(lhs, rhs)?;
         // 参照の被演算子は gen_value が暗黙にデリファレンスする。
         let (l, _) = self.gen_value(lhs, &chosen)?;
@@ -759,8 +1137,20 @@ impl<'a> FnCodegen<'a> {
         span: Span,
     ) -> Result<String, CodegenError> {
         // メソッド呼び出し `object.method(args)`。
-        if let ExprKind::Member { object, field } = &callee.kind {
-            return self.gen_method_call(object, field, args, span);
+        if let ExprKind::Member {
+            object,
+            field,
+            qualifier,
+        } = &callee.kind
+        {
+            return self.gen_method_call(
+                object,
+                field,
+                qualifier.as_ref(),
+                callee.span,
+                args,
+                span,
+            );
         }
         let ExprKind::Ident(name) = &callee.kind else {
             return Err(CodegenError::new(span, "この呼び出しはコード生成に未対応です"));
@@ -769,8 +1159,26 @@ impl<'a> FnCodegen<'a> {
         let func = self
             .find_function(name)
             .ok_or_else(|| CodegenError::new(span, format!("`{name}` の定義が見つかりません")))?;
+
+        // ジェネリック関数なら、単相化記号を引き、callee 側の型パラメータ束縛で型を解決する。
+        let (symbol, callee_subst) = if func.generics.is_empty() {
+            (name.clone(), HashMap::new())
+        } else {
+            let (gname, abstract_args) = self.mono.get(&callee.span).ok_or_else(|| {
+                CodegenError::new(span, format!("`{name}` の単相化情報がありません"))
+            })?;
+            // 入れ子の場合に備え、外側の型パラメータ束縛を適用して具体化する。
+            let concrete: Vec<Ty> = abstract_args.iter().map(|a| subst_ty(a, self.type_subst)).collect();
+            let mut cmap = HashMap::new();
+            for (g, a) in func.generics.iter().zip(&concrete) {
+                cmap.insert(g.name.clone(), a.clone());
+            }
+            (mono_symbol(gname, &concrete), cmap)
+        };
+
+        let lower_callee = |t: &Type| subst_ty(&Ty::from_ast(t), &callee_subst);
         let ret_ty = match &func.ret {
-            Some(t) => llvm_ty(&Ty::from_ast(t), self.structs).map_err(|m| CodegenError::new(t.span(), m))?,
+            Some(t) => llvm_ty(&lower_callee(t), self.structs).map_err(|m| CodegenError::new(t.span(), m))?,
             None => "void".to_string(),
         };
         let mut arg_strs = Vec::new();
@@ -780,12 +1188,12 @@ impl<'a> FnCodegen<'a> {
             let want = func
                 .params
                 .get(i)
-                .map(|p| Ty::from_ast(&p.ty))
+                .map(|p| lower_callee(&p.ty))
                 .unwrap_or(Ty::Infer);
             let (v, pty) = self.gen_value(a, &want)?;
             arg_strs.push(format!("{pty} {v}"));
         }
-        let call = format!("call {ret_ty} @{name}({})", arg_strs.join(", "));
+        let call = format!("call {ret_ty} @{symbol}({})", arg_strs.join(", "));
         if ret_ty == "void" {
             self.emit(&call);
             Ok(String::new())
@@ -802,15 +1210,25 @@ impl<'a> FnCodegen<'a> {
         &mut self,
         object: &Expr,
         method: &str,
+        qualifier: Option<&crate::ast::TraitRef>,
+        member_span: Span,
         args: &[Expr],
         span: Span,
     ) -> Result<String, CodegenError> {
         let recv_ty = self.raw_ty(object).defaulted();
         let ty_name = struct_name_of(&recv_ty)
             .ok_or_else(|| CodegenError::new(span, "メソッド呼び出しの受け手が型を持ちません"))?;
+
+        // 提供元ラベル: `#修飾子` があればそれ、無ければ typeck が記録した解決結果、
+        // どちらも無ければ固有（型名）とみなす。
+        let label = qualifier
+            .map(|q| q.name.clone())
+            .or_else(|| self.method_provider.get(&member_span).cloned())
+            .unwrap_or_else(|| ty_name.clone());
+
         let func = *self
-            .method_table
-            .get(&(ty_name.clone(), method.to_string()))
+            .method_defs
+            .get(&(ty_name.clone(), method.to_string(), label.clone()))
             .ok_or_else(|| {
                 CodegenError::new(span, format!("メソッド `{ty_name}.{method}` が見つかりません"))
             })?;
@@ -818,8 +1236,13 @@ impl<'a> FnCodegen<'a> {
             .self_kind
             .ok_or_else(|| CodegenError::new(span, format!("`{method}` は self を取りません")))?;
 
+        let colliding = self
+            .method_collisions
+            .contains(&(ty_name.clone(), method.to_string()));
+        let symbol = method_symbol(&ty_name, method, &label, colliding);
+
         let ret_ty = match &func.ret {
-            Some(t) => llvm_ty(&Ty::from_ast(t), self.structs)
+            Some(t) => llvm_ty(&self.lower(t), self.structs)
                 .map_err(|m| CodegenError::new(t.span(), m))?,
             None => "void".to_string(),
         };
@@ -842,13 +1265,13 @@ impl<'a> FnCodegen<'a> {
             let want = func
                 .params
                 .get(i + 1)
-                .map(|p| Ty::from_ast(&p.ty))
+                .map(|p| self.lower(&p.ty))
                 .unwrap_or(Ty::Infer);
             let (v, pty) = self.gen_value(a, &want)?;
             arg_strs.push(format!("{pty} {v}"));
         }
 
-        let call = format!("call {ret_ty} @{ty_name}.{method}({})", arg_strs.join(", "));
+        let call = format!("call {ret_ty} @{symbol}({})", arg_strs.join(", "));
         if ret_ty == "void" {
             self.emit(&call);
             Ok(String::new())
@@ -1013,7 +1436,8 @@ impl<'a> FnCodegen<'a> {
 
     /// 式の内部型（型検査の結果のまま。リテラルは未確定型を保つ）。
     fn raw_ty(&self, expr: &Expr) -> Ty {
-        self.types.get(&expr.span).cloned().unwrap_or(Ty::Infer)
+        let ty = self.types.get(&expr.span).cloned().unwrap_or(Ty::Infer);
+        subst_ty(&ty, self.type_subst)
     }
 
     /// 式を評価し、期待型 `want` に合わせて必要なら暗黙デリファレンスして

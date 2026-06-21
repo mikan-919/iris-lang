@@ -22,8 +22,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, SelfKind, Stmt, Type,
-    TypeDef, TypeDefBody, UnaryOp,
+    BinaryOp, Block, Else, Expr, ExprKind, FieldInit, Function, Item, Program, SelfKind, Stmt,
+    TraitRef, Type, TypeDef, TypeDefBody, UnaryOp,
 };
 use crate::sema::resolve::{DefId, DefKind, Resolution};
 use crate::sema::ty::{FLOAT_TYPES, INT_TYPES, Ty};
@@ -38,6 +38,13 @@ const BUILTIN_TYPES: &[&str] = &[
 #[derive(Debug, Default)]
 pub struct TypeInfo {
     pub expr_types: HashMap<Span, Ty>,
+    /// ジェネリック関数呼び出しの単相化情報。callee の span → (関数名, 型引数順の具体型)。
+    /// コード生成が呼び出しごとの具体化記号を引くのに使う。型引数は外側の型パラメータを
+    /// 含みうる（入れ子のジェネリック呼び出し。コード生成側で更に置換する）。
+    pub mono: HashMap<Span, (String, Vec<Ty>)>,
+    /// メソッド呼び出しの解決済み提供元。callee の span → トレイト名 or 受け手の型名。
+    /// コード生成が同名衝突時に正しい記号（`@Type.Trait.method`）を選ぶのに使う。
+    pub method_provider: HashMap<Span, String>,
 }
 
 /// 型エラー。
@@ -49,8 +56,45 @@ pub struct TypeError {
 
 /// 関数のシグネチャ。
 struct FuncSig {
+    /// 型パラメータ名と境界（`fn f<T: Bound>(...)`）。呼び出し時の単相化推論・境界検査に使う。
+    generics: Vec<(String, Vec<Bound>)>,
     params: Vec<Ty>,
     ret: Ty,
+}
+
+/// トレイト境界 `Trait<Args>`（ADR-0006/0007）。`<T: Bound>`・スーパートレイトで使う。
+#[derive(Clone)]
+struct Bound {
+    trait_name: String,
+    args: Vec<Ty>,
+}
+
+/// トレイト定義の情報。メソッドのシグネチャは `Self`・トレイト型引数を含みうる。
+struct TraitInfo {
+    /// トレイトの型パラメータ名（`trait Iterator<T>` の `T`）。
+    generics: Vec<String>,
+    /// スーパートレイト（`trait Sub: Super`）。
+    supertraits: Vec<Bound>,
+    /// メソッド名 → シグネチャ。
+    methods: HashMap<String, MethodSig>,
+    /// 既定実装を持つメソッド名。
+    defaults: HashSet<String>,
+}
+
+/// `impl Trait for Type` 1 件の情報。
+struct TraitImpl {
+    trait_name: String,
+    trait_args: Vec<Ty>,
+    /// この impl が明示的に提供したメソッド名 → (シグネチャ, 名前 span)。
+    provided: HashMap<String, (MethodSig, Span)>,
+    span: Span,
+}
+
+/// メソッド解決の提供元（固有メソッド or 実装トレイトの 1 件）。
+struct Provider {
+    sig: MethodSig,
+    /// 曖昧時の表示・`#` 修飾子の一致に使う名前（トレイト名 or 型名）。
+    label: String,
 }
 
 /// メソッドのシグネチャ。`params` は self を除いた引数の型。
@@ -82,16 +126,46 @@ pub fn check(program: &Program, res: &Resolution) -> Result<TypeInfo, Vec<TypeEr
         match item {
             Item::Function(f) => checker.check_function(f),
             Item::Impl(im) => {
+                checker.set_self_ty(Some(im.type_name.clone()));
                 for m in &im.methods {
                     checker.check_function(m);
                 }
+                checker.set_self_ty(None);
+            }
+            // トレイトの既定実装の本体を検査する（`Self` は実装型を表す抽象型）。
+            Item::Trait(tr) => {
+                // Self はこのトレイトを実装する抽象型、トレイト型引数も抽象。
+                let mut ambient: HashMap<String, Vec<Bound>> = HashMap::new();
+                ambient.insert(
+                    "Self".to_string(),
+                    vec![Bound {
+                        trait_name: tr.name.clone(),
+                        args: tr.generics.iter().map(|g| Ty::named(&g.name)).collect(),
+                    }],
+                );
+                for g in &tr.generics {
+                    ambient.insert(g.name.clone(), Vec::new());
+                }
+                checker.ambient_generics = ambient;
+                checker.set_self_ty(Some("Self".to_string()));
+                for m in &tr.methods {
+                    if m.default {
+                        checker.check_function(&m.func);
+                    }
+                }
+                checker.set_self_ty(None);
+                checker.ambient_generics = HashMap::new();
             }
             Item::TypeDef(_) => {}
         }
     }
+    // すべての `impl Trait for Type` の適合（conformance）を検査する。
+    checker.check_conformance();
     if checker.errors.is_empty() {
         Ok(TypeInfo {
             expr_types: checker.expr_types,
+            mono: checker.mono,
+            method_provider: checker.method_provider,
         })
     } else {
         Err(checker.errors)
@@ -103,6 +177,16 @@ struct Checker<'a> {
     funcs: HashMap<String, FuncSig>,
     /// 型名 → メソッド名 → シグネチャ（固有メソッド）。
     methods: HashMap<String, HashMap<String, MethodSig>>,
+    /// トレイト名 → トレイト定義。
+    traits: HashMap<String, TraitInfo>,
+    /// 型名 → その型への `impl Trait for Type` 群。
+    trait_impls: HashMap<String, Vec<TraitImpl>>,
+    /// 現在検査中の関数の型パラメータ名 → 境界。`x.m()` を境界経由で解決するのに使う。
+    generics: HashMap<String, Vec<Bound>>,
+    /// 関数の外側から与える型パラメータ（トレイト既定実装の `Self`・トレイト型引数）。
+    ambient_generics: HashMap<String, Vec<Bound>>,
+    /// 現在の `Self` 型名（impl 対象の型、またはトレイト既定実装では `"Self"`）。
+    self_ty: Option<String>,
     /// 型定義（別名・struct・enum）。
     types: HashMap<String, TyDef>,
     /// 既知の型名（プリミティブ＋組み込み＋定義済み）。型名検証に使う。
@@ -112,6 +196,10 @@ struct Checker<'a> {
     /// 定義（宣言）位置の span から DefId を引くための表。
     def_spans: HashMap<Span, DefId>,
     expr_types: HashMap<Span, Ty>,
+    /// ジェネリック関数呼び出しの単相化情報（callee span → (関数名, 型引数)）。
+    mono: HashMap<Span, (String, Vec<Ty>)>,
+    /// メソッド呼び出しの解決済み提供元（callee span → トレイト名 or 型名）。
+    method_provider: HashMap<Span, String>,
     errors: Vec<TypeError>,
     /// 検査中の関数の戻り値型。
     current_ret: Ty,
@@ -148,36 +236,116 @@ impl<'a> Checker<'a> {
             if let Item::Function(f) = item {
                 let params = f.params.iter().map(|p| Ty::from_ast(&p.ty)).collect();
                 let ret = f.ret.as_ref().map_or_else(Ty::unit, Ty::from_ast);
-                funcs.insert(f.name.clone(), FuncSig { params, ret });
+                let generics = f
+                    .generics
+                    .iter()
+                    .map(|g| {
+                        let bounds = g
+                            .bounds
+                            .iter()
+                            .map(|b| Bound {
+                                trait_name: b.name.clone(),
+                                args: b.args.iter().map(Ty::from_ast).collect(),
+                            })
+                            .collect();
+                        (g.name.clone(), bounds)
+                    })
+                    .collect();
+                funcs.insert(
+                    f.name.clone(),
+                    FuncSig {
+                        generics,
+                        params,
+                        ret,
+                    },
+                );
+            }
+        }
+
+        // トレイト名も既知の型名として登録（境界・修飾子の名前検証用）。
+        for item in &program.items {
+            if let Item::Trait(t) = item {
+                known_types.insert(t.name.clone());
+            }
+        }
+
+        let mk_method_sig = |m: &Function| {
+            // self_kind が Some のとき params[0] は合成 self なので飛ばす。
+            let skip = usize::from(m.self_kind.is_some());
+            let params = m.params[skip..].iter().map(|p| Ty::from_ast(&p.ty)).collect();
+            let ret = m.ret.as_ref().map_or_else(Ty::unit, Ty::from_ast);
+            MethodSig {
+                self_kind: m.self_kind,
+                params,
+                ret,
+            }
+        };
+
+        // トレイト定義テーブル。
+        let mut traits: HashMap<String, TraitInfo> = HashMap::new();
+        for item in &program.items {
+            if let Item::Trait(t) = item {
+                let mut tmethods = HashMap::new();
+                let mut defaults = HashSet::new();
+                for tm in &t.methods {
+                    tmethods.insert(tm.func.name.clone(), mk_method_sig(&tm.func));
+                    if tm.default {
+                        defaults.insert(tm.func.name.clone());
+                    }
+                }
+                traits.insert(
+                    t.name.clone(),
+                    TraitInfo {
+                        generics: t.generics.iter().map(|g| g.name.clone()).collect(),
+                        supertraits: t
+                            .supertraits
+                            .iter()
+                            .map(|s| Bound {
+                                trait_name: s.name.clone(),
+                                args: s.args.iter().map(Ty::from_ast).collect(),
+                            })
+                            .collect(),
+                        methods: tmethods,
+                        defaults,
+                    },
+                );
             }
         }
 
         // 固有メソッドのシグネチャ（型名 → メソッド名 → sig）。self は params から除く。
         // 同じ型に同名メソッドがあれば（同一 impl・別 impl を問わず）二重定義として報告する。
+        // trait impl のメソッドは固有表に入れず、trait_impls 側へ集める。
         let mut methods: HashMap<String, HashMap<String, MethodSig>> = HashMap::new();
+        let mut trait_impls: HashMap<String, Vec<TraitImpl>> = HashMap::new();
         let mut dup_errors = Vec::new();
         for item in &program.items {
-            if let Item::Impl(im) = item {
-                let table = methods.entry(im.type_name.clone()).or_default();
-                for m in &im.methods {
-                    // self_kind が Some のとき params[0] は合成 self なので飛ばす。
-                    let skip = usize::from(m.self_kind.is_some());
-                    let params = m.params[skip..].iter().map(|p| Ty::from_ast(&p.ty)).collect();
-                    let ret = m.ret.as_ref().map_or_else(Ty::unit, Ty::from_ast);
-                    let sig = MethodSig {
-                        self_kind: m.self_kind,
-                        params,
-                        ret,
-                    };
-                    if table.insert(m.name.clone(), sig).is_some() {
-                        dup_errors.push(TypeError {
-                            span: m.name_span,
-                            message: format!(
-                                "型 `{}` にメソッド `{}` が二重に定義されています",
-                                im.type_name, m.name
-                            ),
-                        });
-                    }
+            let Item::Impl(im) = item else { continue };
+            if let Some(tr) = &im.trait_ref {
+                // `impl Trait for Type`：提供メソッドのシグネチャを記録する。
+                let provided = im
+                    .methods
+                    .iter()
+                    .map(|m| (m.name.clone(), (mk_method_sig(m), m.name_span)))
+                    .collect();
+                trait_impls.entry(im.type_name.clone()).or_default().push(TraitImpl {
+                    trait_name: tr.name.clone(),
+                    trait_args: tr.args.iter().map(Ty::from_ast).collect(),
+                    provided,
+                    span: tr.span,
+                });
+                continue;
+            }
+            // 固有 impl。
+            let table = methods.entry(im.type_name.clone()).or_default();
+            for m in &im.methods {
+                if table.insert(m.name.clone(), mk_method_sig(m)).is_some() {
+                    dup_errors.push(TypeError {
+                        span: m.name_span,
+                        message: format!(
+                            "型 `{}` にメソッド `{}` が二重に定義されています",
+                            im.type_name, m.name
+                        ),
+                    });
                 }
             }
         }
@@ -194,11 +362,18 @@ impl<'a> Checker<'a> {
             res,
             funcs,
             methods,
+            traits,
+            trait_impls,
+            generics: HashMap::new(),
+            ambient_generics: HashMap::new(),
+            self_ty: None,
             types,
             known_types,
             def_types: vec![Ty::Infer; res.defs.len()],
             def_spans,
             expr_types: HashMap::new(),
+            mono: HashMap::new(),
+            method_provider: HashMap::new(),
             errors: dup_errors,
             current_ret: Ty::unit(),
             loop_depth: 0,
@@ -215,7 +390,9 @@ impl<'a> Checker<'a> {
     fn validate_type(&mut self, t: &Type) {
         match t {
             Type::Named { name, args, span } => {
-                if !self.known_types.contains(name) {
+                // ジェネリック型パラメータ・`Self` は既知扱い。
+                let is_self = name == "Self" && self.self_ty.is_some();
+                if !is_self && !self.is_generic_param(name) && !self.known_types.contains(name) {
                     self.error(*span, format!("未定義の型 `{name}`"));
                 }
                 for a in args {
@@ -229,10 +406,31 @@ impl<'a> Checker<'a> {
                     self.validate_type(e);
                 }
             }
+            // 匿名境界はパーサが脱糖済み。防御的に何もしない。
+            Type::Bound { .. } => {}
         }
     }
 
+    fn set_self_ty(&mut self, name: Option<String>) {
+        self.self_ty = name;
+    }
+
     fn check_function(&mut self, f: &Function) {
+        // ジェネリック環境＝外側(ambient: Self・トレイト型引数) ＋ 関数自身の型パラメータ。
+        let mut generics = self.ambient_generics.clone();
+        for g in &f.generics {
+            let bounds = g
+                .bounds
+                .iter()
+                .map(|b| Bound {
+                    trait_name: b.name.clone(),
+                    args: b.args.iter().map(Ty::from_ast).collect(),
+                })
+                .collect();
+            generics.insert(g.name.clone(), bounds);
+        }
+        self.generics = generics;
+
         // 引数・戻り値の型名を検証し、引数型を DefId に登録する。
         for p in &f.params {
             self.validate_type(&p.ty);
@@ -246,6 +444,12 @@ impl<'a> Checker<'a> {
         // メソッドは `funcs` に無いので、関数自身の戻り値型から設定する。
         self.current_ret = f.ret.as_ref().map_or_else(Ty::unit, Ty::from_ast);
         self.check_block(&f.body);
+        self.generics = HashMap::new();
+    }
+
+    /// 型名 `name` が現在のスコープのジェネリック型パラメータか。
+    fn is_generic_param(&self, name: &str) -> bool {
+        self.generics.contains_key(name)
     }
 
     fn check_block(&mut self, block: &Block) {
@@ -412,7 +616,7 @@ impl<'a> Checker<'a> {
             ExprKind::Unary { op, expr: inner } => self.infer_unary(*op, inner),
             ExprKind::Binary { op, lhs, rhs } => self.infer_binary(*op, lhs, rhs),
             ExprKind::Call { callee, args } => self.infer_call(callee, args),
-            ExprKind::Member { object, field } => self.infer_member(object, field, expr.span),
+            ExprKind::Member { object, field, .. } => self.infer_member(object, field, expr.span),
             ExprKind::Ternary {
                 cond,
                 then,
@@ -525,8 +729,20 @@ impl<'a> Checker<'a> {
         let arg_tys: Vec<Ty> = args.iter().map(|a| self.check_expr(a)).collect();
 
         // メソッド呼び出し `object.method(args)`（callee がメンバアクセス）。
-        if let ExprKind::Member { object, field } = &callee.kind {
-            return self.infer_method_call(object, field, callee.span, args, &arg_tys);
+        if let ExprKind::Member {
+            object,
+            field,
+            qualifier,
+        } = &callee.kind
+        {
+            return self.infer_method_call(
+                object,
+                field,
+                qualifier.as_ref(),
+                callee.span,
+                args,
+                &arg_tys,
+            );
         }
 
         if let ExprKind::Ident(name) = &callee.kind
@@ -549,6 +765,7 @@ impl<'a> Checker<'a> {
         };
         let ret = sig.ret.clone();
         let params = sig.params.clone();
+        let generics = sig.generics.clone();
         if params.len() != arg_tys.len() {
             self.error(
                 span,
@@ -560,33 +777,90 @@ impl<'a> Checker<'a> {
             );
             return ret;
         }
+
+        // 単相化推論: 型パラメータ → 引数から推論した具体型。
+        let gset: HashSet<&str> = generics.iter().map(|(n, _)| n.as_str()).collect();
+        let mut smap: HashMap<String, Ty> = HashMap::new();
+        if !gset.is_empty() {
+            for (p, a) in params.iter().zip(arg_tys) {
+                unify(p, a, &gset, &mut smap);
+            }
+        }
+
         for ((expected, actual), arg) in params.iter().zip(arg_tys).zip(args) {
-            if !self.assignable(expected, actual) {
+            let exp = if gset.is_empty() {
+                expected.clone()
+            } else {
+                subst(expected, &smap)
+            };
+            if !self.assignable(&exp, actual) {
                 self.error(
                     arg.span,
                     format!(
                         "引数の型が一致しません: `{}` を期待しましたが `{}` でした",
-                        expected.describe(),
+                        exp.describe(),
                         actual.describe()
                     ),
                 );
             }
         }
-        ret
+
+        // トレイト境界の充足検査: 各型パラメータの推論結果が境界トレイトを実装しているか。
+        for (gname, bounds) in &generics {
+            if bounds.is_empty() {
+                continue;
+            }
+            let Some(concrete) = smap.get(gname) else {
+                continue;
+            };
+            let Ty::Named { name: cname, .. } = concrete.peel_refs() else {
+                continue;
+            };
+            // 別のジェネリック型パラメータへ束縛された場合は単相化時に再検査される。
+            if self.is_generic_param(cname) {
+                continue;
+            }
+            for b in bounds {
+                if !self.type_implements(cname, &b.trait_name, &b.args) {
+                    self.error(
+                        span,
+                        format!(
+                            "`{cname}` はトレイト境界 `{}` を満たしていません（`impl {} for {cname}` が必要）",
+                            b.trait_name, b.trait_name
+                        ),
+                    );
+                }
+            }
+        }
+
+        if gset.is_empty() {
+            ret
+        } else {
+            // 単相化情報を記録（型引数を宣言順に並べる）。
+            let type_args: Vec<Ty> = generics
+                .iter()
+                .map(|(n, _)| smap.get(n).cloned().unwrap_or(Ty::Infer))
+                .collect();
+            self.mono.insert(span, (name.to_string(), type_args));
+            subst(&ret, &smap)
+        }
     }
 
-    /// メソッド呼び出し `object.method(args)` を静的ディスパッチで型付けする。
+    /// メソッド呼び出し `object.method(args)` を静的ディスパッチで型付けする（ADR-0004）。
+    /// 受け手が具象型なら固有＋実装トレイトのメソッド、ジェネリック型パラメータなら境界
+    /// （スーパートレイト含む）から提供元を集め、ちょうど 1 個へ解決する。複数なら `#` で明示。
     fn infer_method_call(
         &mut self,
         object: &Expr,
         method: &str,
+        qualifier: Option<&TraitRef>,
         span: Span,
         args: &[Expr],
         arg_tys: &[Ty],
     ) -> Ty {
         let obj_ty = self.check_expr(object);
         // 受け手の型名（参照は剥がす）。
-        let Ty::Named { name: ty_name, .. } = obj_ty.peel_refs().clone() else {
+        let Ty::Named { name: ty_name, args: ty_args } = obj_ty.peel_refs().clone() else {
             if !matches!(obj_ty, Ty::Infer | Ty::Error) {
                 self.error(
                     span,
@@ -596,12 +870,50 @@ impl<'a> Checker<'a> {
             return Ty::Infer;
         };
 
-        let Some(sig) = self.methods.get(&ty_name).and_then(|m| m.get(method)).cloned() else {
-            self.error(
-                span,
-                format!("型 `{ty_name}` にメソッド `{method}` はありません"),
-            );
-            return Ty::Error;
+        // 提供元を集める。label は曖昧時の表示と `#` 修飾子の一致に使う。
+        let recv = Ty::Named { name: ty_name.clone(), args: ty_args };
+        let mut providers = self.collect_providers(&ty_name, &recv, method);
+
+        // 修飾子 `#Qualifier` があれば提供元を絞る。
+        if let Some(q) = qualifier {
+            providers.retain(|p| p.label == q.name);
+        }
+
+        let sig = match providers.len() {
+            1 => {
+                let p = providers.pop().unwrap();
+                // コード生成のため、解決した提供元（トレイト名 or 型名）を記録する。
+                self.method_provider.insert(span, p.label);
+                p.sig
+            }
+            0 => {
+                if let Some(q) = qualifier {
+                    self.error(
+                        span,
+                        format!("`{ty_name}` には `{}` 由来のメソッド `{method}` はありません", q.name),
+                    );
+                } else {
+                    self.error(
+                        span,
+                        format!("型 `{ty_name}` にメソッド `{method}` はありません"),
+                    );
+                }
+                return Ty::Error;
+            }
+            _ => {
+                let labels: Vec<_> = providers
+                    .iter()
+                    .map(|p| format!("`{method}#{}`", p.label))
+                    .collect();
+                self.error(
+                    span,
+                    format!(
+                        "メソッド `{method}` の提供元が複数あります。{} のように `#` で明示してください",
+                        labels.join(" / ")
+                    ),
+                );
+                return providers.pop().unwrap().sig.ret;
+            }
         };
 
         // self を取らない関連関数は、値からのドット呼び出しでは呼べない。
@@ -640,6 +952,224 @@ impl<'a> Checker<'a> {
             }
         }
         sig.ret
+    }
+
+    /// メソッド `method` の提供元を集める。具象型では固有＋実装トレイトの直接メソッド、
+    /// ジェネリック型パラメータでは境界（スーパートレイトを辿る）から集める。
+    fn collect_providers(&self, ty_name: &str, recv: &Ty, method: &str) -> Vec<Provider> {
+        let mut providers = Vec::new();
+        if self.is_generic_param(ty_name) {
+            for bound in self.generics.get(ty_name).cloned().unwrap_or_default() {
+                if let Some((owner, sig)) =
+                    self.resolve_trait_method(&bound.trait_name, &bound.args, recv, method)
+                {
+                    // ラベルはメソッドを実際に定義するトレイト（スーパートレイト由来なら親）。
+                    providers.push(Provider { sig, label: owner });
+                }
+            }
+            return providers;
+        }
+        // 具象型：固有メソッド。
+        if let Some(sig) = self.methods.get(ty_name).and_then(|m| m.get(method)) {
+            providers.push(Provider {
+                sig: sig.clone(),
+                label: ty_name.to_string(),
+            });
+        }
+        // 実装トレイト（直接のメソッドのみ。スーパートレイト由来はそのトレイト自身の impl が提供）。
+        if let Some(impls) = self.trait_impls.get(ty_name) {
+            for ti in impls {
+                if let Some(tinfo) = self.traits.get(&ti.trait_name)
+                    && let Some(sig) = tinfo.methods.get(method)
+                {
+                    let mut map = HashMap::new();
+                    map.insert("Self".to_string(), recv.clone());
+                    for (g, a) in tinfo.generics.iter().zip(&ti.trait_args) {
+                        map.insert(g.clone(), a.clone());
+                    }
+                    providers.push(Provider {
+                        sig: subst_sig(sig, &map),
+                        label: ti.trait_name.clone(),
+                    });
+                }
+            }
+        }
+        providers
+    }
+
+    /// トレイト `trait_name<trait_args>` とそのスーパートレイトから `method` を探し、
+    /// `(メソッドを定義するトレイト名, Self・型引数を置換した具体シグネチャ)` を返す。
+    fn resolve_trait_method(
+        &self,
+        trait_name: &str,
+        trait_args: &[Ty],
+        recv: &Ty,
+        method: &str,
+    ) -> Option<(String, MethodSig)> {
+        let tinfo = self.traits.get(trait_name)?;
+        let mut map = HashMap::new();
+        map.insert("Self".to_string(), recv.clone());
+        for (g, a) in tinfo.generics.iter().zip(trait_args) {
+            map.insert(g.clone(), a.clone());
+        }
+        if let Some(sig) = tinfo.methods.get(method) {
+            return Some((trait_name.to_string(), subst_sig(sig, &map)));
+        }
+        for s in &tinfo.supertraits {
+            let s_args: Vec<Ty> = s.args.iter().map(|a| subst(a, &map)).collect();
+            if let Some(found) = self.resolve_trait_method(&s.trait_name, &s_args, recv, method) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// 具象型 `ty_name` がトレイト `trait_name<args>` を実装しているか（可視範囲・ADR-0008）。
+    fn type_implements(&self, ty_name: &str, trait_name: &str, args: &[Ty]) -> bool {
+        self.trait_impls.get(ty_name).is_some_and(|impls| {
+            impls.iter().any(|ti| {
+                ti.trait_name == trait_name
+                    && ti.trait_args.len() == args.len()
+                    && ti
+                        .trait_args
+                        .iter()
+                        .zip(args)
+                        .all(|(x, y)| self.tys_match(x, y))
+            })
+        })
+    }
+
+    /// 双方向に適合する型同士か（トレイト引数の一致判定。Infer はワイルドカード）。
+    fn tys_match(&self, a: &Ty, b: &Ty) -> bool {
+        self.assignable(a, b) || self.assignable(b, a)
+    }
+
+    /// すべての `impl Trait for Type` の適合を検査する（ADR-0004/0007/0008）。
+    /// - トレイトの全メソッドを提供（既定実装があれば省略可）し、シグネチャが一致する
+    /// - トレイトに無いメソッドを置かない
+    /// - スーパートレイトの実装が存在する
+    /// - 同一キー `(Trait<引数>, Type)` の重複実装を弾く（スコープ・コヒーレンス）
+    fn check_conformance(&mut self) {
+        let mut errs: Vec<TypeError> = Vec::new();
+        for (ty_name, impls) in &self.trait_impls {
+            for (idx, ti) in impls.iter().enumerate() {
+                // 重複実装（同一キー）。`#` でも選べないため弾く。
+                for other in &impls[..idx] {
+                    if other.trait_name == ti.trait_name
+                        && other.trait_args.len() == ti.trait_args.len()
+                        && other
+                            .trait_args
+                            .iter()
+                            .zip(&ti.trait_args)
+                            .all(|(x, y)| self.tys_match(x, y))
+                    {
+                        errs.push(TypeError {
+                            span: ti.span,
+                            message: format!(
+                                "`{}` への `{}` の実装が重複しています（同一スコープで一意でなければなりません）",
+                                ty_name, ti.trait_name
+                            ),
+                        });
+                    }
+                }
+
+                let Some(tinfo) = self.traits.get(&ti.trait_name) else {
+                    errs.push(TypeError {
+                        span: ti.span,
+                        message: format!("未定義のトレイト `{}`", ti.trait_name),
+                    });
+                    continue;
+                };
+
+                if ti.trait_args.len() != tinfo.generics.len() {
+                    errs.push(TypeError {
+                        span: ti.span,
+                        message: format!(
+                            "トレイト `{}` の型引数は {} 個ですが {} 個指定されています",
+                            ti.trait_name,
+                            tinfo.generics.len(),
+                            ti.trait_args.len()
+                        ),
+                    });
+                }
+
+                // 置換マップ: Self → 実装型, トレイト型引数 → impl の指定。
+                let recv = Ty::named(ty_name);
+                let mut map = HashMap::new();
+                map.insert("Self".to_string(), recv);
+                for (g, a) in tinfo.generics.iter().zip(&ti.trait_args) {
+                    map.insert(g.clone(), a.clone());
+                }
+
+                // 各トレイトメソッドの提供・シグネチャ一致。
+                for (mname, tsig) in &tinfo.methods {
+                    let expected = subst_sig(tsig, &map);
+                    match ti.provided.get(mname) {
+                        Some((isig, ispan)) => {
+                            let mut ok = isig.self_kind == expected.self_kind
+                                && isig.params.len() == expected.params.len()
+                                && isig
+                                    .params
+                                    .iter()
+                                    .zip(&expected.params)
+                                    .all(|(a, b)| self.tys_match(a, b))
+                                && self.tys_match(&isig.ret, &expected.ret);
+                            // 既定実装の self を上書きしている場合の不一致も拾う。
+                            if !ok {
+                                errs.push(TypeError {
+                                    span: *ispan,
+                                    message: format!(
+                                        "メソッド `{mname}` のシグネチャがトレイト `{}` と一致しません",
+                                        ti.trait_name
+                                    ),
+                                });
+                                ok = true; // 二重報告を避ける
+                            }
+                            let _ = ok;
+                        }
+                        None => {
+                            if !tinfo.defaults.contains(mname) {
+                                errs.push(TypeError {
+                                    span: ti.span,
+                                    message: format!(
+                                        "`{}` への `{}` の実装にメソッド `{mname}` がありません",
+                                        ty_name, ti.trait_name
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // トレイトに存在しないメソッドを置いていないか。
+                for (mname, (_, ispan)) in &ti.provided {
+                    if !tinfo.methods.contains_key(mname) {
+                        errs.push(TypeError {
+                            span: *ispan,
+                            message: format!(
+                                "トレイト `{}` にメソッド `{mname}` はありません",
+                                ti.trait_name
+                            ),
+                        });
+                    }
+                }
+
+                // スーパートレイトの実装が存在するか（ADR-0007）。
+                for s in &tinfo.supertraits {
+                    let s_args: Vec<Ty> = s.args.iter().map(|a| subst(a, &map)).collect();
+                    if !self.type_implements(ty_name, &s.trait_name, &s_args) {
+                        errs.push(TypeError {
+                            span: ti.span,
+                            message: format!(
+                                "`{}` は `{}` の前提となるスーパートレイト `{}` を実装していません",
+                                ty_name, ti.trait_name, s.trait_name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        self.errors.extend(errs);
     }
 
     /// `&mut self` メソッドの受け手が可変か検査する。不変参照越し・不変束縛は不可。
@@ -943,6 +1473,66 @@ impl<'a> Checker<'a> {
             return Some(pick_concrete(a, b));
         }
         None
+    }
+}
+
+/// 型パラメータ名を具体型へ置換する（`Self`・トレイト型引数の単相化）。
+fn subst(ty: &Ty, map: &HashMap<String, Ty>) -> Ty {
+    match ty {
+        Ty::Named { name, args } => {
+            if args.is_empty()
+                && let Some(rep) = map.get(name)
+            {
+                return rep.clone();
+            }
+            Ty::Named {
+                name: name.clone(),
+                args: args.iter().map(|a| subst(a, map)).collect(),
+            }
+        }
+        Ty::Ref { mutable, inner } => Ty::Ref {
+            mutable: *mutable,
+            inner: Box::new(subst(inner, map)),
+        },
+        Ty::Array(i) => Ty::Array(Box::new(subst(i, map))),
+        Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| subst(e, map)).collect()),
+        other => other.clone(),
+    }
+}
+
+/// 単相化推論: パラメータ型 `param`（型パラメータ `gset` を含みうる）と実引数型 `arg` を
+/// 突き合わせ、型パラメータ → 具体型の束縛を `out` に集める。最初の束縛を優先する。
+fn unify(param: &Ty, arg: &Ty, gset: &HashSet<&str>, out: &mut HashMap<String, Ty>) {
+    match (param, arg) {
+        (Ty::Named { name, args }, _) if args.is_empty() && gset.contains(name.as_str()) => {
+            // 参照は剥がし、リテラルは既定型へ確定して束縛する。
+            let bound = arg.peel_refs().clone().defaulted();
+            out.entry(name.clone()).or_insert(bound);
+        }
+        (Ty::Named { args: pa, .. }, Ty::Named { args: aa, .. }) if pa.len() == aa.len() => {
+            for (p, a) in pa.iter().zip(aa) {
+                unify(p, a, gset, out);
+            }
+        }
+        (Ty::Ref { inner: pi, .. }, Ty::Ref { inner: ai, .. }) => unify(pi, ai, gset, out),
+        // 暗黙デリファレンス: `&T` 引数を値パラメータへ。
+        (Ty::Named { .. }, Ty::Ref { inner: ai, .. }) => unify(param, ai, gset, out),
+        (Ty::Array(p), Ty::Array(a)) => unify(p, a, gset, out),
+        (Ty::Tuple(ps), Ty::Tuple(es)) if ps.len() == es.len() => {
+            for (p, a) in ps.iter().zip(es) {
+                unify(p, a, gset, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// メソッドシグネチャの引数・戻り値型を置換する。
+fn subst_sig(sig: &MethodSig, map: &HashMap<String, Ty>) -> MethodSig {
+    MethodSig {
+        self_kind: sig.self_kind,
+        params: sig.params.iter().map(|p| subst(p, map)).collect(),
+        ret: subst(&sig.ret, map),
     }
 }
 
