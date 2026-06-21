@@ -155,7 +155,7 @@ impl Flow<'_> {
                 }
             }
             Stmt::While { cond, body, .. } => {
-                self.visit_expr(cond, st);
+                self.visit_operand(cond, st);
                 self.visit_loop_body(body, st, ret_is_ref);
             }
             Stmt::Loop { body, .. } => {
@@ -194,11 +194,13 @@ impl Flow<'_> {
             ExprKind::Ident(name) => self.use_var(name, expr.span, st, true),
             ExprKind::Unary { op, expr: inner } => match op {
                 UnaryOp::Ref | UnaryOp::RefMut => self.use_place(inner, st),
-                UnaryOp::Neg => self.visit_expr(inner, st),
+                UnaryOp::Neg => self.visit_operand(inner, st),
             },
             ExprKind::Binary { lhs, rhs, .. } => {
-                self.visit_expr(lhs, st);
-                self.visit_expr(rhs, st);
+                // 算術・比較・論理のオペランドは auto-deref される文脈。参照は
+                // デリファレンス読み（借用）であってムーブではない。
+                self.visit_operand(lhs, st);
+                self.visit_operand(rhs, st);
             }
             ExprKind::Call { callee, args } => {
                 match &callee.kind {
@@ -216,7 +218,7 @@ impl Flow<'_> {
                 then,
                 otherwise,
             } => {
-                self.visit_expr(cond, st);
+                self.visit_operand(cond, st);
                 let mut a = st.clone();
                 self.visit_expr(then, &mut a);
                 let mut b = st.clone();
@@ -234,7 +236,7 @@ impl Flow<'_> {
                 then,
                 otherwise,
             } => {
-                self.visit_expr(cond, st);
+                self.visit_operand(cond, st);
                 let mut a = st.clone();
                 self.visit_block(then, &mut a, false);
                 let mut b = st.clone();
@@ -246,6 +248,18 @@ impl Flow<'_> {
                 }
                 *st = merge(a, b);
             }
+        }
+    }
+
+    /// auto-deref される文脈（算術・比較・論理・単項マイナス・条件）のオペランドを
+    /// 訪問する。式の型が参照なら、その参照値は使われず参照先がデリファレンス読み
+    /// されるだけなので、ムーブではなく借用（読み）として扱う（特に `&mut` は非 Copy
+    /// だが、`r + 1` のような auto-deref は r をムーブしない）。
+    fn visit_operand(&mut self, expr: &Expr, st: &mut State) {
+        if matches!(self.types.get(&expr.span), Some(Ty::Ref { .. })) {
+            self.use_place(expr, st);
+        } else {
+            self.visit_expr(expr, st);
         }
     }
 

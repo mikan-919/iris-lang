@@ -33,6 +33,13 @@ fn copy_types_are_not_moved() {
 }
 
 #[test]
+fn mut_ref_deref_read_does_not_move() {
+    // `&mut` は非 Copy だが、算術オペランド（auto-deref）での読みはムーブではない。
+    // `r = r + 1` は右辺で r を読み、続けて write-through で r を使える。
+    ownck("fn add_one(r: &mut i32) {\n    r = r + 1\n}").expect("auto-deref 読みはムーブしない");
+}
+
+#[test]
 fn borrow_does_not_move() {
     let src = format!("{STRUCT}fn peek(p: &P): i32 {{\n    return p.x\n}}\nfn run(): i32 {{\n    let a = P {{ x: 1 }}\n    let b = peek(&a)\n    let c = take(a)\n    return b + c\n}}");
     ownck(&src).expect("借用はムーブしない");
