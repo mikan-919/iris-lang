@@ -31,6 +31,9 @@ trait を導入すると、ひとつの型が複数の trait を実装したと�
 - 例: 固有 `impl Point { fn at(self) }` と `impl Drawable for Point { fn at(self) }` が
   衝突するとき、`p.at#Point()`（固有）と `p.at#Drawable()`（trait）で指し分ける。
 - `#` を**新しいトークン**として追加する（字句解析上、現在 `#` はどのトークンにも未使用）。
+- `Qualifier` は**トレイトの型引数まで**含められる: `c.next#Iterator<i32>()`（ADR-0007 の
+  複数 instantiation の曖昧解消）。`#` は一般の曖昧解消記号として、`for` の要素型にも及ぶ:
+  `for x#i32 in c`。すなわち `#` は「呼び出し側で提供元を一意に絞る印」として言語横断で使う。
 
 ### 解決規則
 呼び出し `x.m(...)`（修飾なし）:
