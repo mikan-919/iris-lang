@@ -372,6 +372,8 @@ impl Flow<'_> {
                 self.use_place(base, st);
                 self.visit_operand(index, st);
             }
+            // `expr as T` は被変換値を読む（数値・bool＝Copy。参照は auto-deref 読み）。
+            ExprKind::Cast { expr: inner, .. } => self.visit_operand(inner, st),
         }
     }
 

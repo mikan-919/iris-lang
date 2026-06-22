@@ -306,6 +306,12 @@ pub enum ExprKind {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+    /// 型変換 `expr as Type`。数値↔数値・`bool`→数値の変換を行う。
+    /// 変換後の型は `ty` で、typeck が `expr_types` にも記録する。
+    Cast {
+        expr: Box<Expr>,
+        ty: Type,
+    },
 }
 
 /// match 式のアーム `pattern [if guard] -> body`。

@@ -813,7 +813,34 @@ impl<'a> Checker<'a> {
             ExprKind::Match { scrutinee, arms } => self.infer_match(scrutinee, arms, expr.span),
             ExprKind::ArrayLit { elems } => self.infer_array_lit(elems),
             ExprKind::Index { base, index } => self.infer_index(base, index, expr.span),
+            ExprKind::Cast { expr: inner, ty } => self.infer_cast(inner, ty, expr.span),
         }
+    }
+
+    /// `expr as Type` を型付けする。数値↔数値・`bool`→数値の変換のみ許す
+    /// （ポインタ・参照・struct 等への変換は未対応）。結果は変換先の型。
+    fn infer_cast(&mut self, inner: &Expr, target: &Type, span: Span) -> Ty {
+        let src = self.check_expr(inner);
+        self.validate_type(target);
+        let dst = Ty::from_ast(target);
+        // 被変換式または変換先が型エラーなら、これ以上の波及を避けて変換先で続ける。
+        if matches!(src, Ty::Error) || matches!(dst, Ty::Error) {
+            return dst;
+        }
+        // 参照は暗黙にデリファレンスして指す先の値を変換する。
+        let src_inner = src.peel_refs();
+        let ok = (src_inner.is_numeric() || src_inner.is_bool()) && dst.is_numeric();
+        if !ok {
+            self.error(
+                span,
+                format!(
+                    "`{}` から `{}` への `as` 変換は未対応です（数値間・`bool`→数値のみ）",
+                    src.describe(),
+                    dst.describe()
+                ),
+            );
+        }
+        dst
     }
 
     /// 添字アクセス `base[index]` を型付けする。`string` は `u8`、固定長配列 `T[]` と

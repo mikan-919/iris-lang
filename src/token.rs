@@ -32,6 +32,7 @@ pub enum TokenKind {
     Extern,
     Match,
     Use,
+    As, // as（型変換）
 
     // 区切り・括弧
     LParen,   // (
@@ -101,6 +102,7 @@ impl TokenKind {
             TokenKind::Extern => "`extern`".into(),
             TokenKind::Match => "`match`".into(),
             TokenKind::Use => "`use`".into(),
+            TokenKind::As => "`as`".into(),
             TokenKind::LParen => "`(`".into(),
             TokenKind::RParen => "`)`".into(),
             TokenKind::LBrace => "`{`".into(),

@@ -208,6 +208,7 @@ fn lex_ident_or_keyword(input: LSpan) -> nom::IResult<LSpan, Token> {
         "extern" => TokenKind::Extern,
         "match" => TokenKind::Match,
         "use" => TokenKind::Use,
+        "as" => TokenKind::As,
         "true" => TokenKind::Bool(true),
         "false" => TokenKind::Bool(false),
         _ => TokenKind::Ident(text.to_string()),

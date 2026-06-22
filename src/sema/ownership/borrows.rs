@@ -300,6 +300,7 @@ impl Borrows<'_> {
                 self.gather(base, out);
                 self.gather(index, out);
             }
+            ExprKind::Cast { expr: inner, .. } => self.gather(inner, out),
             // if の条件だけ集め、ブロックは descend で扱う。
             ExprKind::If { cond, .. } => self.gather(cond, out),
             _ => {}
@@ -416,6 +417,7 @@ impl Borrows<'_> {
                 self.descend_expr(base);
                 self.descend_expr(index);
             }
+            ExprKind::Cast { expr: inner, .. } => self.descend_expr(inner),
             _ => {}
         }
     }

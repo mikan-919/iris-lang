@@ -939,6 +939,7 @@ fn walk_expr_calls(expr: &Expr, out: &mut Vec<Span>) {
             walk_expr_calls(base, out);
             walk_expr_calls(index, out);
         }
+        ExprKind::Cast { expr: e, .. } => walk_expr_calls(e, out),
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -2114,7 +2115,63 @@ impl<'a> FnCodegen<'a> {
             }
             ExprKind::ArrayLit { elems } => self.gen_array_lit(elems, expr.span),
             ExprKind::Index { base, index } => self.gen_index(base, index, expr.span),
+            ExprKind::Cast { expr: inner, .. } => {
+                let dst = self.iris_ty(expr);
+                self.gen_cast(inner, &dst, expr.span)
+            }
         }
+    }
+
+    /// `expr as T` を生成する。被変換式を評価し、ソース/ターゲットの数値クラスと
+    /// LLVM 表現に応じて適切な変換命令を選ぶ（数値↔数値・`bool`→数値のみ。typeck が
+    /// 検証済み）。LLVM 表現が同一（`i32`→`u32` 等、符号は型に出ない）なら無変換。
+    fn gen_cast(&mut self, inner: &Expr, dst_ty: &Ty, span: Span) -> Result<String, CodegenError> {
+        // 参照は暗黙にデリファレンスして指す先の値を変換する。
+        let src_ty = self.iris_ty(inner).peel_refs().clone();
+        let (v, src_ll) = self.gen_value(inner, &src_ty)?;
+        let dst_ll = llvm_ty(dst_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        if src_ll == dst_ll {
+            return Ok(v);
+        }
+        let src_kind = num_kind(&src_ty);
+        let dst_kind = num_kind(dst_ty);
+        let r = self.fresh_tmp();
+        let instr = match (is_float_ll(&src_ll), is_float_ll(&dst_ll)) {
+            // 整数 → 整数。幅で trunc / sext / zext を選ぶ（bool は符号なし拡張）。
+            (false, false) => {
+                if int_width(&dst_ll) < int_width(&src_ll) {
+                    format!("{r} = trunc {src_ll} {v} to {dst_ll}")
+                } else if src_kind == NumKind::SInt && src_ll != "i1" {
+                    format!("{r} = sext {src_ll} {v} to {dst_ll}")
+                } else {
+                    format!("{r} = zext {src_ll} {v} to {dst_ll}")
+                }
+            }
+            // 整数 → 浮動小数。
+            (false, true) => {
+                let op = if src_kind == NumKind::UInt || src_ll == "i1" {
+                    "uitofp"
+                } else {
+                    "sitofp"
+                };
+                format!("{r} = {op} {src_ll} {v} to {dst_ll}")
+            }
+            // 浮動小数 → 整数。
+            (true, false) => {
+                let op = if dst_kind == NumKind::UInt { "fptoui" } else { "fptosi" };
+                format!("{r} = {op} {src_ll} {v} to {dst_ll}")
+            }
+            // 浮動小数 → 浮動小数。
+            (true, true) => {
+                if float_width(&dst_ll) < float_width(&src_ll) {
+                    format!("{r} = fptrunc {src_ll} {v} to {dst_ll}")
+                } else {
+                    format!("{r} = fpext {src_ll} {v} to {dst_ll}")
+                }
+            }
+        };
+        self.emit(&instr);
+        Ok(r)
     }
 
     /// 添字アクセス `base[index]` を読む。`string` は i 番目のバイトを `u8` で、固定長
@@ -3164,6 +3221,32 @@ fn num_kind(ty: &Ty) -> NumKind {
             _ => NumKind::SInt,
         },
         _ => NumKind::SInt,
+    }
+}
+
+/// LLVM の浮動小数型か（`as` 変換の命令選択用）。
+fn is_float_ll(llty: &str) -> bool {
+    llty == "float" || llty == "double"
+}
+
+/// LLVM 整数型のビット幅（`as` 変換の trunc/拡張判定用）。
+fn int_width(llty: &str) -> u32 {
+    match llty {
+        "i1" => 1,
+        "i8" => 8,
+        "i16" => 16,
+        "i32" => 32,
+        "i64" => 64,
+        _ => 0,
+    }
+}
+
+/// LLVM 浮動小数型のビット幅（`as` 変換の fptrunc/fpext 判定用）。
+fn float_width(llty: &str) -> u32 {
+    match llty {
+        "float" => 32,
+        "double" => 64,
+        _ => 0,
     }
 }
 

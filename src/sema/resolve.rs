@@ -351,6 +351,8 @@ impl Resolver {
                 self.resolve_expr(base);
                 self.resolve_expr(index);
             }
+            // `expr as Type`。型名は型検査で検証し、ここでは被変換式のみ解決する。
+            ExprKind::Cast { expr: inner, .. } => self.resolve_expr(inner),
         }
     }
 

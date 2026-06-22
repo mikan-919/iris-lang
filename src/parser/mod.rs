@@ -1117,9 +1117,28 @@ fn parse_multiplicative(input: Tokens, no_struct: bool) -> PResult<Expr> {
             (TokenKind::Slash, BinaryOp::Div),
             (TokenKind::Percent, BinaryOp::Rem),
         ],
-        parse_unary,
+        parse_cast,
         no_struct,
     )
+}
+
+/// 型変換 `expr as Type`。二項演算子より強く・単項/後置より弱く結合する
+/// （`a + b as T` は `a + (b as T)`、`-x as T` は `(-x) as T`）。左結合で連鎖も許す。
+fn parse_cast(input: Tokens, no_struct: bool) -> PResult<Expr> {
+    let (mut input, mut expr) = parse_unary(input, no_struct)?;
+    while input.peek() == &TokenKind::As {
+        let (rest, ty) = parse_type(input.take_from(1))?;
+        let span = expr.span.merge(ty.span());
+        expr = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                ty,
+            },
+            span,
+        };
+        input = rest;
+    }
+    Ok((input, expr))
 }
 
 fn parse_unary(input: Tokens, no_struct: bool) -> PResult<Expr> {

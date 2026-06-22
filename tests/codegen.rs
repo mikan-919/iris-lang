@@ -779,3 +779,39 @@ fn conditionally_moved_vec_uses_drop_flag() {
         assert_eq!(code, 0);
     }
 }
+
+#[test]
+fn emits_int_casts() {
+    // i64→i32 は trunc、u8→i32 は zext（符号なし拡張）、i32→i64 は sext。
+    let ir = emit("fn f(a: i64, b: u8, c: i32): i32 {\n    let x = a as i32\n    let y = b as i32\n    let z = c as i64\n    return x\n}");
+    assert!(ir.contains("trunc i64"));
+    assert!(ir.contains("zext i8"));
+    assert!(ir.contains("sext i32"));
+}
+
+#[test]
+fn emits_int_float_casts() {
+    // i32→f64 は sitofp、f64→i32 は fptosi、f32→f64 は fpext。
+    let ir = emit("fn f(a: i32, b: f64, c: f32): f64 {\n    let x = a as f64\n    let y = b as i32\n    let z = c as f64\n    return x\n}");
+    assert!(ir.contains("sitofp i32"));
+    assert!(ir.contains("fptosi double"));
+    assert!(ir.contains("fpext float"));
+}
+
+#[test]
+fn runs_cast_chain() {
+    // 5 as f64 = 5.0、/2.0 = 2.5、as i32 = 2 を終了コードで確認。
+    let src = "fn main(): i32 {\n    let big = 5 as f64\n    let half = big / 2.0\n    return half as i32\n}";
+    if let Some(code) = run_exit_code(src, "cast_chain") {
+        assert_eq!(code, 2);
+    }
+}
+
+#[test]
+fn runs_string_byte_cast() {
+    // s[0]（u8）を i32 へ拡張して返す（'A' = 65）。`as` 以前は u8→i32 が書けなかった。
+    let src = "fn main(): i32 {\n    let s = \"A\"\n    return s[0] as i32\n}";
+    if let Some(code) = run_exit_code(src, "cast_strbyte") {
+        assert_eq!(code, 65);
+    }
+}

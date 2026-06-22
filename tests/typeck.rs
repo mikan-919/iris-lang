@@ -350,3 +350,15 @@ fn rejects_string_index_into_i32() {
     let errs = typecheck("fn f() {\n    let s = \"hi\"\n    let b: i32 = s[0]\n}").unwrap_err();
     assert!(errs.iter().any(|m| m.contains("型が一致しません")));
 }
+
+#[test]
+fn accepts_numeric_and_bool_casts() {
+    typecheck("fn f() {\n    let a: i64 = 1\n    let b = a as i32\n    let c = 3.5 as i32\n    let d = true as i32\n}")
+        .expect("数値間・bool→数値の `as` は通る");
+}
+
+#[test]
+fn rejects_cast_to_nonnumeric() {
+    let errs = typecheck("fn f() {\n    let b = true as string\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("`as` 変換は未対応")));
+}

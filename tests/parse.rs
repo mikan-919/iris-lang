@@ -238,3 +238,16 @@ fn parses_subscript_index() {
     };
     assert!(matches!(&base.kind, ExprKind::Index { .. }));
 }
+
+#[test]
+fn parses_cast_precedence() {
+    // `a + b as i32` は `a + (b as i32)`（cast は二項より強い）。
+    let prog = parse_src("fn f() {\n    let x = a + b as i32\n}");
+    let Item::Function(func) = &prog.items[0] else { panic!() };
+    let Stmt::Let { value, .. } = &func.body.stmts[0] else { panic!() };
+    // 最上位は加算で、右辺が Cast。
+    let ExprKind::Binary { op: BinaryOp::Add, rhs, .. } = &value.kind else {
+        panic!("最上位は加算のはず: {:?}", value.kind)
+    };
+    assert!(matches!(rhs.kind, ExprKind::Cast { .. }), "右辺は cast のはず");
+}
