@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（`as` 型変換＝数値↔数値/`bool`→数値、および `RawPtr` 不透明ポインタ＋`std/os.iris`＝FILE I/O・プロセス・環境変数）。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（`std/os.iris` の NULL 安全化＝組み込み述語 `is_null` と `open`/`env` の `Option` 戻りラッパ。`as` 型変換＝数値↔数値/`bool`→数値、`RawPtr` 不透明ポインタ＋`std/os.iris`＝FILE I/O・プロセス・環境変数）。
 
 ## パイプライン
 
@@ -285,11 +285,16 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 - **不透明 C ポインタ型 `RawPtr`**: FFI 用のコンパイラ組み込みプリミティブ。LLVM では opaque ポインタ（`ptr`）で表現し、
   `string` と同様に free/drop を持たない **Copy** 型・所有グラフの辺を作らない。typeck（`BUILTIN_TYPES`・両 `is_copy`）と
   codegen（`llvm_ty` → `ptr`）に最小限で配線。std/os は `pub type File = RawPtr` と名前付けして使う（コンパイラは stdio を知らない）
-- 提供（いずれも libc を `extern` で借りる）: `type File = RawPtr`、`fopen(path, mode): File` / `fclose(f): i32` /
+- 生の extern（いずれも libc を `extern` で借りる）: `type File = RawPtr`、`fopen(path, mode): File` / `fclose(f): i32` /
   `fputs(s, f): i32` / `fgets(buf, n, f): string`（`buf` は `malloc` 確保の書き込み可能バッファ）、`exit(code): void`、`getenv(name): string`
-- 書き込み→読み戻しのファイル往復、`exit` による終了コード、`getenv` の値取得を `clang` 実行で検証（`tests/codegen.rs`）
-- **残り（NULL 安全化）**: `fopen`/`getenv` 失敗時の NULL ハンドル判定構文が無い（戻りを `Option` 化するか NULL 比較を入れる）。
-  `stdout`/`stderr` グローバル（FILE\*）の参照、`fprintf` 等の可変長引数、`File` の自動 `fclose`（Drop）は未対応
+- **NULL 安全な高水準 API（実装済み）**: `open(path, mode): Option<File>` / `env(name): Option<string>`。失敗（NULL）を `None`、
+  成功を `Some(...)` に包んで返すため、利用側は `match` で安全に分岐でき生 NULL を見ない。生の `fopen`/`getenv` より推奨
+- **組み込み述語 `is_null(p): bool`**: ポインタ裏付けの型（`RawPtr`/`string`、別名含む）が NULL かを返すコンパイラ組み込み。
+  resolve（`PRELUDE`）→ typeck（`is_rawptr_like` で引数検査・`bool` 返り）→ codegen（`icmp eq ptr %p, null`）に配線。
+  上記 `open`/`env` ラッパの土台。`null` リテラル構文は導入していない（NULL 判定はこの述語に集約）
+- 書き込み→読み戻しのファイル往復、`open` の Some/None 両経路、`exit` による終了コード、`env` の設定/未設定を `clang` 実行で検証（`tests/codegen.rs`、`tests/typeck.rs`）
+- **残り**: `fputs`/`fgets` 失敗（負値・NULL）の `Option`/`Result` 化、`stdout`/`stderr` グローバル（FILE\*）の参照、
+  `fprintf` 等の可変長引数、`File` の自動 `fclose`（Drop）は未対応
 
 ### トレイトシステム（実装済み・ADR-0004〜0009）
 
@@ -359,6 +364,7 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 - **`string` は Copy**: 不変な NUL 終端ポインタで free/drop を持たない（concat の結果はリーク）ため Copy 型として扱う（ムーブしない）。Rust の `&str` 相当。spec に所有権上の規定は無いため暫定。将来 free/所有を導入する場合は再検討が必要。
 - **添字 `s[i]` はバイト**: 文字列の索引は UTF-8 バイト列の i バイト目を `u8` で返す（`char` リテラル・codegen 未整備のため）。マルチバイト境界・`char` 単位の索引は未対応。`u8`→`i32` の暗黙幅変換は無いが、`as` 型変換が実装されたため `println_int(s[i] as i32)` のように明示変換して書ける。
 - **`as` 型変換の構文・範囲**: spec に型変換の記述が無いため Rust に倣い `expr as Type` を採用。`as` を予約語化し、優先順位は二項演算子より強く・単項/後置より弱い（`a + b as T` = `a + (b as T)`、`-x as T` = `(-x) as T`）。左結合で `x as A as B` も可。変換は当面 **数値↔数値・`bool`→数値**に限定（ポインタ・参照・`string`・enum/struct・別名への変換は未対応）。`bool`→整数は符号なし拡張（`zext`、0/1）。浮動小数→整数はゼロ方向丸め（`fptosi`/`fptoui`）。
+- **NULL 判定は述語 `is_null` に集約**: ポインタ NULL の検出に `null` リテラル＋ポインタ比較ではなく、組み込み述語 `is_null(p): bool` を採用した（spec に NULL 規定が無いため暫定）。生ポインタを言語表層へ出さない self-contained 志向に沿い、FFI の NULL は std ラッパ（`open`/`env`）が `Option` に変換して隠す。`null` リテラル・ポインタ算術・任意ポインタ比較は導入していない。
 - **`malloc` の引数幅**: prelude では `extern fn malloc(n: i32)` と宣言し、`Vec` リテラルの確保も i32 引数で呼ぶ（`as` 変換が無く concat の長さが i32 のため）。x86-64 では i32 引数が rdi へゼロ拡張されるため libc の `size_t`（i64）と ABI 互換。他ターゲットへ移す際は要再検討。
 - **Drop/free の第一スライス範囲**: 解放対象は **`Vec<T>` ローカルのみ**（`string` は ADR で Copy・leak 許容、`Box` は codegen 未整備のため対象外）。条件付き move は **動的 drop flag**（Rust 準拠）で解決し、**解放位置はスコープ末＝関数末**（最後の使用での即時解放や、ループ本体・ネストブロック単位の早期解放は未実装）。move 検出は codegen が「裸の Vec 識別子の値消費」を消費地点ごとに記録する方式（所有権チェッカ flow.rs は不変＝use-after-move は従来どおり静的に拒否し、drop flag は解放責務の追跡のみ）。`free` は libc を直接 `declare`（prelude には出さない）。健全（二重解放・use-after-free 無し）だが、ループ内 Vec・Vec 引数・struct フィールドの Vec は現状リークを許容する。
 

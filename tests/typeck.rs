@@ -362,3 +362,19 @@ fn rejects_cast_to_nonnumeric() {
     let errs = typecheck("fn f() {\n    let b = true as string\n}").unwrap_err();
     assert!(errs.iter().any(|m| m.contains("`as` 変換は未対応")));
 }
+
+#[test]
+fn accepts_is_null_on_pointer_types() {
+    // is_null は RawPtr と string（どちらもポインタ裏付け）に使え、bool を返す。
+    typecheck(
+        "extern fn h(): RawPtr\nextern fn s(): string\nfn f(): bool {\n    is_null(h()) && is_null(s())\n}",
+    )
+    .expect("RawPtr/string への is_null は通るはず");
+}
+
+#[test]
+fn rejects_is_null_on_non_pointer() {
+    // 数値などポインタでない型への is_null は拒否する。
+    let errs = typecheck("fn f(): bool {\n    is_null(5)\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("is_null")), "got: {errs:?}");
+}

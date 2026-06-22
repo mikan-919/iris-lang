@@ -1221,6 +1221,25 @@ impl<'a> Checker<'a> {
         {
             // ユーザー定義 enum バリアント（ペイロードあり。ジェネリック含む）。
             if self.res.defs[id].kind == DefKind::Builtin {
+                // 組み込み述語 `is_null(p)`: ポインタ型（`RawPtr`/`string`）が NULL かを返す。
+                // FFI で NULL を返す C 関数（fopen/getenv 等）を Option へ包む土台。
+                if name == "is_null" {
+                    if args.len() != 1 {
+                        self.error(
+                            call_span,
+                            format!("`is_null` の引数は 1 個ですが {} 個渡されました", args.len()),
+                        );
+                    } else if !self.is_rawptr_like(arg_tys[0].peel_refs()) {
+                        self.error(
+                            args[0].span,
+                            format!(
+                                "`is_null` はポインタ型（`RawPtr`/`string`）に使えますが `{}` でした",
+                                arg_tys[0].describe()
+                            ),
+                        );
+                    }
+                    return Ty::named("bool");
+                }
                 if let Some((enum_name, tag, payload_ty, generics)) = self.variant_owners.get(name).cloned() {
                     // ジェネリック enum はペイロード引数から型パラメータを推論する。
                     let gset: HashSet<&str> = generics.iter().map(|s| s.as_str()).collect();
@@ -2034,6 +2053,18 @@ impl<'a> Checker<'a> {
         match self.types.get(name)? {
             TyDef::Alias(t) => Some(t),
             _ => None,
+        }
+    }
+
+    /// ポインタ裏付けの型か（`RawPtr` か `string`、別名は元をたどる）。`is_null` の引数判定に使う。
+    fn is_rawptr_like(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Named { name, args } if args.is_empty() => {
+                name == "RawPtr"
+                    || name == "string"
+                    || self.alias_target(name).is_some_and(|t| self.is_rawptr_like(t))
+            }
+            _ => false,
         }
     }
 

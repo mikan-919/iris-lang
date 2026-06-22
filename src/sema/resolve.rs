@@ -29,7 +29,7 @@ pub enum DefKind {
 
 /// プレリュードとして常に利用できる組み込みの値名。
 /// Result/Option のコンストラクタ。型定義の実装後に整理する。
-const PRELUDE: &[&str] = &["Ok", "Err", "Some", "None"];
+const PRELUDE: &[&str] = &["Ok", "Err", "Some", "None", "is_null"];
 
 /// 名前の定義 1 件。
 #[derive(Debug, Clone)]

@@ -2,16 +2,25 @@
 // prelude と違い自動前置されない。`use std.os.*` などで明示的に取り込んで使う。
 //
 // 現状の codegen 対応範囲（i32 / string / RawPtr）で記述する。失敗を表す NULL
-// ハンドル（fopen の戻り等）を判定する構文がまだ無いため、当面は呼び出し側で
-// 注意して扱う（NULL 安全化は Option 戻り値の導入後に対応する）。
+// ハンドルは組み込み述語 `is_null(p)` で判定し、安全な API では `Option` に包んで返す。
+// 利用側は生の `extern fn`（fopen/getenv）より `open` / `env` を使うことを推奨する。
 
 // 不透明な FILE ハンドル（libc の `FILE*`）。中身は触らずポインタとして持ち回す。
 // `RawPtr` は free/drop を持たない Copy なポインタ型（FFI 用のコンパイラ組み込み）。
 pub type File = RawPtr
 
-// ファイルを開く。`mode` は libc fopen と同じ（"r" / "w" / "a" / "rb" 等）。
-// 失敗時は NULL ハンドルを返す。
+// ファイルを開く（生）。`mode` は libc fopen と同じ（"r" / "w" / "a" / "rb" 等）。
+// 失敗時は NULL ハンドルを返す。NULL 安全な `open` の利用を推奨する。
 pub extern fn fopen(path: string, mode: string): File
+
+// ファイルを開く（安全版）。成功なら `Some(File)`、失敗（NULL）なら `None`。
+pub fn open(path: string, mode: string): Option<File> {
+    let h = fopen(path, mode)
+    if is_null(h) {
+        return None
+    }
+    Some(h)
+}
 
 // 開いているファイルを閉じる。成功で 0。
 pub extern fn fclose(f: File): i32
@@ -27,5 +36,14 @@ pub extern fn fgets(buf: string, n: i32, f: File): string
 // プロセスを終了コード `code` で終了する（戻らない）。
 pub extern fn exit(code: i32): void
 
-// 環境変数 `name` の値を返す。未設定なら NULL。
+// 環境変数 `name` の値を返す（生）。未設定なら NULL。NULL 安全な `env` の利用を推奨する。
 pub extern fn getenv(name: string): string
+
+// 環境変数 `name` の値を返す（安全版）。設定済みなら `Some(value)`、未設定なら `None`。
+pub fn env(name: string): Option<string> {
+    let v = getenv(name)
+    if is_null(v) {
+        return None
+    }
+    Some(v)
+}

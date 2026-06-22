@@ -841,3 +841,62 @@ fn runs_os_exit() {
         assert_eq!(code, 7);
     }
 }
+
+#[test]
+fn emits_is_null_as_icmp() {
+    // 組み込み述語 is_null(p) は NULL ポインタとの icmp に落ちる。
+    let ir = emit(
+        "use std.os.*\nfn main(): i32 {\n    let f = fopen(\"x\", \"r\")\n    return is_null(f) ? 1 : 0\n}",
+    );
+    assert!(ir.contains("icmp eq ptr"), "is_null は icmp eq ptr ..., null を出すはず\n{ir}");
+    assert!(ir.contains(", null"));
+}
+
+#[test]
+fn runs_os_open_none_for_missing_file() {
+    // 存在しないファイルを open すると None。match None 経路で 7 を返す。
+    let src = "use std.os.*\nfn main(): i32 {\n    match open(\"/nonexistent/iris/xyz\", \"r\") {\n        Some(f) -> fclose(f) + 1\n        None -> 7\n    }\n}";
+    if let Some(code) = run_exit_code(src, "os_open_none") {
+        assert_eq!(code, 7);
+    }
+}
+
+#[test]
+fn runs_os_open_some_for_existing_file() {
+    // 実在ファイルを open すると Some(File)。Some 経路で fclose(0)+1 = 1 を返す。
+    let path = std::env::temp_dir().join("iris_os_open_some.txt");
+    std::fs::write(&path, "x").unwrap();
+    let src = format!(
+        "use std.os.*\nfn main(): i32 {{\n    match open(\"{}\", \"r\") {{\n        Some(f) -> fclose(f) + 1\n        None -> 0\n    }}\n}}",
+        path.display()
+    );
+    if let Some(code) = run_exit_code(&src, "os_open_some") {
+        assert_eq!(code, 1);
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn runs_os_env_some_and_none() {
+    // env(name) は設定済みなら Some(value)、未設定なら None。
+    // 設定時は値の先頭バイト（'A'=65）を、未設定時は 7 を返す。
+    if !clang_available() {
+        return;
+    }
+    let src = "use std.os.*\nfn main(): i32 {\n    match env(\"IRIS_ENV_TEST\") {\n        Some(v) -> v[0] as i32\n        None -> 7\n    }\n}";
+    let ir = emit(src);
+    let dir = std::env::temp_dir();
+    let ll = dir.join("iris_cg_os_env.ll");
+    let exe = dir.join("iris_cg_os_env.bin");
+    std::fs::write(&ll, ir).unwrap();
+    let ok = Command::new("clang").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
+    assert!(ok.status.success(), "clang 失敗:\n{}", String::from_utf8_lossy(&ok.stderr));
+    // 未設定 → 7。
+    let none = Command::new(&exe).env_remove("IRIS_ENV_TEST").status().expect("実行");
+    assert_eq!(none.code(), Some(7));
+    // 設定 → 'A' = 65。
+    let some = Command::new(&exe).env("IRIS_ENV_TEST", "ABC").status().expect("実行");
+    assert_eq!(some.code(), Some(65));
+    let _ = std::fs::remove_file(&ll);
+    let _ = std::fs::remove_file(&exe);
+}

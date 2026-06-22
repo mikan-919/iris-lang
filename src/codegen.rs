@@ -2696,6 +2696,21 @@ impl<'a> FnCodegen<'a> {
         let ExprKind::Ident(name) = &callee.kind else {
             return Err(CodegenError::new(span, "この呼び出しはコード生成に未対応です"));
         };
+        // 組み込み述語 `is_null(p)`: ポインタを NULL と比較して i1 を返す。
+        if name == "is_null" {
+            let a = &args[0];
+            let aty = self.iris_ty(a).peel_refs().clone();
+            let (v, llty) = self.gen_value(a, &aty)?;
+            if llty != "ptr" {
+                return Err(CodegenError::new(
+                    span,
+                    format!("`is_null` はポインタ型に使えますが `{llty}` でした"),
+                ));
+            }
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = icmp eq ptr {v}, null"));
+            return Ok(r);
+        }
         // 関数のシグネチャから引数型・戻り値型を引く。
         let func = self
             .find_function(name)
