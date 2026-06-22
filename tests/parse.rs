@@ -192,3 +192,23 @@ fn parses_match_range_and_guard_arms() {
         Some(ExprKind::Binary { op: BinaryOp::Gt, .. })
     ));
 }
+
+#[test]
+fn parses_array_literal_multiline_and_trailing_comma() {
+    // 配列リテラルは改行・カンマ区切り、末尾カンマ、空リストを許す。
+    let prog = parse_src("fn f() {\n    let a = [1, 2, 3,]\n    let b = [\n        10\n        20\n    ]\n    let c = []\n}");
+    let Item::Function(func) = &prog.items[0] else {
+        panic!("関数のはず");
+    };
+    let mut arrays = 0;
+    for stmt in &func.body.stmts {
+        if let Stmt::Let { value, .. } = stmt
+            && let ExprKind::ArrayLit { elems } = &value.kind
+        {
+            arrays += 1;
+            // 1 つ目は 3 要素、2 つ目は 2 要素、3 つ目は空。
+            assert!(elems.len() == 3 || elems.len() == 2 || elems.is_empty());
+        }
+    }
+    assert_eq!(arrays, 3);
+}

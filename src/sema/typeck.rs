@@ -517,12 +517,17 @@ impl<'a> Checker<'a> {
                                 ),
                             );
                         }
-                        // 注釈型から enum 構築の未確定型引数を埋める。
+                        // 注釈型から enum 構築・配列リテラルの未確定型を埋める。
                         self.refine_construction(value, &expected);
+                        self.finalize_array_lit(value, &expected);
                         expected
                     }
                     // 注釈なしはリテラルを既定型へ確定する。
-                    None => value_ty.defaulted(),
+                    None => {
+                        let d = value_ty.defaulted();
+                        self.finalize_array_lit(value, &d);
+                        d
+                    }
                 };
                 if let Some(&id) = self.def_spans.get(span) {
                     self.def_types[id] = bind_ty;
@@ -543,8 +548,9 @@ impl<'a> Checker<'a> {
                                 ),
                             );
                         }
-                        // 戻り型から enum 構築の未確定型引数を埋める（集約レイアウト整合）。
+                        // 戻り型から enum 構築・配列リテラルの未確定型を埋める。
                         self.refine_construction(v, &ret);
+                        self.finalize_array_lit(v, &ret);
                     }
                     None => {
                         if !self.assignable(&ret, &Ty::unit()) {
@@ -671,9 +677,12 @@ impl<'a> Checker<'a> {
                 span,
                 ..
             } => {
-                // イテレータ式の型から `Iterator<T>` 実装を探し、要素型 T を取り出す。
+                // 配列リテラルを直接反復する場合は既定（`T[]`）へ確定しておく。
                 let iter_ty = self.check_expr(iter);
-                let elem = self.iterator_elem(&iter_ty, *span);
+                self.finalize_array_lit(iter, &iter_ty.clone().defaulted());
+                let iter_ty = self.expr_types.get(&iter.span).cloned().unwrap_or(iter_ty);
+                // 配列 `T[]` / `Vec<T>` は要素を直接反復する。それ以外は `Iterator<T>` 実装を探す。
+                let elem = self.sequence_elem(&iter_ty, *span);
                 if let Some(&id) = self.def_spans.get(var_span) {
                     self.def_types[id] = elem.clone();
                 }
@@ -800,6 +809,79 @@ impl<'a> Checker<'a> {
                 Ty::Infer
             }
             ExprKind::Match { scrutinee, arms } => self.infer_match(scrutinee, arms, expr.span),
+            ExprKind::ArrayLit { elems } => self.infer_array_lit(elems),
+        }
+    }
+
+    /// 配列リテラル `[e1, e2, ...]` を型付けする。全要素を共通要素型へ `join` し、
+    /// 未確定の配列リテラル型 `ArrayLit(elem)` を返す（`T[]`/`Vec<T>` への確定は
+    /// 注釈に応じて [`Self::finalize_array_lit`] が行う）。
+    fn infer_array_lit(&mut self, elems: &[Expr]) -> Ty {
+        let mut elem: Option<Ty> = None;
+        for e in elems {
+            let et = self.check_expr(e);
+            elem = Some(match elem {
+                None => et,
+                Some(prev) => self.join(&prev, &et).unwrap_or_else(|| {
+                    self.error(
+                        e.span,
+                        format!(
+                            "配列要素の型が一致しません: `{}` と `{}`",
+                            prev.describe(),
+                            et.describe()
+                        ),
+                    );
+                    Ty::Error
+                }),
+            });
+        }
+        Ty::ArrayLit(Box::new(elem.unwrap_or(Ty::Infer)))
+    }
+
+    /// 配列リテラル式の型を、期待型（`T[]` または `Vec<T>`）に合わせて確定し、
+    /// `expr_types` に記録し直す。要素のリテラル型も要素型へ確定する（codegen が
+    /// 要素の幅を決められるように）。注釈が配列・Vec でなければ既定の `T[]` に確定する。
+    fn finalize_array_lit(&mut self, expr: &Expr, target: &Ty) {
+        let ExprKind::ArrayLit { elems } = &expr.kind else {
+            return;
+        };
+        // 期待型から要素型と Vec か否かを取り出す。
+        let (is_vec, elem_target) = match target.peel_refs() {
+            Ty::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                (true, Some(args[0].clone()))
+            }
+            Ty::Array(e) => (false, Some((**e).clone())),
+            _ => (false, None),
+        };
+        // 現在記録されている要素型（未確定でありうる）。
+        let cur_elem = match self.expr_types.get(&expr.span) {
+            Some(Ty::ArrayLit(e)) | Some(Ty::Array(e)) => Some((**e).clone()),
+            Some(Ty::Named { name, args }) if name == "Vec" && args.len() == 1 => {
+                Some(args[0].clone())
+            }
+            _ => None,
+        };
+        let vague = |t: &Ty| matches!(t, Ty::Infer | Ty::IntLit | Ty::FloatLit);
+        let melem = match (elem_target, cur_elem) {
+            (Some(t), Some(c)) => if vague(&c) && !vague(&t) { t } else { c },
+            (Some(t), None) => t,
+            (None, Some(c)) => c.defaulted(),
+            (None, None) => Ty::Infer,
+        };
+        let resolved = if is_vec {
+            Ty::Named { name: "Vec".to_string(), args: vec![melem.clone()] }
+        } else {
+            Ty::Array(Box::new(melem.clone()))
+        };
+        self.expr_types.insert(expr.span, resolved);
+        // 要素の未確定リテラル型を要素型へ確定し、入れ子の配列リテラルも辿る。
+        for e in elems {
+            if !vague(&melem)
+                && matches!(self.expr_types.get(&e.span), Some(t) if vague(t))
+            {
+                self.expr_types.insert(e.span, melem.clone());
+            }
+            self.finalize_array_lit(e, &melem);
         }
     }
 
@@ -1414,6 +1496,34 @@ impl<'a> Checker<'a> {
         })
     }
 
+    /// `for x in coll` の対象型から要素型を求める。配列 `T[]` / `Vec<T>` は要素 `T` を
+    /// 直接取り出す（当面は要素が Copy 型のときのみ。借用反復・値束縛）。それ以外は
+    /// `Iterator<T>` 実装を探す（[`Self::iterator_elem`]）。
+    fn sequence_elem(&mut self, coll_ty: &Ty, span: Span) -> Ty {
+        let elem = match coll_ty.peel_refs() {
+            Ty::Array(e) | Ty::ArrayLit(e) => Some((**e).clone().defaulted()),
+            Ty::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                Some(args[0].clone().defaulted())
+            }
+            _ => None,
+        };
+        match elem {
+            Some(e) => {
+                if !matches!(e, Ty::Infer | Ty::Error) && !is_copy_ty(&e) {
+                    self.error(
+                        span,
+                        format!(
+                            "`for ... in` は Copy 型の要素のみ反復できます（要素型 `{}` は Copy ではありません）",
+                            e.describe()
+                        ),
+                    );
+                }
+                e
+            }
+            None => self.iterator_elem(coll_ty, span),
+        }
+    }
+
     /// `for x in it` の対象型から、実装する `Iterator<T>` の要素型 T を求める（ADR-0007）。
     /// `Iterator` を実装していなければエラーを記録し `Ty::Error` を返す。複数の `Iterator`
     /// 実装（`Iterator<i32>`/`Iterator<string>` 同居）は当面曖昧エラー（`for x#T in` 未実装）。
@@ -1925,6 +2035,13 @@ impl<'a> Checker<'a> {
                 (!*m1 || *m2) && self.assignable(i1, i2)
             }
             (Array(i1), Array(i2)) => self.assignable(i1, i2),
+            // 配列リテラルは固定長配列・Vec のどちらの注釈にも適合する（型指向）。
+            (Array(i1), ArrayLit(i2)) | (ArrayLit(i1), Array(i2)) | (ArrayLit(i1), ArrayLit(i2)) => {
+                self.assignable(i1, i2)
+            }
+            (Named { name, args }, ArrayLit(i2)) if name == "Vec" && args.len() == 1 => {
+                self.assignable(&args[0], i2)
+            }
             (Tuple(e1), Tuple(e2)) => {
                 e1.len() == e2.len() && e1.iter().zip(e2).all(|(x, y)| self.assignable(x, y))
             }
@@ -1983,8 +2100,26 @@ fn subst(ty: &Ty, map: &HashMap<String, Ty>) -> Ty {
             inner: Box::new(subst(inner, map)),
         },
         Ty::Array(i) => Ty::Array(Box::new(subst(i, map))),
+        Ty::ArrayLit(i) => Ty::ArrayLit(Box::new(subst(i, map))),
         Ty::Tuple(es) => Ty::Tuple(es.iter().map(|e| subst(e, map)).collect()),
         other => other.clone(),
+    }
+}
+
+/// 型が Copy（ムーブせずコピー）か（`for ... in` の要素束縛の制限に使う）。
+/// 数値・bool・char・不変参照・要素が全て Copy のタプルが Copy。未確定/不明は Copy 扱い。
+fn is_copy_ty(ty: &Ty) -> bool {
+    match ty {
+        Ty::IntLit | Ty::FloatLit | Ty::Infer | Ty::Error => true,
+        Ty::Ref { mutable, .. } => !*mutable,
+        Ty::Tuple(elems) => elems.iter().all(is_copy_ty),
+        Ty::Named { name, args } if args.is_empty() => {
+            INT_TYPES.contains(&name.as_str())
+                || FLOAT_TYPES.contains(&name.as_str())
+                || name == "bool"
+                || name == "char"
+        }
+        _ => false,
     }
 }
 
@@ -2005,7 +2140,14 @@ fn unify(param: &Ty, arg: &Ty, gset: &HashSet<&str>, out: &mut HashMap<String, T
         (Ty::Ref { inner: pi, .. }, Ty::Ref { inner: ai, .. }) => unify(pi, ai, gset, out),
         // 暗黙デリファレンス: `&T` 引数を値パラメータへ。
         (Ty::Named { .. }, Ty::Ref { inner: ai, .. }) => unify(param, ai, gset, out),
-        (Ty::Array(p), Ty::Array(a)) => unify(p, a, gset, out),
+        (Ty::Array(p), Ty::Array(a))
+        | (Ty::Array(p), Ty::ArrayLit(a))
+        | (Ty::ArrayLit(p), Ty::Array(a))
+        | (Ty::ArrayLit(p), Ty::ArrayLit(a)) => unify(p, a, gset, out),
+        // Vec<T> パラメータへ配列リテラル引数: 要素型を突き合わせる。
+        (Ty::Named { name, args }, Ty::ArrayLit(a)) if name == "Vec" && args.len() == 1 => {
+            unify(&args[0], a, gset, out)
+        }
         (Ty::Tuple(ps), Ty::Tuple(es)) if ps.len() == es.len() => {
             for (p, a) in ps.iter().zip(es) {
                 unify(p, a, gset, out);

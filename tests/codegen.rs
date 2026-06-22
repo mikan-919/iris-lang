@@ -63,8 +63,9 @@ fn emits_short_circuit_for_logical_and() {
 
 #[test]
 fn unsupported_type_is_reported() {
-    // ジェネリック型（Vec など）はまだコード生成に未対応。
-    let err = iris_lang::compile_ir("test", "fn f(v: Vec<i32>): i32 {\n    return 0\n}");
+    // 一部のジェネリック組み込み型（Map など）はまだコード生成に未対応。
+    // （Vec<T> / 配列 T[] は対応済み。下の array_* テストを参照）
+    let err = iris_lang::compile_ir("test", "fn f(v: Map<i32, i32>): i32 {\n    return 0\n}");
     assert!(err.is_err());
 }
 
@@ -618,5 +619,50 @@ fn runs_option_of_generic_struct() {
     let src = "type Pair<T> = struct {\n    a: T\n    b: T\n}\nfn first(o: Option<Pair<i32>>): i32 {\n    match o {\n        Some(p) -> p.a + p.b\n        None -> 0\n    }\n}\nfn main(): i32 {\n    let o = Some(Pair { a: 8, b: 9 })\n    return first(o)\n}";
     if let Some(code) = run_exit_code(src, "opt_gstruct") {
         assert_eq!(code, 17);
+    }
+}
+
+#[test]
+fn emits_array_and_vec_types() {
+    // 配列・Vec を使うと名前付き型と malloc 宣言が出る。
+    let ir = emit("fn main(): i32 {\n    let a: i32[] = [1, 2]\n    let v: Vec<i32> = [3]\n    return 0\n}");
+    assert!(ir.contains("%Array = type { ptr, i64 }"));
+    assert!(ir.contains("%Vec = type { ptr, i64, i64 }"));
+    assert!(ir.contains("declare ptr @malloc(i64)"));
+}
+
+#[test]
+fn runs_fixed_array_for_sum() {
+    // 固定長配列 `T[]` の for 反復で要素を合計する。
+    let src = "fn main(): i32 {\n    let a: i32[] = [10, 20, 30]\n    let mut s = 0\n    for x in a {\n        s = s + x\n    }\n    return s\n}";
+    if let Some(code) = run_exit_code(src, "array_for") {
+        assert_eq!(code, 60);
+    }
+}
+
+#[test]
+fn runs_vec_for_sum() {
+    // 動的配列 `Vec<T>` の for 反復（ヒープ確保 + コピー）。
+    let src = "fn main(): i32 {\n    let v: Vec<i32> = [1, 2, 3, 4]\n    let mut s = 0\n    for y in v {\n        s = s + y\n    }\n    return s\n}";
+    if let Some(code) = run_exit_code(src, "vec_for") {
+        assert_eq!(code, 10);
+    }
+}
+
+#[test]
+fn runs_array_literal_for_with_break_continue() {
+    // 配列リテラルを直接反復し、break / continue が効く。
+    let src = "fn main(): i32 {\n    let mut t = 0\n    for x in [1, 2, 3, 4, 5] {\n        if x == 4 {\n            break\n        }\n        if x == 2 {\n            continue\n        }\n        t = t + x\n    }\n    return t\n}";
+    if let Some(code) = run_exit_code(src, "array_lit_for") {
+        assert_eq!(code, 4);
+    }
+}
+
+#[test]
+fn array_is_borrowed_not_consumed_by_for() {
+    // for 反復はコレクションを借用するだけ（消費しない）。2 回反復できる。
+    let src = "fn main(): i32 {\n    let a: i32[] = [1, 2, 3]\n    let mut s = 0\n    for x in a {\n        s = s + x\n    }\n    for y in a {\n        s = s + y\n    }\n    return s\n}";
+    if let Some(code) = run_exit_code(src, "array_reuse") {
+        assert_eq!(code, 12);
     }
 }

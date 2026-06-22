@@ -562,6 +562,47 @@ pub fn emit_module(
         module.push('\n');
     }
 
+    // 配列 `T[]` / 動的配列 `Vec<T>` の名前付き型を、使われている場合だけ宣言する。
+    // `%Array = { データポインタ, 長さ }`（スタック裏付け）、
+    // `%Vec = { データポインタ, 長さ, 容量 }`（ヒープ。`malloc` で確保）。
+    let mut need_array = false;
+    let mut need_vec = false;
+    for ty in type_info.expr_types.values() {
+        scan_seq_types(ty, &mut need_array, &mut need_vec);
+    }
+    for item in &program.items {
+        let mut sigs: Vec<&Function> = Vec::new();
+        match item {
+            Item::Function(f) => sigs.push(f),
+            Item::Impl(im) => sigs.extend(im.methods.iter()),
+            _ => {}
+        }
+        for f in sigs {
+            for p in &f.params {
+                scan_seq_types(&Ty::from_ast(&p.ty), &mut need_array, &mut need_vec);
+            }
+            if let Some(r) = &f.ret {
+                scan_seq_types(&Ty::from_ast(r), &mut need_array, &mut need_vec);
+            }
+        }
+    }
+    if need_array {
+        let _ = writeln!(module, "%Array = type {{ ptr, i64 }}");
+    }
+    if need_vec {
+        let _ = writeln!(module, "%Vec = type {{ ptr, i64, i64 }}");
+        // `malloc` がユーザ extern で宣言されていなければここで declare を出す。
+        let has_malloc = program.items.iter().any(|it| {
+            matches!(it, Item::Function(f) if f.name == "malloc")
+        });
+        if !has_malloc {
+            let _ = writeln!(module, "declare ptr @malloc(i64)");
+        }
+    }
+    if need_array || need_vec {
+        module.push('\n');
+    }
+
     // 文字列リテラルのグローバル定数はここに集め、関数生成後に末尾へ出力する。
     let strings = RefCell::new(StringPool::default());
 
@@ -860,6 +901,11 @@ fn walk_expr_calls(expr: &Expr, out: &mut Vec<Span>) {
                 walk_expr_calls(&arm.body, out);
             }
         }
+        ExprKind::ArrayLit { elems } => {
+            for e in elems {
+                walk_expr_calls(e, out);
+            }
+        }
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -887,6 +933,31 @@ fn mono_symbol(name: &str, args: &[Ty]) -> String {
         s.push_str(&mangle_ty(a));
     }
     s
+}
+
+/// 型から固定長配列 `T[]` / 動的配列 `Vec<T>` の使用を検出する（型宣言の発行判定）。
+fn scan_seq_types(ty: &Ty, need_array: &mut bool, need_vec: &mut bool) {
+    match ty {
+        Ty::Array(e) | Ty::ArrayLit(e) => {
+            *need_array = true;
+            scan_seq_types(e, need_array, need_vec);
+        }
+        Ty::Named { name, args } => {
+            if name == "Vec" && args.len() == 1 {
+                *need_vec = true;
+            }
+            for a in args {
+                scan_seq_types(a, need_array, need_vec);
+            }
+        }
+        Ty::Ref { inner, .. } => scan_seq_types(inner, need_array, need_vec),
+        Ty::Tuple(es) => {
+            for e in es {
+                scan_seq_types(e, need_array, need_vec);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 集約 enum インスタンスの記憶域フィールドの LLVM 型を返す（zeroinitializer 用）。
@@ -1297,6 +1368,12 @@ impl<'a> FnCodegen<'a> {
         body: &Block,
     ) -> Result<(), CodegenError> {
         let recv_ty = self.raw_ty(iter).defaulted();
+        // 配列 `T[]` / `Vec<T>` は要素を直接インデックスループで反復する。
+        if matches!(recv_ty.peel_refs(), Ty::Array(_) | Ty::ArrayLit(_))
+            || matches!(recv_ty.peel_refs(), Ty::Named { name, args } if name == "Vec" && args.len() == 1)
+        {
+            return self.gen_for_in_seq(var_span, iter, body, &recv_ty);
+        }
         let ty_name = struct_name_of(&recv_ty).ok_or_else(|| {
             CodegenError::new(iter.span, "`for ... in` の対象が型を持ちません")
         })?;
@@ -1381,6 +1458,88 @@ impl<'a> FnCodegen<'a> {
         if !self.terminated {
             self.emit(&format!("br label %{head_l}"));
         }
+
+        self.emit_label(&end_l);
+        Ok(())
+    }
+
+    /// 配列 `T[]` / `Vec<T>` の `for x in coll` を生成する。コレクション値（fat pointer /
+    /// {ptr,len,cap}）を借用として一度だけ評価し、データポインタと長さを取り出して
+    /// `0..len` のインデックスループで各要素を `x` へ load する（要素は Copy 限定）。
+    fn gen_for_in_seq(
+        &mut self,
+        var_span: &Span,
+        iter: &Expr,
+        body: &Block,
+        coll_ty: &Ty,
+    ) -> Result<(), CodegenError> {
+        let peeled = coll_ty.peel_refs().clone();
+        let (is_vec, elem_ty) = match &peeled {
+            Ty::Named { name, args } if name == "Vec" && args.len() == 1 => (true, args[0].clone()),
+            Ty::Array(e) | Ty::ArrayLit(e) => (false, (**e).clone()),
+            _ => {
+                return Err(CodegenError::new(iter.span, "`for ... in` の対象が配列ではありません"));
+            }
+        };
+        let elem_ty = elem_ty.defaulted();
+        let elem_llty = llvm_ty(&elem_ty, self.structs).map_err(|m| CodegenError::new(iter.span, m))?;
+        let coll_llty = if is_vec { "%Vec" } else { "%Array" };
+
+        // コレクションを借用として評価し、データポインタと長さを取り出す。
+        let (cv, _) = self.gen_value(iter, &peeled)?;
+        let dataptr = self.fresh_tmp();
+        self.emit(&format!("{dataptr} = extractvalue {coll_llty} {cv}, 0"));
+        let len = self.fresh_tmp();
+        self.emit(&format!("{len} = extractvalue {coll_llty} {cv}, 1"));
+
+        // インデックスカウンタとループ変数のスロット。
+        let idx_slot = self.fresh_tmp();
+        self.emit(&format!("{idx_slot} = alloca i64"));
+        self.emit(&format!("store i64 0, ptr {idx_slot}"));
+        let id = self.def_spans.get(var_span).copied().ok_or_else(|| {
+            CodegenError::new(*var_span, "ループ変数の定義が見つかりません")
+        })?;
+        let var_slot = format!("%v.slot{id}");
+        self.emit(&format!("{var_slot} = alloca {elem_llty}"));
+        self.locals.insert(id, (var_slot.clone(), elem_llty.clone()));
+
+        let cond_l = self.fresh_label("forin.cond");
+        let body_l = self.fresh_label("forin.body");
+        let step_l = self.fresh_label("forin.step");
+        let end_l = self.fresh_label("forin.end");
+
+        self.emit(&format!("br label %{cond_l}"));
+        self.emit_label(&cond_l);
+        let i = self.fresh_tmp();
+        self.emit(&format!("{i} = load i64, ptr {idx_slot}"));
+        let c = self.fresh_tmp();
+        self.emit(&format!("{c} = icmp ult i64 {i}, {len}"));
+        self.emit(&format!("br i1 {c}, label %{body_l}, label %{end_l}"));
+
+        self.emit_label(&body_l);
+        // x = dataptr[i]
+        let i_b = self.fresh_tmp();
+        self.emit(&format!("{i_b} = load i64, ptr {idx_slot}"));
+        let ep = self.fresh_tmp();
+        self.emit(&format!("{ep} = getelementptr {elem_llty}, ptr {dataptr}, i64 {i_b}"));
+        let x = self.fresh_tmp();
+        self.emit(&format!("{x} = load {elem_llty}, ptr {ep}"));
+        self.emit(&format!("store {elem_llty} {x}, ptr {var_slot}"));
+        // continue は増分へ、break は末尾へ。
+        self.loops.push((step_l.clone(), end_l.clone()));
+        self.gen_block(body)?;
+        self.loops.pop();
+        if !self.terminated {
+            self.emit(&format!("br label %{step_l}"));
+        }
+
+        self.emit_label(&step_l);
+        let i_s = self.fresh_tmp();
+        self.emit(&format!("{i_s} = load i64, ptr {idx_slot}"));
+        let nxt = self.fresh_tmp();
+        self.emit(&format!("{nxt} = add i64 {i_s}, 1"));
+        self.emit(&format!("store i64 {nxt}, ptr {idx_slot}"));
+        self.emit(&format!("br label %{cond_l}"));
 
         self.emit_label(&end_l);
         Ok(())
@@ -1890,6 +2049,79 @@ impl<'a> FnCodegen<'a> {
             ExprKind::Match { scrutinee, arms } => {
                 self.gen_match(scrutinee, arms, expr.span)
             }
+            ExprKind::ArrayLit { elems } => self.gen_array_lit(elems, expr.span),
+        }
+    }
+
+    /// 配列リテラル `[e1, e2, ...]` を生成する。typeck が確定した型（`T[]` か `Vec<T>`）で
+    /// 表現を決める。`T[]` はスタックに `[N x T]` を確保した fat pointer `%Array { ptr, len }`、
+    /// `Vec<T>` は `malloc` で確保したバッファへコピーした `%Vec { ptr, len, cap }`。
+    fn gen_array_lit(&mut self, elems: &[Expr], span: Span) -> Result<String, CodegenError> {
+        // typeck が記録した確定型（単相化中なら型引数を置換）。
+        let ty = subst_ty(&self.types.get(&span).cloned().unwrap_or(Ty::Infer), self.type_subst)
+            .defaulted();
+        let (is_vec, elem_ty) = match &ty {
+            Ty::Named { name, args } if name == "Vec" && args.len() == 1 => {
+                (true, args[0].clone())
+            }
+            Ty::Array(e) => (false, (**e).clone()),
+            Ty::ArrayLit(e) => (false, (**e).clone()),
+            other => {
+                return Err(CodegenError::new(
+                    span,
+                    format!("配列リテラルの型を解決できません: `{}`", other.describe()),
+                ));
+            }
+        };
+        let elem_ty = elem_ty.defaulted();
+        let ellty = llvm_ty(&elem_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        let n = elems.len();
+
+        if is_vec {
+            // sizeof(T) = ptrtoint (getelementptr T, null, 1)。要素数を掛けて malloc。
+            let szp = self.fresh_tmp();
+            self.emit(&format!("{szp} = getelementptr {ellty}, ptr null, i64 1"));
+            let sz = self.fresh_tmp();
+            self.emit(&format!("{sz} = ptrtoint ptr {szp} to i64"));
+            let total = self.fresh_tmp();
+            self.emit(&format!("{total} = mul i64 {sz}, {n}"));
+            let buf = self.fresh_tmp();
+            self.emit(&format!("{buf} = call ptr @malloc(i64 {total})"));
+            for (i, e) in elems.iter().enumerate() {
+                let (v, _) = self.gen_value(e, &elem_ty)?;
+                let p = self.fresh_tmp();
+                self.emit(&format!("{p} = getelementptr {ellty}, ptr {buf}, i64 {i}"));
+                self.emit(&format!("store {ellty} {v}, ptr {p}"));
+            }
+            // %Vec { buf, n, n } を組み立てる。
+            let v0 = self.fresh_tmp();
+            self.emit(&format!("{v0} = insertvalue %Vec undef, ptr {buf}, 0"));
+            let v1 = self.fresh_tmp();
+            self.emit(&format!("{v1} = insertvalue %Vec {v0}, i64 {n}, 1"));
+            let v2 = self.fresh_tmp();
+            self.emit(&format!("{v2} = insertvalue %Vec {v1}, i64 {n}, 2"));
+            Ok(v2)
+        } else {
+            // スタックに [N x T] を確保し各要素を格納、先頭アドレスで fat pointer を組む。
+            let back = self.fresh_tmp();
+            self.emit(&format!("{back} = alloca [{n} x {ellty}]"));
+            for (i, e) in elems.iter().enumerate() {
+                let (v, _) = self.gen_value(e, &elem_ty)?;
+                let p = self.fresh_tmp();
+                self.emit(&format!(
+                    "{p} = getelementptr [{n} x {ellty}], ptr {back}, i64 0, i64 {i}"
+                ));
+                self.emit(&format!("store {ellty} {v}, ptr {p}"));
+            }
+            let dp = self.fresh_tmp();
+            self.emit(&format!(
+                "{dp} = getelementptr [{n} x {ellty}], ptr {back}, i64 0, i64 0"
+            ));
+            let v0 = self.fresh_tmp();
+            self.emit(&format!("{v0} = insertvalue %Array undef, ptr {dp}, 0"));
+            let v1 = self.fresh_tmp();
+            self.emit(&format!("{v1} = insertvalue %Array {v0}, i64 {n}, 1"));
+            Ok(v1)
         }
     }
 
@@ -2665,6 +2897,12 @@ fn llvm_ty(ty: &Ty, reg: &StructReg) -> Result<String, String> {
         Ty::Named { name, args } if !args.is_empty() && reg.is_generic_struct(name) => {
             Ok(format!("%{}", mono_symbol(name, args)))
         }
+        // 動的配列 `Vec<T>` は { データポインタ, 長さ, 容量 } のヒープ表現。要素型は
+        // 命令側で扱うため opaque ポインタ。全インスタンス共通の `%Vec`。
+        Ty::Named { name, args } if name == "Vec" && args.len() == 1 => Ok("%Vec".to_string()),
+        // 固定長配列 `T[]`（および未確定の配列リテラル）は { データポインタ, 長さ } の
+        // 表現（スタック裏付け）。全要素型共通の `%Array`。
+        Ty::Array(_) | Ty::ArrayLit(_) => Ok("%Array".to_string()),
         Ty::Named { name, args } if args.is_empty() => match name.as_str() {
             // 整数は LLVM では符号を型に持たない（幅だけ）。符号は命令側で扱う。
             "i8" | "u8" => Ok("i8".to_string()),

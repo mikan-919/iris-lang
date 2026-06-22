@@ -290,6 +290,11 @@ impl Borrows<'_> {
                     self.gather(&f.value, out);
                 }
             }
+            ExprKind::ArrayLit { elems } => {
+                for el in elems {
+                    self.gather(el, out);
+                }
+            }
             // if の条件だけ集め、ブロックは descend で扱う。
             ExprKind::If { cond, .. } => self.gather(cond, out),
             _ => {}
@@ -395,6 +400,11 @@ impl Borrows<'_> {
                 for arm in arms {
                     // 各アームは独立したスコープ（反復ごとに借用を解放）。
                     self.visit_block_arm(arm.guard.as_ref(), &arm.body);
+                }
+            }
+            ExprKind::ArrayLit { elems } => {
+                for el in elems {
+                    self.descend_expr(el);
                 }
             }
             _ => {}

@@ -314,6 +314,12 @@ impl Flow<'_> {
                     self.visit_expr(&f.value, st);
                 }
             }
+            // 配列リテラルの各要素は値として格納される（要素は Copy 限定のため読み扱いで足りる）。
+            ExprKind::ArrayLit { elems } => {
+                for e in elems {
+                    self.visit_expr(e, st);
+                }
+            }
             ExprKind::If {
                 cond,
                 then,
@@ -538,7 +544,7 @@ fn is_copy(ty: &Ty, aliases: &HashMap<String, Ty>) -> bool {
         Ty::IntLit | Ty::FloatLit | Ty::Infer | Ty::Error => true,
         Ty::Ref { mutable, .. } => !mutable,
         Ty::Tuple(elems) => elems.iter().all(|e| is_copy(e, aliases)),
-        Ty::Array(_) => false,
+        Ty::Array(_) | Ty::ArrayLit(_) => false,
         Ty::Named { name, args } if args.is_empty() => {
             if INT_TYPES.contains(&name.as_str())
                 || FLOAT_TYPES.contains(&name.as_str())

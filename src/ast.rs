@@ -275,6 +275,9 @@ pub enum ExprKind {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
     },
+    /// 配列リテラル `[e1, e2, ...]`。型注釈に応じて固定長配列 `T[]` または
+    /// 動的配列 `Vec<T>` を構築する（型指向。typeck が解決して型を記録する）。
+    ArrayLit { elems: Vec<Expr> },
 }
 
 /// match 式のアーム `pattern [if guard] -> body`。

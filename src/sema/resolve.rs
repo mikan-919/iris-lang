@@ -302,6 +302,11 @@ impl Resolver {
                     self.pop_scope();
                 }
             }
+            ExprKind::ArrayLit { elems } => {
+                for e in elems {
+                    self.resolve_expr(e);
+                }
+            }
         }
     }
 

@@ -1222,6 +1222,40 @@ fn parse_primary(input: Tokens, no_struct: bool) -> PResult<Expr> {
             let (input, _) = expect(input, &TokenKind::RParen, "`)`")?;
             Ok((input, expr))
         }
+        // 配列リテラル `[e1, e2, ...]`（型注釈で `T[]` / `Vec<T>` のどちらにもなる）。
+        // 要素は改行またはカンマ区切り。末尾カンマ・空リスト `[]` を許す。
+        TokenKind::LBracket => {
+            let lb_span = span;
+            let mut cur = input.take_from(1);
+            let mut elems = Vec::new();
+            loop {
+                cur = skip_separators(cur);
+                if cur.peek() == &TokenKind::RBracket {
+                    break;
+                }
+                let (rest, e) = parse_expr(cur)?;
+                elems.push(e);
+                cur = rest;
+                match cur.peek() {
+                    TokenKind::Comma | TokenKind::Newline | TokenKind::RBracket => {}
+                    _ => {
+                        return Err(nom::Err::Failure(ParseErr::expected(
+                            "改行・`,`・`]`",
+                            cur.first(),
+                        )));
+                    }
+                }
+            }
+            let (cur, rb) = expect(cur, &TokenKind::RBracket, "`]`")?;
+            let span = lb_span.merge(rb.span);
+            Ok((
+                cur,
+                Expr {
+                    kind: ExprKind::ArrayLit { elems },
+                    span,
+                },
+            ))
+        }
         TokenKind::If => parse_if(input),
         TokenKind::Match => parse_match(input),
         _ => Err(nom::Err::Error(ParseErr::expected("式", tok))),

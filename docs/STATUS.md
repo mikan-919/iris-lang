@@ -60,7 +60,8 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   （ADR-0004〜0009、下記）。`trait` も識別子として扱う
 - 構造体リテラル `Name { field: value, ... }`（`if`/三項の条件位置では抑制し曖昧性回避）
 - 文: `let` / `const`、`return`、再代入 `target = value`、式文
-- ループ: `while cond { ... }` / `loop { ... }` / `break` / `continue` / **`for x in lo..hi { ... }`**（整数範囲。`..` 排他・`..=` 包含）/ **`for x in iter { ... }`**（一般イテレータ＝`Iterator<T>` トレイト経由、ADR-0007。`iter` が `Iterator` を実装する値、要素型 `T` を `x` に束縛）
+- ループ: `while cond { ... }` / `loop { ... }` / `break` / `continue` / **`for x in lo..hi { ... }`**（整数範囲。`..` 排他・`..=` 包含）/ **`for x in iter { ... }`**（一般イテレータ＝`Iterator<T>` トレイト経由、ADR-0007。`iter` が `Iterator` を実装する値、要素型 `T` を `x` に束縛）/ **`for x in coll { ... }`**（配列 `T[]`・動的配列 `Vec<T>` の直接反復。要素は Copy 型限定・コレクションは借用＝消費しない）
+- **配列リテラル `[e1, e2, ...]`**（改行/カンマ区切り・末尾カンマ・空リスト可）。型注釈に応じて固定長配列 `T[]`（スタック裏付け）または動的配列 `Vec<T>`（`malloc` でヒープ確保）を構築する（型指向。整数リテラル既定 `i32`）
 - 型: 名前付き型、ジェネリクス `Vec<T>`、参照 `&T` / `&mut T`、配列 `T[]`、タプル `(A, B)`
 - 式（優先順位対応）:
   - リテラル（整数・浮動小数点・文字列・真偽値）、識別子
@@ -106,6 +107,8 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   - `while` の条件が bool でない、`break`/`continue` のループ外使用
   - `for x in lo..hi` の範囲境界が整数でない／下限と上限の型不一致。ループ変数 `x` には境界の具体整数型（両方リテラルなら既定 `i32`）を付与し、本体内で使えるようにする
   - `for x in iter`（一般イテレータ）: `iter` の型が `Iterator<T>` を実装しているか検査し、要素型 `T` をループ変数 `x` に付与（`Iterator` 未実装なら拒否、複数 `Iterator` 実装の同居は当面曖昧エラー）。要素型は codegen が `next()` の戻り `Option<T>` のアンラップに使う
+  - `for x in coll`（配列 `T[]` / 動的配列 `Vec<T>`）: 要素型 `T` を `x` に付与し、要素を直接反復する（`Iterator` 実装より優先）。当面 `x` は **Copy 型のみ**（非 Copy 要素は拒否）。コレクションは借用（消費しない）
+  - **配列リテラル `[...]`** は未確定型 `ArrayLit(要素型)` として型付けし、注釈（`T[]` / `Vec<T>`）に応じて確定する（型指向。`let` 注釈・戻り型・`for` の対象で `finalize_array_lit` が `expr_types` を書き換え、codegen が表現を決める）。注釈がなければ既定で固定長配列 `T[]`。要素型は全要素を `join` して求める（不一致はエラー）
 - `&mut T` は `&T` として使える（参照の可変性は所有権パスで詳細検査）
 
 #### 型定義の扱い（実装済み）
@@ -212,6 +215,16 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   リテラルの符号化は印字可能 ASCII 以外と `"` `\` を `\XX`（16進）でエスケープし末尾に NUL を付ける
   （マルチバイト UTF-8 はバイト単位）。値渡し（引数・戻り値・`let`）に対応。`extern fn puts`（std）で
   libc に渡して出力できる。**長さ・索引・連結・補間などの操作はまだ無い**（リテラルを渡す/返すのみ）
+- **配列 `T[]` / 動的配列 `Vec<T>`**: 使用時のみ名前付き型を宣言する。固定長配列は fat pointer
+  `%Array = type { ptr, i64 }`（データポインタ＋長さ）。配列リテラルは `alloca [N x T]` をスタックに
+  確保し各要素を `store`、先頭アドレスと長さ `N` を `insertvalue` で組む。動的配列は
+  `%Vec = type { ptr, i64, i64 }`（ポインタ＋長さ＋容量）。配列リテラルから `malloc`（`sizeof(T)` は
+  `getelementptr T, null, 1` → `ptrtoint` で算出）でバッファを確保し要素をコピー、`len=cap=N`。
+  要素型は opaque ポインタ越しに命令側で扱うため、型宣言は要素型に依らず単一（`%Array`/`%Vec`）。
+  `for x in coll` はデータポインタと長さを `extractvalue` で取り出し、`0..len` のインデックスループへ
+  落とす（`getelementptr` で要素アドレス→`load`→`x` のスロットへ `store`。`continue`/`break` はラベル
+  スタックで解決）。**未対応**: `push`/`len`/索引 `v[i]`・スライス・非 Copy 要素・配列の値渡しの所有権追跡
+  （現状リテラル構築と借用反復のみ。返却すると配列はスタック裏付けのため危険＝所有権検査は将来）
 - **enum**: 非ジェネリック・スカラペイロードのジェネリックは `%EnumName = type { i8, i64 }`（i8 = タグ、i64 = ペイロードの記憶域）。**集約ペイロードのジェネリック enum（`Option<Point>` 等）は per-instantiation の `%Enum.Args = type { i8, <記憶域> }`**（ADR-0010）。`StructReg.enum_layouts`（ビルトイン Option/Result ＋ ユーザ enum、generics 付き）が enum レイアウトの唯一の真実源で、`enum_tag`/`enum_payload_of`/`enum_is_aggregate`/`enum_storage_ty` を提供。`llvm_ty` は enum 名を、スカラなら `%Name`・集約なら `%Name.Args`（`mono_symbol`）へ写す。`gen_enum_construction`/`gen_match` は集約なら typed store/load、スカラなら i64 キャストを使う
   - **バリアント構築** `gen_enum_construction`: alloca → タグを `getelementptr` + `store i8` → ペイロードを `getelementptr` + `cast_to_i64` + `store i64` → `load %EnumName`。`cast_to_i64` は `i32`→`sext`、`bool`→`zext`、`f64`→`bitcast`、`ptr`→`ptrtoint` で i64 へ変換。typeck が `variant_constructions` に記録した span で `gen_expr` の先頭で命中したら `gen_enum_construction` へ分岐（AST ノード種を変えない）
   - **`match` 式** `gen_match`: 結果を受け取る alloca（result slot）を確保 → scrutinee を alloca へ退避 → `getelementptr` でタグフィールドを load → アームを順に if-else 連鎖でチェック（ワイルドカードは無条件 `br`）→ 各アームでペイロード束縛変数（`cast_from_i64` で元の型へ変換し alloca に退避）を用意 → アーム本体を評価して result slot へ store → `match.end` ラベルで合流 → result slot を load して値を返す。`cast_from_i64` は `trunc`/`fptrunc`/`inttoptr` 等で元の型へ戻す
@@ -278,7 +291,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 
 ### 未実装
 
-- ループ `for`: **整数範囲 `for x in lo..hi` / `lo..=hi`** と **一般イテレータ `for x in iter`（`Iterator<T>` 経由・ADR-0007）は実装済み**（いずれも縦断・clang 実行）。**残り**: 反復可能な標準コレクション（`Vec<T>` 等。ジェネリック struct 単相化が前提）、複数 `Iterator` 実装の同居を解く `for x#T in iter` 修飾構文、浮動小数範囲
+- ループ `for`: **整数範囲 `for x in lo..hi` / `lo..=hi`**・**一般イテレータ `for x in iter`（`Iterator<T>` 経由・ADR-0007）**・**配列 `T[]` / 動的配列 `Vec<T>` の直接反復 `for x in coll`** は実装済み（いずれも縦断・clang 実行）。**残り**: 非 Copy 要素の反復（要素のムーブ/借用の所有権設計）、複数 `Iterator` 実装の同居を解く `for x#T in iter` 修飾構文、浮動小数範囲
 - `match` の拡張: リテラル（整数・浮動小数・bool・**文字列**）・**範囲 `1..10` / `1..=10`**・**ガード `if cond`**・ワイルドカード `_`・enum バリアント束縛・enum タグ比較による if-else 連鎖は実装済み。**残り**: 範囲の浮動小数境界の網羅性、識別子束縛パターン（`x ->` で scrutinee 全体を束縛）、ネストパターン、`|`（or パターン）、exhaustiveness 検査
 - ラムダ `(x): T -> expr`、関数型シグネチャ
 - 一般の型合成 `A + B`（ADR-0001。引数位置の匿名トレイト境界としては実装済み）

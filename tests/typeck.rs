@@ -288,3 +288,37 @@ fn rejects_generic_struct_inconsistent_fields() {
     .unwrap_err();
     assert!(errs.iter().any(|m| m.contains("型が一致しません")));
 }
+
+#[test]
+fn array_literal_assigns_to_fixed_array_and_vec() {
+    // 同じ配列リテラルが固定長配列 `T[]` にも動的配列 `Vec<T>` にも適合する（型指向）。
+    typecheck("fn f() {\n    let a: i32[] = [1, 2, 3]\n    let v: Vec<i32> = [4, 5]\n}")
+        .expect("配列リテラルは T[]/Vec<T> の双方へ適合");
+}
+
+#[test]
+fn array_literal_element_type_mismatch_rejected() {
+    let errs = typecheck("fn f() {\n    let a: i32[] = [1, true]\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("一致しません")));
+}
+
+#[test]
+fn for_over_array_binds_element_type() {
+    // 配列を反復するとループ変数は要素型になり、本体で使える。
+    typecheck("fn f(): i32 {\n    let a: i32[] = [1, 2, 3]\n    let mut s = 0\n    for x in a {\n        s = s + x\n    }\n    return s\n}")
+        .expect("配列の for は要素型を束縛する");
+}
+
+#[test]
+fn for_over_vec_binds_element_type() {
+    typecheck("fn f(): i32 {\n    let v: Vec<i32> = [1, 2]\n    let mut s = 0\n    for x in v {\n        s = s + x\n    }\n    return s\n}")
+        .expect("Vec の for は要素型を束縛する");
+}
+
+#[test]
+fn for_over_non_copy_element_rejected() {
+    // 当面、要素が Copy 型でない配列は反復できない。
+    let src = "type P = struct { x: i32 }\nfn f() {\n    let a: P[] = [P { x: 1 }]\n    for p in a {\n    }\n}";
+    let errs = typecheck(src).unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("Copy")));
+}

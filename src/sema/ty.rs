@@ -29,6 +29,9 @@ pub enum Ty {
     IntLit,
     /// 型が未確定の浮動小数リテラル。任意の浮動小数型に適合する。
     FloatLit,
+    /// 型が未確定の配列リテラル `[...]`。要素型を保持し、固定長配列 `T[]` にも
+    /// 動的配列 `Vec<T>` にも適合する（型指向。注釈がなければ既定で `T[]`）。
+    ArrayLit(Box<Ty>),
     /// 不明な型（ジェネリクスの穴・メンバアクセス等）。何にでも適合する。
     Infer,
     /// 型エラー。これ以上エラーを波及させないための番兵。
@@ -112,6 +115,7 @@ impl Ty {
             }
             Ty::IntLit => "整数リテラル".to_string(),
             Ty::FloatLit => "小数リテラル".to_string(),
+            Ty::ArrayLit(inner) => format!("{}[] (配列リテラル)", inner.describe()),
             Ty::Infer => "_".to_string(),
             Ty::Error => "<error>".to_string(),
         }
@@ -133,6 +137,8 @@ impl Ty {
         match self {
             Ty::IntLit => Ty::named("i32"),
             Ty::FloatLit => Ty::named("f64"),
+            // 注釈なしの配列リテラルは既定で固定長配列 `T[]` に確定する。
+            Ty::ArrayLit(inner) => Ty::Array(Box::new(inner.defaulted())),
             other => other,
         }
     }
