@@ -1,0 +1,31 @@
+// OS との最小インターフェース。libc の stdio・プロセス・環境変数を extern で借りる。
+// prelude と違い自動前置されない。`use std.os.*` などで明示的に取り込んで使う。
+//
+// 現状の codegen 対応範囲（i32 / string / RawPtr）で記述する。失敗を表す NULL
+// ハンドル（fopen の戻り等）を判定する構文がまだ無いため、当面は呼び出し側で
+// 注意して扱う（NULL 安全化は Option 戻り値の導入後に対応する）。
+
+// 不透明な FILE ハンドル（libc の `FILE*`）。中身は触らずポインタとして持ち回す。
+// `RawPtr` は free/drop を持たない Copy なポインタ型（FFI 用のコンパイラ組み込み）。
+pub type File = RawPtr
+
+// ファイルを開く。`mode` は libc fopen と同じ（"r" / "w" / "a" / "rb" 等）。
+// 失敗時は NULL ハンドルを返す。
+pub extern fn fopen(path: string, mode: string): File
+
+// 開いているファイルを閉じる。成功で 0。
+pub extern fn fclose(f: File): i32
+
+// NUL 終端文字列 `s` を `f` へ書き出す。非負なら成功。
+pub extern fn fputs(s: string, f: File): i32
+
+// `f` から最大 `n - 1` バイトを `buf` へ読み込み NUL 終端する。改行も読み込む。
+// EOF・エラー時は NULL を返す（成功時は `buf` を返す）。`buf` は呼び出し側が
+// `malloc(n)` 等で確保した書き込み可能なバッファを渡す。
+pub extern fn fgets(buf: string, n: i32, f: File): string
+
+// プロセスを終了コード `code` で終了する（戻らない）。
+pub extern fn exit(code: i32): void
+
+// 環境変数 `name` の値を返す。未設定なら NULL。
+pub extern fn getenv(name: string): string

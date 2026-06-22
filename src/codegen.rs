@@ -3172,6 +3172,8 @@ fn llvm_ty(ty: &Ty, reg: &StructReg) -> Result<String, String> {
             "bool" => Ok("i1".to_string()),
             // 文字列は NUL 終端の C 文字列へのポインタ（opaque ポインタ）。
             "string" => Ok("ptr".to_string()),
+            // 不透明な C ポインタ（FFI ハンドル）も opaque ポインタ。
+            "RawPtr" => Ok("ptr".to_string()),
             "void" => Ok("void".to_string()),
             // 定義済み struct・enum（別名チェーン越しを含む）は名前付き構造体型。
             other => {

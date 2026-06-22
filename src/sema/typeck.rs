@@ -32,6 +32,9 @@ use crate::span::Span;
 /// プリミティブ以外の組み込み型名（ジェネリックなものを含む）。
 const BUILTIN_TYPES: &[&str] = &[
     "bool", "string", "char", "void", "Vec", "Result", "Option", "Box", "Map", "Set",
+    // 不透明な C ポインタ（FFI 用）。`ptr` で表現し、free/drop を持たず Copy。
+    // std が `type File = RawPtr` のように名前付けして使う。
+    "RawPtr",
 ];
 
 /// 型検査の結果。各式の型を保持する（今後のコード生成で利用する）。
@@ -2183,6 +2186,8 @@ fn is_copy_ty(ty: &Ty) -> bool {
                 || name == "char"
                 // 文字列は不変なポインタ値で free/drop を持たないため Copy 扱い。
                 || name == "string"
+                // 不透明な C ポインタも free/drop を持たないポインタ値で Copy 扱い。
+                || name == "RawPtr"
         }
         _ => false,
     }

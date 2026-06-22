@@ -815,3 +815,29 @@ fn runs_string_byte_cast() {
         assert_eq!(code, 65);
     }
 }
+
+#[test]
+fn emits_rawptr_extern_as_pointer() {
+    // std.os の File（= RawPtr）は LLVM では opaque ポインタ。extern も ptr で宣言される。
+    let ir = emit("use std.os.*\nfn main(): i32 {\n    let f = fopen(\"x\", \"r\")\n    return fclose(f)\n}");
+    assert!(ir.contains("declare ptr @fopen(ptr, ptr)"));
+    assert!(ir.contains("declare i32 @fclose(ptr)"));
+}
+
+#[test]
+fn runs_os_file_roundtrip() {
+    // ファイルへ書き込み → 読み戻し、先頭バイトを i32 へ変換して返す（'Z' = 90）。
+    let src = "use std.os.*\nfn main(): i32 {\n    let path = \"/tmp/iris_os_roundtrip.txt\"\n    let w = fopen(path, \"w\")\n    let r1 = fputs(\"Zebra\\n\", w)\n    let c1 = fclose(w)\n    let f = fopen(path, \"r\")\n    let buf = malloc(64)\n    let line = fgets(buf, 64, f)\n    let c2 = fclose(f)\n    return buf[0] as i32\n}";
+    if let Some(code) = run_exit_code(src, "os_roundtrip") {
+        assert_eq!(code, 90);
+    }
+}
+
+#[test]
+fn runs_os_exit() {
+    // exit(7) はプロセスを終了コード 7 で終える（return には到達しない）。
+    let src = "use std.os.*\nfn main(): i32 {\n    exit(7)\n    return 0\n}";
+    if let Some(code) = run_exit_code(src, "os_exit") {
+        assert_eq!(code, 7);
+    }
+}

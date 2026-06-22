@@ -562,6 +562,8 @@ fn is_copy(ty: &Ty, aliases: &HashMap<String, Ty>) -> bool {
                 // 文字列は不変な NUL 終端ポインタ。free/drop を持たず（concat の結果は
                 // リーク）、ポインタの複製は安全なので Copy 扱い（Rust の `&str` 相当）。
                 || name == "string"
+                // 不透明な C ポインタ（FFI ハンドル）も free/drop を持たず Copy 扱い。
+                || name == "RawPtr"
             {
                 true
             } else if let Some(target) = aliases.get(name) {

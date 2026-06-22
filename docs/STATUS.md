@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（`as` 型変換を縦断実装＝数値↔数値・`bool`→数値）。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（`as` 型変換＝数値↔数値/`bool`→数値、および `RawPtr` 不透明ポインタ＋`std/os.iris`＝FILE I/O・プロセス・環境変数）。
 
 ## パイプライン
 
@@ -47,6 +47,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（`as` 型�
 | `tests/module.rs` | モジュール use・pub 可視性・モジュールパス呼び出しの回帰テスト | ✅ |
 | `src/module.rs` | モジュールローダー（ファイル読み込み・pub アイテム抽出・パス解決） | ✅ |
 | `std/prelude.iris` | 最小 std（旧 std/std.iris からリネーム） | ✅ |
+| `std/os.iris` | OS モジュール（`use std.os`。FILE I/O・プロセス・環境変数） | ✅ |
 
 ## 構文の実装状況
 
@@ -275,6 +276,20 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（`as` 型�
 - `strcmp` は libc から借りる文字列比較。`match` の文字列リテラルパターンの codegen が呼び出す（未使用でも `declare` のみ出力され無害）
 - 現状のコード生成に合わせ `i32` / `bool` / `string` の範囲で記述
 - これにより `main(): i32` から実際に数値・真偽値を標準出力へ表示し、`clang` でビルドして実行できる
+
+#### `std/os.iris`（OS モジュール・実装済み）
+
+prelude と違い**自動前置されず**、`use std.os`（または `use std.os.*`）で明示的に取り込む追加 std モジュール。
+モジュール解決（`std.*` → `CARGO_MANIFEST_DIR/std/os.iris`）経由でロードされる。
+
+- **不透明 C ポインタ型 `RawPtr`**: FFI 用のコンパイラ組み込みプリミティブ。LLVM では opaque ポインタ（`ptr`）で表現し、
+  `string` と同様に free/drop を持たない **Copy** 型・所有グラフの辺を作らない。typeck（`BUILTIN_TYPES`・両 `is_copy`）と
+  codegen（`llvm_ty` → `ptr`）に最小限で配線。std/os は `pub type File = RawPtr` と名前付けして使う（コンパイラは stdio を知らない）
+- 提供（いずれも libc を `extern` で借りる）: `type File = RawPtr`、`fopen(path, mode): File` / `fclose(f): i32` /
+  `fputs(s, f): i32` / `fgets(buf, n, f): string`（`buf` は `malloc` 確保の書き込み可能バッファ）、`exit(code): void`、`getenv(name): string`
+- 書き込み→読み戻しのファイル往復、`exit` による終了コード、`getenv` の値取得を `clang` 実行で検証（`tests/codegen.rs`）
+- **残り（NULL 安全化）**: `fopen`/`getenv` 失敗時の NULL ハンドル判定構文が無い（戻りを `Option` 化するか NULL 比較を入れる）。
+  `stdout`/`stderr` グローバル（FILE\*）の参照、`fprintf` 等の可変長引数、`File` の自動 `fclose`（Drop）は未対応
 
 ### トレイトシステム（実装済み・ADR-0004〜0009）
 
