@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（所有権ベースの `Vec` 解放＝Drop/free・動的 drop flag）。
 
 ## パイプライン
 
@@ -230,8 +230,19 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   要素型は opaque ポインタ越しに命令側で扱うため、型宣言は要素型に依らず単一（`%Array`/`%Vec`）。
   `for x in coll` はデータポインタと長さを `extractvalue` で取り出し、`0..len` のインデックスループへ
   落とす（`getelementptr` で要素アドレス→`load`→`x` のスロットへ `store`。`continue`/`break` はラベル
-  スタックで解決）。**未対応**: `push`/`len`/索引 `v[i]`・スライス・非 Copy 要素・配列の値渡しの所有権追跡
-  （現状リテラル構築と借用反復のみ。返却すると配列はスタック裏付けのため危険＝所有権検査は将来）
+  スタックで解決）。**索引 `coll[i]`** はデータポインタを `extractvalue 0` で取り出し `getelementptr` +
+  `load` で要素を読む（要素型は typeck の `expr_types` から、添字はネイティブ整数型のまま GEP 添字に使う）。
+  malloc は `extern fn malloc(n: i32)`（prelude）として宣言し、`Vec` リテラルの確保もこれに合わせて i32
+  引数で呼ぶ（x86-64 では i32 引数が rdi へゼロ拡張され size_t 互換。確保サイズは i32 へ trunc）。
+  **所有権ベースの解放（Drop/free）**: ヒープ所有する `Vec<T>` ローカルを**スコープ末で `free` する**（`declare void @free(ptr)`）。
+  各 Vec ローカルに**ドロップフラグ**（`i1` の alloca、entry で `false` 初期化・`let` 格納後に `true`）を持たせ、
+  値が move された地点（値渡し引数・`return`・別束縛・struct フィールドへの格納＝裸の Vec 識別子の消費）で `false` に戻す。
+  各 `ret` の直前で `emit_drops` がフラグの立つ Vec だけを `free`（`extractvalue 0` でデータポインタを取り出す）。
+  **条件分岐の move も正確に追える**（Rust の動的 drop flag 相当。片方の分岐だけで move された値は実行時にフラグで解放可否が決まる）。
+  借用 `&v`・添字 `v[i]`・`for x in v` は move でなく別経路で評価されるためフラグを落とさない（借用後も解放される）。
+  **未対応**: `push`/`len`・スライス・非 Copy 要素。Drop の**スコープ粒度は関数末のみ**（ループ本体・ネストブロック単位の早期解放は未実装＝
+  ループ内で確保した Vec は反復ごとに解放されず関数末まで生存＝健全だが反復分リーク）。Vec **引数**（値渡しで受け取った Vec）は
+  callee で解放しない（＝リーク。健全）。struct フィールドの Vec の再帰 Drop も未実装（move 元のフラグは落とすので二重解放は無いが struct は解放されない）
 - **enum**: 非ジェネリック・スカラペイロードのジェネリックは `%EnumName = type { i8, i64 }`（i8 = タグ、i64 = ペイロードの記憶域）。**集約ペイロードのジェネリック enum（`Option<Point>` 等）は per-instantiation の `%Enum.Args = type { i8, <記憶域> }`**（ADR-0010）。`StructReg.enum_layouts`（ビルトイン Option/Result ＋ ユーザ enum、generics 付き）が enum レイアウトの唯一の真実源で、`enum_tag`/`enum_payload_of`/`enum_is_aggregate`/`enum_storage_ty` を提供。`llvm_ty` は enum 名を、スカラなら `%Name`・集約なら `%Name.Args`（`mono_symbol`）へ写す。`gen_enum_construction`/`gen_match` は集約なら typed store/load、スカラなら i64 キャストを使う
   - **バリアント構築** `gen_enum_construction`: alloca → タグを `getelementptr` + `store i8` → ペイロードを `getelementptr` + `cast_to_i64` + `store i64` → `load %EnumName`。`cast_to_i64` は `i32`→`sext`、`bool`→`zext`、`f64`→`bitcast`、`ptr`→`ptrtoint` で i64 へ変換。typeck が `variant_constructions` に記録した span で `gen_expr` の先頭で命中したら `gen_enum_construction` へ分岐（AST ノード種を変えない）
   - **`match` 式** `gen_match`: 結果を受け取る alloca（result slot）を確保 → scrutinee を alloca へ退避 → `getelementptr` でタグフィールドを load → アームを順に if-else 連鎖でチェック（ワイルドカードは無条件 `br`）→ 各アームでペイロード束縛変数（`cast_from_i64` で元の型へ変換し alloca に退避）を用意 → アーム本体を評価して result slot へ store → `match.end` ラベルで合流 → result slot を load して値を返す。`cast_from_i64` は `trunc`/`fptrunc`/`inttoptr` 等で元の型へ戻す
@@ -328,6 +339,11 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 - **match のガード構文**: `pattern if cond -> body`（Rust 風）と仮定。docs に文法記述がなかった。
 - **識別子束縛パターン未対応**: `match x { name -> ... }` の `name` は現状バリアント名として扱う（scrutinee 全体を束縛する識別子パターンは未実装）。そのため scrutinee 値を参照するガードは `_ if cond`（scrutinee を変数で持つ場合）の形で書く。
 - **`for` の範囲構文**: spec（`control.md`）は `for x in list`（イテレータ）のみ規定。当面は **整数範囲 `for x in lo..hi` / `lo..=hi`** に限定して実装した。境界はリテラルに限らず**任意の整数式**を許す（`for i in 0..n`）。上限の包含/排他は範囲パターンと同じ規約（`..` 排他・`..=` 包含、Rust 準拠の暫定）。ループ変数 `x` は**不変束縛**（反復ごとに再束縛・Copy）。`for` キーワードは `impl Trait for Type` の `for` と同一トークン（文脈で判別）。
+- **文字列操作の構文**: spec（`type.md`）は補間のみ規定し、長さ・索引・連結の構文は未定。`+` は型合成（ADR-0001）のため連結に使えないので、`s.len()` / `a.concat(b)`（`impl string` のメソッド）・添字 `s[i]`（→`u8`）を暫定採用した。`impl` 対象に組み込みプリミティブ（`string`）を許す点も暫定（メソッド表は型名で引くため動作する）。
+- **`string` は Copy**: 不変な NUL 終端ポインタで free/drop を持たない（concat の結果はリーク）ため Copy 型として扱う（ムーブしない）。Rust の `&str` 相当。spec に所有権上の規定は無いため暫定。将来 free/所有を導入する場合は再検討が必要。
+- **添字 `s[i]` はバイト**: 文字列の索引は UTF-8 バイト列の i バイト目を `u8` で返す（`char` リテラル・codegen 未整備のため）。マルチバイト境界・`char` 単位の索引は未対応。`u8`→`i32` の暗黙幅変換は無いため `println_int(s[i])` 等は直接は書けない（`as` 変換の実装待ち）。
+- **`malloc` の引数幅**: prelude では `extern fn malloc(n: i32)` と宣言し、`Vec` リテラルの確保も i32 引数で呼ぶ（`as` 変換が無く concat の長さが i32 のため）。x86-64 では i32 引数が rdi へゼロ拡張されるため libc の `size_t`（i64）と ABI 互換。他ターゲットへ移す際は要再検討。
+- **Drop/free の第一スライス範囲**: 解放対象は **`Vec<T>` ローカルのみ**（`string` は ADR で Copy・leak 許容、`Box` は codegen 未整備のため対象外）。条件付き move は **動的 drop flag**（Rust 準拠）で解決し、**解放位置はスコープ末＝関数末**（最後の使用での即時解放や、ループ本体・ネストブロック単位の早期解放は未実装）。move 検出は codegen が「裸の Vec 識別子の値消費」を消費地点ごとに記録する方式（所有権チェッカ flow.rs は不変＝use-after-move は従来どおり静的に拒否し、drop flag は解放責務の追跡のみ）。`free` は libc を直接 `declare`（prelude には出さない）。健全（二重解放・use-after-free 無し）だが、ループ内 Vec・Vec 引数・struct フィールドの Vec は現状リークを許容する。
 
 ## ビルド・実行
 

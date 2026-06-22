@@ -596,7 +596,15 @@ pub fn emit_module(
             matches!(it, Item::Function(f) if f.name == "malloc")
         });
         if !has_malloc {
-            let _ = writeln!(module, "declare ptr @malloc(i64)");
+            let _ = writeln!(module, "declare ptr @malloc(i32)");
+        }
+        // `Vec` バッファの解放に使う libc `free`。スコープ末のドロップが呼ぶ
+        // （未使用でも `declare` のみ出力され無害）。
+        let has_free = program.items.iter().any(|it| {
+            matches!(it, Item::Function(f) if f.name == "free")
+        });
+        if !has_free {
+            let _ = writeln!(module, "declare void @free(ptr)");
         }
     }
     if need_array || need_vec {
@@ -634,6 +642,9 @@ pub fn emit_module(
             type_subst: subst,
             mono: &type_info.mono,
             for_iter_elem: &type_info.for_iter_elem,
+            drop_flags: HashMap::new(),
+            entry_allocas: String::new(),
+            drop_counter: 0,
         };
         let func_ir = cg.emit_function(f, symbol)?;
         module.push_str(&func_ir);
@@ -781,6 +792,22 @@ struct FnCodegen<'a> {
     mono: &'a HashMap<Span, (String, Vec<Ty>)>,
     /// `for x in it` の要素型（typeck が記録。var_span → 要素型 T）。
     for_iter_elem: &'a HashMap<Span, Ty>,
+    /// ヒープ所有する `Vec<T>` ローカルのドロップ追跡（所有権ベースの解放）。
+    /// DefId → ドロップフラグの alloca（`i1`）。フラグが真のままスコープ末（＝各 `ret`
+    /// の直前）に到達した値だけ `free` する。値が move（値渡し・return・別束縛へ）された
+    /// 時点でフラグを偽にし、二重解放を防ぐ。条件分岐の move もフラグで正確に追える
+    /// （Rust の動的 drop flag 相当）。第一スライスは `Vec` ローカルのみ・解放位置は
+    /// 関数スコープ末（ループ本体・ネストブロック単位の早期解放は今後）。
+    drop_flags: HashMap<DefId, String>,
+    /// ドロップフラグなど、entry ブロック先頭に置きたい alloca/初期化を貯める。
+    entry_allocas: String,
+    /// ドロップフラグ用の連番。
+    drop_counter: usize,
+}
+
+/// ヒープ所有する動的配列 `Vec<T>` か判定する（ドロップ対象の判定）。
+fn is_vec_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::Named { name, args } if name == "Vec" && args.len() == 1)
 }
 
 /// 型パラメータ名を具体型へ置換する（単相化）。
@@ -1114,12 +1141,17 @@ impl<'a> FnCodegen<'a> {
                 let (v, _) = self.gen_value(e, &self.ret_ty.clone())?;
                 // gen_value 内でブロックが終端している場合、または値が空（if 文など）は ret を出さない。
                 if !self.terminated && !v.is_empty() {
+                    // 末尾式の返り値が裸の Vec なら呼び出し側へ所有権が移る。
+                    self.note_move(e);
+                    self.emit_drops();
                     self.emit(&format!("ret {ret_ty} {v}"));
                     self.terminated = true;
                 }
             } else if ret_ty == "void" {
+                self.emit_drops();
                 self.emit("ret void");
             } else {
+                self.emit_drops();
                 self.emit(&format!("ret {ret_ty} {}", zero_value(&ret_ty)));
             }
         }
@@ -1135,6 +1167,9 @@ impl<'a> FnCodegen<'a> {
         for s in &param_setup {
             out.push_str(s);
         }
+        // ドロップフラグの alloca/初期化を entry 先頭にまとめて置く
+        // （宣言前の早期 return でも未初期化スロットを読まないよう、フラグは常に初期化）。
+        out.push_str(&self.entry_allocas);
         out.push_str(&self.body);
         out.push_str("}\n");
         Ok(out)
@@ -1158,11 +1193,21 @@ impl<'a> FnCodegen<'a> {
                     None => self.raw_ty(value).defaulted(),
                 };
                 let (v, llty) = self.gen_value(value, &want)?;
+                // 右辺の値が裸の Vec ローカルなら、この束縛へ所有権が移る（move）。
+                self.note_move(value);
                 if let Some(&id) = self.def_spans.get(span) {
                     let ptr = format!("%{}.slot{}", "v", id);
                     self.emit(&format!("{ptr} = alloca {llty}"));
                     self.emit(&format!("store {llty} {v}, ptr {ptr}"));
                     self.locals.insert(id, (ptr, llty));
+                    // ヒープ所有する Vec はスコープ末で解放する。フラグを真にして
+                    // 「この束縛が生存・所有している」ことを記録する。
+                    if is_vec_ty(&want) {
+                        self.register_vec_drop(id);
+                        if let Some(flag) = self.drop_flags.get(&id).cloned() {
+                            self.emit(&format!("store i1 true, ptr {flag}"));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1171,9 +1216,15 @@ impl<'a> FnCodegen<'a> {
                     Some(v) => {
                         let want = self.ret_ty.clone();
                         let (r, llty) = self.gen_value(v, &want)?;
+                        // 返り値の Vec は呼び出し側へ所有権が移るので解放しない。
+                        self.note_move(v);
+                        self.emit_drops();
                         self.emit(&format!("ret {llty} {r}"));
                     }
-                    None => self.emit("ret void"),
+                    None => {
+                        self.emit_drops();
+                        self.emit("ret void");
+                    }
                 }
                 self.terminated = true;
                 Ok(())
@@ -1189,10 +1240,12 @@ impl<'a> FnCodegen<'a> {
                     let dest = self.gen_expr(target, "ptr")?;
                     let inner_ty = (**inner).clone();
                     let (v, vllty) = self.gen_value(value, &inner_ty)?;
+                    self.note_move(value);
                     self.emit(&format!("store {vllty} {v}, ptr {dest}"));
                 } else {
                     let (ptr, llty) = self.place_ptr(target)?;
                     let (v, _) = self.gen_value(value, &target_ty)?;
+                    self.note_move(value);
                     self.emit(&format!("store {llty} {v}, ptr {ptr}"));
                 }
                 Ok(())
@@ -1757,6 +1810,10 @@ impl<'a> FnCodegen<'a> {
                 CodegenError::new(span, format!("フィールド `{fname}` が初期化されていません"))
             })?;
             let (v, fllty) = self.gen_value(&init.value, fty)?;
+            // Vec フィールドへの値の格納は構造体への所有権移動（move）。
+            if is_vec_ty(fty) {
+                self.note_move(&init.value);
+            }
             let p = self.fresh_tmp();
             self.emit(&format!(
                 "{p} = getelementptr inbounds %{canon}, ptr {slot}, i32 0, i32 {idx}"
@@ -2546,6 +2603,10 @@ impl<'a> FnCodegen<'a> {
             for (i, a) in args.iter().enumerate() {
                 let want = func.params.get(i).map(|p| Ty::from_ast(&p.ty)).unwrap_or(Ty::Infer);
                 let (v, pty) = self.gen_value(a, &want)?;
+                // 値渡しの Vec は呼ばれた側へ所有権が移る（move）。
+                if is_vec_ty(&want) {
+                    self.note_move(a);
+                }
                 arg_strs.push(format!("{pty} {v}"));
             }
             let call = format!("call {ret_ty} @{fn_name}({})", arg_strs.join(", "));
@@ -2614,6 +2675,10 @@ impl<'a> FnCodegen<'a> {
                 .map(|p| lower_callee(&p.ty))
                 .unwrap_or(Ty::Infer);
             let (v, pty) = self.gen_value(a, &want)?;
+            // 値渡しの Vec は呼ばれた側へ所有権が移る（move）。
+            if is_vec_ty(&want) {
+                self.note_move(a);
+            }
             arg_strs.push(format!("{pty} {v}"));
         }
         let call = format!("call {ret_ty} @{symbol}({})", arg_strs.join(", "));
@@ -2830,6 +2895,59 @@ impl<'a> FnCodegen<'a> {
             self.gen_stmt(stmt)?;
         }
         Ok(())
+    }
+
+    // ---- 所有権ベースの解放（Vec のドロップ） ---------------------------
+
+    /// `Vec<T>` ローカルのドロップフラグを登録する。フラグは entry で `false` に初期化し、
+    /// 呼び出し側（`let` の格納後）で `true` にする。これにより、宣言前の早期 return では
+    /// フラグが偽のまま＝解放されない（未初期化スロットを読まない）。
+    fn register_vec_drop(&mut self, id: DefId) {
+        if self.drop_flags.contains_key(&id) {
+            return;
+        }
+        let flag = format!("%drop.flag{}", self.drop_counter);
+        self.drop_counter += 1;
+        self.entry_allocas
+            .push_str(&format!("  {flag} = alloca i1\n  store i1 false, ptr {flag}\n"));
+        self.drop_flags.insert(id, flag);
+    }
+
+    /// 値が move された地点でドロップ責務を手放す（フラグを偽にする）。`expr` が裸の識別子で
+    /// 追跡中の `Vec` ローカルを指すときだけ作用する（借用 `&v`・添字 `v[i]`・`for x in v` は
+    /// move ではないので別経路で評価され、ここを通らない）。
+    fn note_move(&mut self, expr: &Expr) {
+        if let ExprKind::Ident(_) = &expr.kind
+            && let Some(id) = self.res.uses.get(&expr.span)
+            && let Some(flag) = self.drop_flags.get(id).cloned()
+        {
+            self.emit(&format!("store i1 false, ptr {flag}"));
+        }
+    }
+
+    /// 現在の関数スコープ末（各 `ret` の直前）で、生存している `Vec` ローカルを解放する。
+    /// フラグが真のものだけ `free`（条件分岐の move もフラグで正しく除外される）。
+    fn emit_drops(&mut self) {
+        let entries: Vec<(DefId, String)> =
+            self.drop_flags.iter().map(|(k, v)| (*k, v.clone())).collect();
+        for (id, flag) in entries {
+            let Some((slot, _)) = self.locals.get(&id).cloned() else {
+                continue;
+            };
+            let f = self.fresh_tmp();
+            let do_l = self.fresh_label("drop.do");
+            let skip_l = self.fresh_label("drop.skip");
+            self.emit(&format!("{f} = load i1, ptr {flag}"));
+            self.emit(&format!("br i1 {f}, label %{do_l}, label %{skip_l}"));
+            self.emit_label(&do_l);
+            let vv = self.fresh_tmp();
+            self.emit(&format!("{vv} = load %Vec, ptr {slot}"));
+            let dp = self.fresh_tmp();
+            self.emit(&format!("{dp} = extractvalue %Vec {vv}, 0"));
+            self.emit(&format!("call void @free(ptr {dp})"));
+            self.emit(&format!("br label %{skip_l}"));
+            self.emit_label(&skip_l);
+        }
     }
 
     // ---- ヘルパ ---------------------------------------------------------

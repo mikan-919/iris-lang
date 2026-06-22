@@ -667,3 +667,115 @@ fn array_is_borrowed_not_consumed_by_for() {
         assert_eq!(code, 12);
     }
 }
+
+#[test]
+fn runs_string_len() {
+    // `s.len()` は libc strlen を借りた長さ（"hello" = 5）。
+    let src = "fn main(): i32 {\n    let s = \"hello\"\n    return s.len()\n}";
+    if let Some(code) = run_exit_code(src, "str_len") {
+        assert_eq!(code, 5);
+    }
+}
+
+#[test]
+fn runs_string_concat() {
+    // `a.concat(b)` はヒープに連結結果を作る。len で長さを確認（"ab"+"cde" = 5）。
+    let src = "fn main(): i32 {\n    let a = \"ab\"\n    let g = a.concat(\"cde\")\n    return g.len()\n}";
+    if let Some(code) = run_exit_code(src, "str_concat") {
+        assert_eq!(code, 5);
+    }
+}
+
+#[test]
+fn runs_string_index_byte() {
+    // 文字列の添字はバイト（u8）。"hello"[1] = 'e' = 101。
+    let src = "fn main(): i32 {\n    let s = \"hello\"\n    let b = s[1]\n    return b == 101 ? 1 : 0\n}";
+    if let Some(code) = run_exit_code(src, "str_index") {
+        assert_eq!(code, 1);
+    }
+}
+
+#[test]
+fn runs_array_index() {
+    // 固定長配列の添字アクセス。arr[0] + arr[2] = 10 + 30 = 40。
+    let src = "fn main(): i32 {\n    let arr: i32[] = [10, 20, 30]\n    return arr[0] + arr[2]\n}";
+    if let Some(code) = run_exit_code(src, "arr_index") {
+        assert_eq!(code, 40);
+    }
+}
+
+#[test]
+fn runs_vec_index() {
+    // 動的配列 Vec<T> の添字アクセス。v[1] * v[2] = 8 * 9 = 72。
+    let src = "fn main(): i32 {\n    let v: Vec<i32> = [7, 8, 9]\n    return v[1] * v[2]\n}";
+    if let Some(code) = run_exit_code(src, "vec_index") {
+        assert_eq!(code, 72);
+    }
+}
+
+#[test]
+fn runs_index_with_variable_subscript() {
+    // 添字が変数（リテラルでない）でも要素アドレスを計算できる。
+    let src = "fn main(): i32 {\n    let arr: i32[] = [3, 6, 9, 12]\n    let mut s = 0\n    for i in 0..4 {\n        s = s + arr[i]\n    }\n    return s\n}";
+    if let Some(code) = run_exit_code(src, "var_index") {
+        assert_eq!(code, 30);
+    }
+}
+
+// ---- 所有権ベースの解放（Vec のドロップ） ----------------------------------
+
+#[test]
+fn vec_local_is_freed_at_scope_end() {
+    // ヒープ所有する Vec ローカルは、関数スコープ末で `free` される。
+    // ドロップフラグの alloca と、フラグで保護された `free` 呼び出しが出る。
+    let ir = emit("fn main(): i32 {\n    let v: Vec<i32> = [1, 2, 3]\n    return v[0]\n}");
+    assert!(ir.contains("declare void @free(ptr)"));
+    assert!(ir.contains("%drop.flag0 = alloca i1"));
+    assert!(ir.contains("store i1 true, ptr %drop.flag0"));
+    assert!(ir.contains("call void @free(ptr"));
+    // clang で実行しても（free を踏んでも）正しい値を返す。
+    if let Some(code) =
+        run_exit_code("fn main(): i32 {\n    let v: Vec<i32> = [1, 2, 3]\n    return v[0]\n}", "vec_drop")
+    {
+        assert_eq!(code, 1);
+    }
+}
+
+#[test]
+fn fixed_array_local_is_not_freed() {
+    // スタック裏付けの固定長配列 `T[]` は解放対象でない（drop フラグも free も出ない）。
+    let ir = emit("fn main(): i32 {\n    let a: i32[] = [1, 2, 3]\n    return a[0]\n}");
+    assert!(!ir.contains("%drop.flag"));
+    assert!(!ir.contains("call void @free"));
+}
+
+#[test]
+fn moved_vec_is_not_freed_by_caller() {
+    // 値渡しで Vec を渡すと呼び出し側はドロップ責務を手放す（move 直後にフラグを偽へ）。
+    // → 呼び出しの直前に `store i1 false` が出て、二重解放にならない。
+    let src = "fn sink(v: Vec<i32>): i32 {\n    return v[0]\n}\nfn main(): i32 {\n    let v: Vec<i32> = [7, 8, 9]\n    return sink(v)\n}";
+    let ir = emit(src);
+    // フラグを真にした後、call の前に偽へ戻している。
+    let after_true = ir.split("store i1 true, ptr %drop.flag0").nth(1).unwrap_or("");
+    let clear_pos = after_true.find("store i1 false, ptr %drop.flag0");
+    let call_pos = after_true.find("call i32 @sink");
+    assert!(clear_pos.is_some() && call_pos.is_some());
+    assert!(clear_pos.unwrap() < call_pos.unwrap(), "move のフラグ解除は call より前に出るはず");
+    if let Some(code) = run_exit_code(src, "vec_move") {
+        assert_eq!(code, 7);
+    }
+}
+
+#[test]
+fn conditionally_moved_vec_uses_drop_flag() {
+    // 片方の分岐だけで move される Vec は、スコープ末でフラグにより解放可否が決まる
+    // （Rust の動的 drop flag 相当）。c=false なら解放、c=true なら呼ばれた側へ移譲。
+    let src = "fn sink(v: Vec<i32>): i32 {\n    return v[0]\n}\nfn main(): i32 {\n    let v: Vec<i32> = [5, 6]\n    let c = false\n    if c {\n        let unused = sink(v)\n    }\n    return 0\n}";
+    let ir = emit(src);
+    // スコープ末の free はフラグの load → 分岐で保護されている。
+    assert!(ir.contains("load i1, ptr %drop.flag0"));
+    assert!(ir.contains("call void @free(ptr"));
+    if let Some(code) = run_exit_code(src, "vec_cond_move") {
+        assert_eq!(code, 0);
+    }
+}
