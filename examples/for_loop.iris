@@ -1,0 +1,47 @@
+// for ループ（整数範囲）の実行例。
+//
+//   cargo run -- run examples/for_loop.iris
+//
+// std（println_int 等）は自動で前置される。現状のコード生成は i32 / bool のみ。
+// `for x in start..end` は上限排他、`for x in start..=end` は上限包含。
+// 範囲は整数のみ（一般のイテレータ＝Iterator トレイト経由は未対応）。
+
+// 排他範囲 0..n の合計（0+1+...+(n-1)）。
+fn sum_below(n: i32): i32 {
+    let mut acc = 0
+    for i in 0..n {
+        acc = acc + i
+    }
+    return acc
+}
+
+// 包含範囲 1..=n の積（階乗）。境界に変数を使える。
+fn factorial(n: i32): i32 {
+    let mut acc = 1
+    for i in 1..=n {
+        acc = acc * i
+    }
+    return acc
+}
+
+// continue / break: 0..n の奇数だけ合計し、和が limit を超えたら打ち切る。
+fn odd_sum_capped(n: i32, limit: i32): i32 {
+    let mut acc = 0
+    for i in 0..n {
+        if i % 2 == 0 {
+            continue
+        }
+        if acc + i > limit {
+            break
+        }
+        acc = acc + i
+    }
+    return acc
+}
+
+fn main(): i32 {
+    let a = println_int(sum_below(5))           // 0+1+2+3+4 = 10
+    let b = println_int(factorial(5))           // 120
+    let c = println_int(odd_sum_capped(100, 20)) // 1+3+5+7 = 16（次の 9 で 25>20 のため打ち切り）
+    return 0
+}

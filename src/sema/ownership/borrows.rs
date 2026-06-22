@@ -181,6 +181,11 @@ impl Borrows<'_> {
             }
             // while の条件の一時借用はこの文の間だけ生きる。本体は descend で扱う。
             Stmt::While { cond, .. } => self.gather(cond, &mut temps),
+            // for の範囲境界の一時借用はこの文の間だけ。本体は descend で扱う。
+            Stmt::For { start, end, .. } => {
+                self.gather(start, &mut temps);
+                self.gather(end, &mut temps);
+            }
             Stmt::Loop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Expr(e) => self.gather(e, &mut temps),
         }
@@ -319,6 +324,12 @@ impl Borrows<'_> {
                 self.visit_block(body);
             }
             Stmt::Loop { body, .. } => self.visit_block(body),
+            // ループ本体は独立スコープ。範囲境界は文側で集約済み。
+            Stmt::For { start, end, body, .. } => {
+                self.descend_expr(start);
+                self.descend_expr(end);
+                self.visit_block(body);
+            }
             Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Expr(e) => self.descend_expr(e),
             Stmt::Return { value: None, .. } => {}

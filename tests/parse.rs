@@ -120,6 +120,29 @@ fn parses_while_loop_break_continue() {
 }
 
 #[test]
+fn parses_for_range_loop() {
+    // `for x in lo..hi` / `for x in lo..=hi`（範囲・包含性・本体）。
+    let program = parse_src(
+        "fn f() {\n    for i in 0..10 {\n        continue\n    }\n    for j in 1..=n {\n        break\n    }\n}",
+    );
+    let Item::Function(f) = &program.items[0] else { panic!("関数のはず") };
+    let Stmt::For { var, inclusive, start, body, .. } = &f.body.stmts[0] else {
+        panic!("for 文のはず");
+    };
+    assert_eq!(var, "i");
+    assert!(!*inclusive); // `..`
+    assert!(matches!(&start.kind, ExprKind::Int(0)));
+    assert!(matches!(&body.stmts[0], Stmt::Continue { .. }));
+    let Stmt::For { var, inclusive, end, body, .. } = &f.body.stmts[1] else {
+        panic!("for 文のはず");
+    };
+    assert_eq!(var, "j");
+    assert!(*inclusive); // `..=`
+    assert!(matches!(&end.kind, ExprKind::Ident(name) if name == "n"));
+    assert!(matches!(&body.stmts[0], Stmt::Break { .. }));
+}
+
+#[test]
 fn lexes_range_operators() {
     // `..` と `..=` は最長一致で正しくトークン化される（`.` と区別する）。
     let kinds: Vec<_> = lex("1..10 1..=10")

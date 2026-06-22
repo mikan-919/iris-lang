@@ -198,6 +198,23 @@ impl Flow<'_> {
             Stmt::Loop { body, .. } => {
                 self.visit_loop_body(body, st, ret_is_ref);
             }
+            Stmt::For {
+                start,
+                end,
+                body,
+                var_span,
+                ..
+            } => {
+                // 範囲の境界は読み（整数 Copy）。ムーブしない。
+                self.visit_operand(start, st);
+                self.visit_operand(end, st);
+                // ループ変数は反復ごとに再束縛される整数（Copy）。念のため状態をリセット。
+                if let Some(&id) = self.def_spans.get(var_span) {
+                    st.moved.remove(&id);
+                    st.dangling.remove(&id);
+                }
+                self.visit_loop_body(body, st, ret_is_ref);
+            }
             // break / continue は制御フローのみ。ムーブ集合は保守的に直線扱いで足りる。
             Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Expr(e) => self.visit_expr(e, st),

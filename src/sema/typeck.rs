@@ -591,6 +591,62 @@ impl<'a> Checker<'a> {
                 self.check_block(body);
                 self.loop_depth -= 1;
             }
+            Stmt::For {
+                var_span,
+                start,
+                end,
+                body,
+                span,
+                ..
+            } => {
+                let start_ty = self.check_expr(start);
+                let end_ty = self.check_expr(end);
+                // 範囲の境界は整数（現状 `for` は整数範囲のみ。浮動小数・一般の
+                // イテレータは未対応）。
+                if !matches!(start_ty, Ty::Error | Ty::Infer) && !self.is_integer_like(&start_ty) {
+                    self.error(
+                        start.span,
+                        format!(
+                            "`for` の範囲の下限は整数である必要があります（`{}`）",
+                            start_ty.describe()
+                        ),
+                    );
+                }
+                if !matches!(end_ty, Ty::Error | Ty::Infer) && !self.is_integer_like(&end_ty) {
+                    self.error(
+                        end.span,
+                        format!(
+                            "`for` の範囲の上限は整数である必要があります（`{}`）",
+                            end_ty.describe()
+                        ),
+                    );
+                }
+                // 下限と上限は同じ整数型であること（リテラルは具体型へ適合）。
+                if !self.assignable(&start_ty, &end_ty) && !self.assignable(&end_ty, &start_ty) {
+                    self.error(
+                        *span,
+                        format!(
+                            "`for` の範囲の下限と上限の型が一致しません: `{}` と `{}`",
+                            start_ty.describe(),
+                            end_ty.describe()
+                        ),
+                    );
+                }
+                // ループ変数の型: 境界の具体整数型を優先し、両方リテラルなら既定 `i32`。
+                let var_ty = if matches!(start_ty, Ty::Named { .. }) && self.is_integer_like(&start_ty) {
+                    start_ty
+                } else if matches!(end_ty, Ty::Named { .. }) && self.is_integer_like(&end_ty) {
+                    end_ty
+                } else {
+                    Ty::named("i32")
+                };
+                if let Some(&id) = self.def_spans.get(var_span) {
+                    self.def_types[id] = var_ty;
+                }
+                self.loop_depth += 1;
+                self.check_block(body);
+                self.loop_depth -= 1;
+            }
             Stmt::Break { span } => {
                 if self.loop_depth == 0 {
                     self.error(*span, "`break` はループの中でのみ使えます".to_string());

@@ -196,6 +196,8 @@ fn lex_ident_or_keyword(input: LSpan) -> nom::IResult<LSpan, Token> {
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
         "loop" => TokenKind::Loop,
+        "for" => TokenKind::For,
+        "in" => TokenKind::In,
         "break" => TokenKind::Break,
         "continue" => TokenKind::Continue,
         "pub" => TokenKind::Pub,

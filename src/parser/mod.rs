@@ -121,7 +121,8 @@ fn parse_impl(input: Tokens) -> PResult<Impl> {
     // 先頭の名前（トレイトか型かはこの時点で未確定）。
     let (input, first) = parse_trait_ref(input.take_from(1))?;
     // `for` が続けば `impl Trait for Type`、なければ固有 `impl Type`。
-    let is_for = matches!(input.peek(), TokenKind::Ident(n) if n == "for");
+    // `for` は `for x in ...` の予約語と同じトークン（文脈キーワードとして流用）。
+    let is_for = matches!(input.peek(), TokenKind::For);
     let (input, trait_ref, type_name, type_name_span) = if is_for {
         let (input, (tname, tspan)) = ident(input.take_from(1))?;
         (input, Some(first), tname, tspan)
@@ -755,6 +756,7 @@ fn parse_stmt(input: Tokens) -> PResult<Stmt> {
         TokenKind::Return => parse_return(input),
         TokenKind::While => parse_while(input),
         TokenKind::Loop => parse_loop(input),
+        TokenKind::For => parse_for(input),
         TokenKind::Break => {
             let span = input.first().span;
             Ok((input.take_from(1), Stmt::Break { span }))
@@ -872,6 +874,43 @@ fn parse_loop(input: Tokens) -> PResult<Stmt> {
     let (input, body) = parse_block(input.take_from(1))?;
     let span = start.merge(body.span);
     Ok((input, Stmt::Loop { body, span }))
+}
+
+/// `for x in start..end { ... }` / `for x in start..=end { ... }`。
+/// 範囲はパターンと同じ規約（`..` は上限排他・`..=` は包含）。境界式・本体ともに
+/// 構造体リテラルを抑制し、末尾の `{` をブロックとして取り扱う。
+fn parse_for(input: Tokens) -> PResult<Stmt> {
+    let kw = input.first();
+    let kw_span = kw.span;
+    let (input, (var, var_span)) = ident(input.take_from(1))?;
+    let (input, _) = expect(input, &TokenKind::In, "`in`")?;
+    let (input, lo) = parse_expr_r(input, true)?;
+    // `..`（排他）か `..=`（包含）。範囲以外の `for` 反復は未対応。
+    let (input, inclusive) = match input.peek() {
+        TokenKind::DotDotEq => (input.take_from(1), true),
+        TokenKind::DotDot => (input.take_from(1), false),
+        _ => {
+            return Err(nom::Err::Failure(ParseErr::expected(
+                "`..` または `..=`（範囲）",
+                input.first(),
+            )));
+        }
+    };
+    let (input, hi) = parse_expr_r(input, true)?;
+    let (input, body) = parse_block(input)?;
+    let span = kw_span.merge(body.span);
+    Ok((
+        input,
+        Stmt::For {
+            var,
+            var_span,
+            start: lo,
+            end: hi,
+            inclusive,
+            body,
+            span,
+        },
+    ))
 }
 
 // ---- 式 -----------------------------------------------------------------

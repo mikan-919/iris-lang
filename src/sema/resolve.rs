@@ -190,6 +190,23 @@ impl Resolver {
                 self.resolve_block(body);
             }
             Stmt::Loop { body, .. } => self.resolve_block(body),
+            Stmt::For {
+                var,
+                var_span,
+                start,
+                end,
+                body,
+                ..
+            } => {
+                // 範囲の境界は本体スコープの外で解決する。
+                self.resolve_expr(start);
+                self.resolve_expr(end);
+                // ループ変数は本体を囲む独立スコープへ束縛する（不変・反復ごとに再束縛）。
+                self.push_scope();
+                self.declare(var, DefKind::Local, *var_span, false, true);
+                self.resolve_block(body);
+                self.pop_scope();
+            }
             // break / continue は名前を持たない（ループ外使用の検査は型検査で行う）。
             Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Expr(e) => self.resolve_expr(e),

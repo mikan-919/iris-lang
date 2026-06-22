@@ -137,6 +137,53 @@ fn runs_factorial() {
 }
 
 #[test]
+fn emits_for_counter_loop() {
+    // for は cond/body/step/end のカウンタループへ落ちる。
+    let ir = emit("fn main(): i32 {\n    let mut s = 0\n    for i in 0..5 {\n        s = s + i\n    }\n    return s\n}");
+    assert!(ir.contains("for.cond"));
+    assert!(ir.contains("for.step"));
+    assert!(ir.contains("for.end"));
+    assert!(ir.contains("icmp slt i32"));
+    assert!(ir.contains("add i32"));
+}
+
+#[test]
+fn runs_for_exclusive_range() {
+    // 0+1+2+3+4 = 10
+    let src = "fn main(): i32 {\n    let mut s = 0\n    for i in 0..5 {\n        s = s + i\n    }\n    return s\n}";
+    if let Some(code) = run_exit_code(src, "for_excl") {
+        assert_eq!(code, 10);
+    }
+}
+
+#[test]
+fn runs_for_inclusive_range() {
+    // 1+2+3+4+5 = 15
+    let src = "fn main(): i32 {\n    let mut s = 0\n    for i in 1..=5 {\n        s = s + i\n    }\n    return s\n}";
+    if let Some(code) = run_exit_code(src, "for_incl") {
+        assert_eq!(code, 15);
+    }
+}
+
+#[test]
+fn runs_for_with_break_and_continue() {
+    // continue で偶数を飛ばし 0..10 の奇数和 25、break で 3 で打ち切り。
+    let src = "fn main(): i32 {\n    let mut odd = 0\n    for i in 0..10 {\n        if i % 2 == 0 {\n            continue\n        }\n        odd = odd + i\n    }\n    let mut c = 0\n    for k in 0..100 {\n        if k == 3 {\n            break\n        }\n        c = c + 1\n    }\n    return odd + c\n}";
+    if let Some(code) = run_exit_code(src, "for_brk_cont") {
+        assert_eq!(code, 28); // 25 + 3
+    }
+}
+
+#[test]
+fn runs_nested_for_with_variable_bound() {
+    // 3x3 の二重ループ = 9。境界は変数。
+    let src = "fn main(): i32 {\n    let n = 3\n    let mut grid = 0\n    for a in 0..n {\n        for b in 0..n {\n            grid = grid + 1\n        }\n    }\n    return grid\n}";
+    if let Some(code) = run_exit_code(src, "for_nested") {
+        assert_eq!(code, 9);
+    }
+}
+
+#[test]
 fn runs_arithmetic_and_let() {
     let src = "fn main(): i32 {\n    let a = 6\n    let mut b = 7\n    b = b * a\n    return b - 2\n}";
     if let Some(code) = run_exit_code(src, "arith") {

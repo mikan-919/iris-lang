@@ -179,6 +179,17 @@ pub enum Stmt {
     },
     /// 無限ループ `loop { ... }`（`break` で抜ける）
     Loop { body: Block, span: Span },
+    /// イテレータループ `for x in start..end { ... }`（現状は整数範囲のみ）。
+    /// `inclusive` が真なら `..=`（上限を含む）、偽なら `..`（上限を含まない）。
+    For {
+        var: String,
+        var_span: Span,
+        start: Expr,
+        end: Expr,
+        inclusive: bool,
+        body: Block,
+        span: Span,
+    },
     /// `break`（最も内側のループを抜ける）
     Break { span: Span },
     /// `continue`（最も内側のループの先頭へ）

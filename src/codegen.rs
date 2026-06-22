@@ -537,6 +537,11 @@ fn walk_stmt_calls(stmt: &Stmt, out: &mut Vec<Span>) {
             collect_call_callees(body, out);
         }
         Stmt::Loop { body, .. } => collect_call_callees(body, out),
+        Stmt::For { start, end, body, .. } => {
+            walk_expr_calls(start, out);
+            walk_expr_calls(end, out);
+            collect_call_callees(body, out);
+        }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
         Stmt::Expr(e) => walk_expr_calls(e, out),
     }
@@ -790,6 +795,14 @@ impl<'a> FnCodegen<'a> {
             }
             Stmt::While { cond, body, .. } => self.gen_while(cond, body),
             Stmt::Loop { body, .. } => self.gen_loop(body),
+            Stmt::For {
+                var_span,
+                start,
+                end,
+                inclusive,
+                body,
+                ..
+            } => self.gen_for(var_span, start, end, *inclusive, body),
             Stmt::Break { span } => {
                 let (_, brk) = self
                     .loops
@@ -854,6 +867,88 @@ impl<'a> FnCodegen<'a> {
         if !self.terminated {
             self.emit(&format!("br label %{body_l}"));
         }
+
+        self.emit_label(&end_l);
+        Ok(())
+    }
+
+    /// `for x in start..end { ... }` をカウンタループへ落とす。
+    /// 範囲境界は一度だけ評価し、`x` を 1 ずつ増やしながら `x < end`（包含なら
+    /// `x <= end`）が成り立つ間ループする。`continue` は増分（step）へ、`break` は
+    /// 末尾へ分岐する。現状は整数範囲のみ（typeck が境界を整数に制限する）。
+    fn gen_for(
+        &mut self,
+        var_span: &Span,
+        start: &Expr,
+        end: &Expr,
+        inclusive: bool,
+        body: &Block,
+    ) -> Result<(), CodegenError> {
+        // ループ変数の型: 境界の具体整数型を優先し、両方リテラルなら既定 `i32`。
+        let lo_ty = self.raw_ty(start);
+        let hi_ty = self.raw_ty(end);
+        let var_ty = if matches!(lo_ty, Ty::Named { .. }) {
+            lo_ty
+        } else if matches!(hi_ty, Ty::Named { .. }) {
+            hi_ty
+        } else {
+            Ty::named("i32")
+        }
+        .defaulted();
+        let llty = llvm_ty(&var_ty, self.structs)
+            .map_err(|m| CodegenError::new(start.span, m))?;
+        let nk = num_kind(&var_ty);
+
+        let cond_l = self.fresh_label("for.cond");
+        let body_l = self.fresh_label("for.body");
+        let step_l = self.fresh_label("for.step");
+        let end_l = self.fresh_label("for.end");
+
+        // 初期値をループ変数の場所へ格納する。
+        let (init, _) = self.gen_value(start, &var_ty)?;
+        let id = self.def_spans.get(var_span).copied().ok_or_else(|| {
+            CodegenError::new(*var_span, "ループ変数の定義が見つかりません")
+        })?;
+        let slot = format!("%v.slot{id}");
+        self.emit(&format!("{slot} = alloca {llty}"));
+        self.emit(&format!("store {llty} {init}, ptr {slot}"));
+        self.locals.insert(id, (slot.clone(), llty.clone()));
+        // 上限は一度だけ評価する（preheader でループ全体を支配する）。
+        let (limit, _) = self.gen_value(end, &var_ty)?;
+
+        self.emit(&format!("br label %{cond_l}"));
+        self.emit_label(&cond_l);
+        let cur = self.fresh_tmp();
+        self.emit(&format!("{cur} = load {llty}, ptr {slot}"));
+        let pred = match (nk, inclusive) {
+            (NumKind::UInt, false) => "icmp ult",
+            (NumKind::UInt, true) => "icmp ule",
+            (NumKind::SInt, false) => "icmp slt",
+            (NumKind::SInt, true) => "icmp sle",
+            // 整数のみのため Float には来ない（防御的に slt/sle）。
+            (NumKind::Float, false) => "icmp slt",
+            (NumKind::Float, true) => "icmp sle",
+        };
+        let c = self.fresh_tmp();
+        self.emit(&format!("{c} = {pred} {llty} {cur}, {limit}"));
+        self.emit(&format!("br i1 {c}, label %{body_l}, label %{end_l}"));
+
+        self.emit_label(&body_l);
+        // continue は増分へ、break は末尾へ。
+        self.loops.push((step_l.clone(), end_l.clone()));
+        self.gen_block(body)?;
+        self.loops.pop();
+        if !self.terminated {
+            self.emit(&format!("br label %{step_l}"));
+        }
+
+        self.emit_label(&step_l);
+        let cur2 = self.fresh_tmp();
+        self.emit(&format!("{cur2} = load {llty}, ptr {slot}"));
+        let next = self.fresh_tmp();
+        self.emit(&format!("{next} = add {llty} {cur2}, 1"));
+        self.emit(&format!("store {llty} {next}, ptr {slot}"));
+        self.emit(&format!("br label %{cond_l}"));
 
         self.emit_label(&end_l);
         Ok(())

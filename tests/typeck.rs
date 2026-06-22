@@ -161,6 +161,51 @@ fn accepts_break_continue_inside_loop() {
 }
 
 #[test]
+fn accepts_for_integer_range() {
+    // ループ変数は整数として本体で使え、break/continue も使える。
+    typecheck(
+        "fn f() {\n    let mut s = 0\n    for i in 0..10 {\n        s = s + i\n        if i == 5 { break }\n    }\n}",
+    )
+    .expect("整数範囲の for は通る");
+}
+
+#[test]
+fn for_loop_var_uses_concrete_bound_type() {
+    // 具体整数型の境界はループ変数へ伝播する（`i64` 同士の加算が通る）。
+    typecheck("fn f(n: i64) {\n    let mut s: i64 = 0\n    for i in 0..n {\n        s = s + i\n    }\n}")
+        .expect("境界の i64 がループ変数へ伝播する");
+}
+
+#[test]
+fn rejects_for_float_range() {
+    let errs = typecheck("fn f() {\n    for x in 0.0..5.0 {\n    }\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("整数である必要があります")));
+}
+
+#[test]
+fn rejects_for_mismatched_bound_types() {
+    // 下限 i32（具体型）と上限 i64 は一致しない。
+    let errs =
+        typecheck("fn f(n: i64) {\n    let a: i32 = 1\n    for k in a..n {\n    }\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("下限と上限の型が一致しません")));
+}
+
+#[test]
+fn rejects_assigning_to_for_loop_var() {
+    // ループ変数は不変束縛。
+    let errs = typecheck("fn f() {\n    for i in 0..3 {\n        i = 9\n    }\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("再代入できません")));
+}
+
+#[test]
+fn for_loop_var_out_of_scope_after_loop() {
+    // ループ変数はループ本体の外では未定義（名前解決で弾く）。
+    let tokens = lex("fn f() {\n    for i in 0..3 {\n    }\n    let x = i\n}").expect("字句解析");
+    let program = parse(&tokens).expect("構文解析");
+    assert!(resolve(&program).is_err(), "ループ変数 i はループ外では見えないはず");
+}
+
+#[test]
 fn accepts_match_guard_with_bool() {
     // ガードが bool なら通る。ペイロード束縛をガードから参照できる。
     typecheck(
