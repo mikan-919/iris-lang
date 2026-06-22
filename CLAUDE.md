@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+Document Map is here -> @MAP.md
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 iris-lang は「Go のシンプルさで Rust の所有権ベースのメモリ安全性を得る」コンパイル言語の
@@ -80,11 +82,3 @@ span を一意に保つため単一文字列として扱う）。現状の codeg
   参照越しの代入（write-through）は未対応。
 - `docs/STATUS.md` 末尾「仕様未確定のため独自に決めた点」に、docs に記述がなく実装側で暫定決定した
   構文（`let mut x`、代入文 `target = value`、`else` の位置）がある。本実装前にユーザー確認が必要。
-
-## ドキュメントの所在
-
-- `docs/CONCEPT.md` — 言語のコンセプト（不変の設計指針）。
-- `docs/CONTEXT.md` — 用語集（trait/let/const/mut/所有権 DAG など）。
-- `docs/spec/` — 言語仕様（type/trait/ownership/control/error/function/module/concurrency/compiler）。
-- `docs/STATUS.md` — 実装進捗（このリポジトリで最も更新頻度が高い実態ドキュメント）。
-- `docs/adr/` — 設計判断の記録。
