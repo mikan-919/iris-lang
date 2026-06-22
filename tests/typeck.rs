@@ -322,3 +322,31 @@ fn for_over_non_copy_element_rejected() {
     let errs = typecheck(src).unwrap_err();
     assert!(errs.iter().any(|m| m.contains("Copy")));
 }
+
+#[test]
+fn accepts_string_and_array_index() {
+    // 文字列の添字は u8、配列の添字は要素型。整合する束縛は通る。
+    let src = "fn f() {\n    let s = \"hi\"\n    let b: u8 = s[0]\n    let arr: i32[] = [1, 2, 3]\n    let x: i32 = arr[1]\n    let v: Vec<i32> = [4, 5]\n    let y: i32 = v[0]\n}";
+    typecheck(src).expect("添字アクセスは整合するはず");
+}
+
+#[test]
+fn rejects_non_integer_subscript() {
+    // 添字が整数でなければエラー。
+    let errs = typecheck("fn f() {\n    let arr: i32[] = [1, 2]\n    let x = arr[true]\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("添字は整数")));
+}
+
+#[test]
+fn rejects_index_on_non_indexable() {
+    // 添字アクセスできない型はエラー。
+    let errs = typecheck("fn f() {\n    let n = 5\n    let x = n[0]\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("添字アクセスできません")));
+}
+
+#[test]
+fn rejects_string_index_into_i32() {
+    // 文字列の添字は u8 なので i32 の束縛には入らない（暗黙の幅変換は無い）。
+    let errs = typecheck("fn f() {\n    let s = \"hi\"\n    let b: i32 = s[0]\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("型が一致しません")));
+}

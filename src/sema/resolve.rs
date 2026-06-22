@@ -347,6 +347,10 @@ impl Resolver {
                     self.resolve_expr(e);
                 }
             }
+            ExprKind::Index { base, index } => {
+                self.resolve_expr(base);
+                self.resolve_expr(index);
+            }
         }
     }
 

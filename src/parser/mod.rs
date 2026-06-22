@@ -1222,6 +1222,20 @@ fn parse_postfix(input: Tokens, no_struct: bool) -> PResult<Expr> {
                 };
                 input = rest;
             }
+            // 添字アクセス `base[index]`（文字列・配列・Vec の要素読み）
+            TokenKind::LBracket => {
+                let (rest, index) = parse_expr(input.take_from(1))?;
+                let (rest, rb) = expect(rest, &TokenKind::RBracket, "`]`")?;
+                let span = expr.span.merge(rb.span);
+                expr = Expr {
+                    kind: ExprKind::Index {
+                        base: Box::new(expr),
+                        index: Box::new(index),
+                    },
+                    span,
+                };
+                input = rest;
+            }
             // エラー伝播 `!`
             TokenKind::Bang => {
                 let bang_span = input.first().span;

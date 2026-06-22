@@ -908,6 +908,10 @@ fn walk_expr_calls(expr: &Expr, out: &mut Vec<Span>) {
                 walk_expr_calls(e, out);
             }
         }
+        ExprKind::Index { base, index } => {
+            walk_expr_calls(base, out);
+            walk_expr_calls(index, out);
+        }
         ExprKind::Int(_)
         | ExprKind::Float(_)
         | ExprKind::Str(_)
@@ -2052,7 +2056,51 @@ impl<'a> FnCodegen<'a> {
                 self.gen_match(scrutinee, arms, expr.span)
             }
             ExprKind::ArrayLit { elems } => self.gen_array_lit(elems, expr.span),
+            ExprKind::Index { base, index } => self.gen_index(base, index, expr.span),
         }
+    }
+
+    /// 添字アクセス `base[index]` を読む。`string` は i 番目のバイトを `u8` で、固定長
+    /// 配列 `T[]` / 動的配列 `Vec<T>` は要素 `T` を返す。添字は GEP の添字としてネイティブ
+    /// 整数型のまま使う（GEP の添字は任意の整数幅を許す）。
+    fn gen_index(&mut self, base: &Expr, index: &Expr, span: Span) -> Result<String, CodegenError> {
+        let base_ty = self.iris_ty(base).peel_refs().clone();
+        let idx_ty = self.iris_ty(index);
+        let (iv, ity) = self.gen_value(index, &idx_ty)?;
+        // 文字列 = NUL 終端バイト列。先頭ポインタから i バイト目を load する。
+        if let Ty::Named { name, args } = &base_ty
+            && name == "string"
+            && args.is_empty()
+        {
+            let (sv, _) = self.gen_value(base, &base_ty)?;
+            let ep = self.fresh_tmp();
+            self.emit(&format!("{ep} = getelementptr i8, ptr {sv}, {ity} {iv}"));
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = load i8, ptr {ep}"));
+            return Ok(r);
+        }
+        // 配列 `T[]` / 動的配列 `Vec<T>`。データポインタ＋添字で要素アドレスを求め load。
+        let (is_vec, elem_ty) = match &base_ty {
+            Ty::Named { name, args } if name == "Vec" && args.len() == 1 => (true, args[0].clone()),
+            Ty::Array(e) | Ty::ArrayLit(e) => (false, (**e).clone()),
+            _ => {
+                return Err(CodegenError::new(
+                    span,
+                    format!("型 `{}` は添字アクセスできません", base_ty.describe()),
+                ));
+            }
+        };
+        let elem_ty = elem_ty.defaulted();
+        let elem_llty = llvm_ty(&elem_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        let coll_llty = if is_vec { "%Vec" } else { "%Array" };
+        let (cv, _) = self.gen_value(base, &base_ty)?;
+        let dataptr = self.fresh_tmp();
+        self.emit(&format!("{dataptr} = extractvalue {coll_llty} {cv}, 0"));
+        let ep = self.fresh_tmp();
+        self.emit(&format!("{ep} = getelementptr {elem_llty}, ptr {dataptr}, {ity} {iv}"));
+        let r = self.fresh_tmp();
+        self.emit(&format!("{r} = load {elem_llty}, ptr {ep}"));
+        Ok(r)
     }
 
     /// 配列リテラル `[e1, e2, ...]` を生成する。typeck が確定した型（`T[]` か `Vec<T>`）で
@@ -2087,8 +2135,13 @@ impl<'a> FnCodegen<'a> {
             self.emit(&format!("{sz} = ptrtoint ptr {szp} to i64"));
             let total = self.fresh_tmp();
             self.emit(&format!("{total} = mul i64 {sz}, {n}"));
+            // malloc は i32 引数で宣言する（prelude の `extern fn malloc(n: i32)` と一致。
+            // x86-64 では i32 引数が rdi へゼロ拡張されるため size_t と互換）。総量を i32 へ
+            // 切り詰めて呼ぶ（このトイ言語の確保サイズでは十分）。
+            let total32 = self.fresh_tmp();
+            self.emit(&format!("{total32} = trunc i64 {total} to i32"));
             let buf = self.fresh_tmp();
-            self.emit(&format!("{buf} = call ptr @malloc(i64 {total})"));
+            self.emit(&format!("{buf} = call ptr @malloc(i32 {total32})"));
             for (i, e) in elems.iter().enumerate() {
                 let (v, _) = self.gen_value(e, &elem_ty)?;
                 let p = self.fresh_tmp();

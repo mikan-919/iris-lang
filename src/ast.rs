@@ -300,6 +300,12 @@ pub enum ExprKind {
     /// 配列リテラル `[e1, e2, ...]`。型注釈に応じて固定長配列 `T[]` または
     /// 動的配列 `Vec<T>` を構築する（型指向。typeck が解決して型を記録する）。
     ArrayLit { elems: Vec<Expr> },
+    /// 添字アクセス `base[index]`。`string`（→ `u8`）・固定長配列 `T[]`（→ `T`）・
+    /// 動的配列 `Vec<T>`（→ `T`）の要素を読む。要素型は typeck が記録する。
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
 }
 
 /// match 式のアーム `pattern [if guard] -> body`。

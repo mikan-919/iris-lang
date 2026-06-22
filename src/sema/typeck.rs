@@ -812,6 +812,40 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Match { scrutinee, arms } => self.infer_match(scrutinee, arms, expr.span),
             ExprKind::ArrayLit { elems } => self.infer_array_lit(elems),
+            ExprKind::Index { base, index } => self.infer_index(base, index, expr.span),
+        }
+    }
+
+    /// 添字アクセス `base[index]` を型付けする。`string` は `u8`、固定長配列 `T[]` と
+    /// 動的配列 `Vec<T>` は要素型 `T` を返す。添字は整数族でなければならない。
+    fn infer_index(&mut self, base: &Expr, index: &Expr, span: Span) -> Ty {
+        let mut base_ty = self.check_expr(base);
+        // 参照越しの添字は自動でたどる。
+        while let Ty::Ref { inner, .. } = base_ty {
+            base_ty = *inner;
+        }
+        let idx_ty = self.check_expr(index);
+        if !matches!(idx_ty, Ty::Error) && !self.is_integer_like(&idx_ty) {
+            self.error(
+                index.span,
+                format!("添字は整数でなければなりません（`{}`）", idx_ty.describe()),
+            );
+        }
+        match &base_ty {
+            // 文字列はバイト列。索引は 1 バイト（`u8`）を返す。
+            Ty::Named { name, args } if name == "string" && args.is_empty() => Ty::named("u8"),
+            // 固定長配列 `T[]`。
+            Ty::Array(elem) => (**elem).clone(),
+            // 動的配列 `Vec<T>`。
+            Ty::Named { name, args } if name == "Vec" && args.len() == 1 => args[0].clone(),
+            Ty::Error => Ty::Error,
+            _ => {
+                self.error(
+                    span,
+                    format!("型 `{}` は添字アクセスできません", base_ty.describe()),
+                );
+                Ty::Error
+            }
         }
     }
 
@@ -2120,6 +2154,8 @@ fn is_copy_ty(ty: &Ty) -> bool {
                 || FLOAT_TYPES.contains(&name.as_str())
                 || name == "bool"
                 || name == "char"
+                // 文字列は不変なポインタ値で free/drop を持たないため Copy 扱い。
+                || name == "string"
         }
         _ => false,
     }

@@ -70,7 +70,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   - リテラル（整数・浮動小数点・文字列・真偽値）、識別子
   - 二項演算 `+ - * / %`、比較 `< <= > >=`、等価 `== !=`、論理 `&& ||`
   - 単項 `-`、参照 `&` / `&mut`
-  - 後置: 関数呼び出し `f(...)`、メンバアクセス `a.b`、エラー伝播 `expr!`
+  - 後置: 関数呼び出し `f(...)`、メンバアクセス `a.b`、エラー伝播 `expr!`、**添字アクセス `base[index]`**（後置式・チェーン可。`string`→`u8`、固定長配列 `T[]`→`T`、`Vec<T>`→`T`。添字は任意の整数式）
   - 三項演算子 `cond ? a : b`
   - if 式（`else if` / `else` 連鎖）
   - **match 式** `match expr { Pattern [if guard] -> expr ... }`（アームは改行またはカンマ区切り。`->` は既存の `Arrow` トークンを流用）。パターンはワイルドカード `_`・リテラル（整数・浮動小数・bool・文字列）・**数値範囲 `1..10`（排他）/ `1..=10`（包含）**・enum バリアント（束縛あり）。各アームに**ガード `if cond`**（bool・束縛変数参照可）を付けられる
@@ -217,7 +217,11 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   `ptr`（先頭バイトのアドレス）として扱う（`llvm_ty("string") = ptr`、`zero_value(ptr) = null`）。
   リテラルの符号化は印字可能 ASCII 以外と `"` `\` を `\XX`（16進）でエスケープし末尾に NUL を付ける
   （マルチバイト UTF-8 はバイト単位）。値渡し（引数・戻り値・`let`）に対応。`extern fn puts`（std）で
-  libc に渡して出力できる。**長さ・索引・連結・補間などの操作はまだ無い**（リテラルを渡す/返すのみ）
+  libc に渡して出力できる。文字列は **Copy 型**として扱う（不変な NUL 終端ポインタ。free/drop を持たず
+  ポインタ複製は安全＝Rust の `&str` 相当）。**操作**: `s.len()`（libc `strlen` を借りる。`i32`）・
+  添字 `s[i]`（i 番目のバイトを `u8` で返す＝`getelementptr i8` + `load i8`）・`a.concat(b)`（`malloc` で
+  確保したバッファへ `strcpy`+`strcat`。結果はヒープ＝現状 free 無しでリークを許容、`Vec` と同様）を
+  `std/prelude.iris` の `impl string` ＋ libc extern で実装済み。**残り**: 補間・スライス・`as` 変換
 - **配列 `T[]` / 動的配列 `Vec<T>`**: 使用時のみ名前付き型を宣言する。固定長配列は fat pointer
   `%Array = type { ptr, i64 }`（データポインタ＋長さ）。配列リテラルは `alloca [N x T]` をスタックに
   確保し各要素を `store`、先頭アドレスと長さ `N` を `insertvalue` で組む。動的配列は
@@ -246,15 +250,15 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
-- 未対応（今後）: 文字列の操作（長さ・索引・連結・補間）（`!` エラー伝播・ジェネリック **enum**（集約ペイロード）＝ADR-0010・ジェネリック**関数**・ジェネリック **struct 型**の単相化はいずれも実装済み）。なお整数/小数リテラルからジェネリック struct を構築すると型パラメータは既定（`i32`/`f64`）に確定し、`Pair<i64>` 等の非既定幅の明示注釈は構築式へ伝播しない（型エラーになる。enum の `refine_construction` と同種の制約）
+- 未対応（今後）: 文字列補間・スライス（長さ `s.len()`・索引 `s[i]`→`u8`・連結 `a.concat(b)` は実装済み）（`!` エラー伝播・ジェネリック **enum**（集約ペイロード）＝ADR-0010・ジェネリック**関数**・ジェネリック **struct 型**の単相化はいずれも実装済み）。なお整数/小数リテラルからジェネリック struct を構築すると型パラメータは既定（`i32`/`f64`）に確定し、`Pair<i64>` 等の非既定幅の明示注釈は構築式へ伝播しない（型エラーになる。enum の `refine_construction` と同種の制約）
 
 ### 標準ライブラリ（最小・iris 自身で記述）
 
-`std/std.iris`。`extern fn putchar` を借りて I/O を実現し、**iris 自身**で書いた最小の
+`std/prelude.iris`。`extern fn putchar` を借りて I/O を実現し、**iris 自身**で書いた最小の
 ライブラリ。コンパイル時に各プログラムの先頭へ自動で前置される（単一の文字列として
 連結し span を一意に保つ）。
 
-- 提供: `putchar` / `puts` / `strcmp`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`、`trait Iterator<T> { fn next(&mut self): Option<T> }`（`for x in iter` が要求する標準トレイト・ADR-0007）
+- 提供: `putchar` / `puts` / `strcmp` / `strlen` / `malloc` / `strcpy` / `strcat`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`、`trait Iterator<T> { fn next(&mut self): Option<T> }`（`for x in iter` が要求する標準トレイト・ADR-0007）、`impl string { fn len(&self): i32, fn concat(&self, other: string): string }`（libc を借りた文字列操作）
 - `puts` は NUL 終端文字列を出力し末尾に改行を付ける（文字列リテラルの出力に使える）
 - `strcmp` は libc から借りる文字列比較。`match` の文字列リテラルパターンの codegen が呼び出す（未使用でも `declare` のみ出力され無害）
 - 現状のコード生成に合わせ `i32` / `bool` / `string` の範囲で記述
@@ -301,6 +305,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 - ジェネリック **enum**（`Option`/`Result`/ユーザ定義）: スカラ／参照／`string`＝ptr ペイロードは i64 共通レイアウト、**struct 等の集約ペイロードは per-instantiation レイアウトで実装済み**（ADR-0010、`Option<Point>`・`Wrap<Point>` 等が縦断・clang 実行）。**残り**: 複数異種ペイロードの過小整列（記憶域＝最大サイズ型のため最大整列とは限らない）、ジェネリック関数の単相化の内側でのみ現れる集約インスタンスの型宣言収集（ADR-0010「Consequences」参照）
 - ジェネリックな **struct 型**定義のコード生成（`type Pair<T>`/`type Box<T>` の per-instantiation 単相化）は**実装済み**（enum・関数のジェネリクスと合わせ、`tests/codegen.rs` で縦断・clang 実行）。**残り**: 整数/小数リテラル構築での非既定幅の型引数の文脈伝播、ジェネリック関数の内側でのみ現れるインスタンスの型宣言収集（ADR-0010 と同種）
 - **`use`・モジュール解決（実装済み）**: `use a.b.*`（glob）・`use a.b { x, y }`（選択）・`use a.b`（Plain）+ `a.b.x(...)` モジュールパス呼び出し。ドット区切り＝ファイルパス区切り（`use foo.bar` → `foo/bar.iris`）。`std` は `CARGO_MANIFEST_DIR/std/` または実行ファイル隣から解決。pub 可視性（モジュールから pub アイテムのみ提供）。**残り**: `use` の選択インポートによる名前制限（現状 Named は Glob と同じ動作）、モジュール自身の相互 use、可視性のモジュール間強制（main 側 pub/private の制限）。
+- **文字列操作（実装済み）**: 長さ `s.len()`（libc `strlen`）・添字 `s[i]`（i 番目のバイト→`u8`）・連結 `a.concat(b)`（`malloc`+`strcpy`+`strcat`、ヒープ結果はリーク許容）を `impl string`＋libc extern で縦断実装。**汎用添字 `expr[i]`** は固定長配列 `T[]`・`Vec<T>` にも対応（要素型を返す）。**残り**: 文字列補間・スライス・`push`/再代入索引・非 Copy 要素の索引
 - 文字列補間（バッククォート `` `...{expr}...` ``）
 - `as` による型変換
 - ブロックコメント
@@ -309,7 +314,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 
 - 借用検査の高度化（NLL 風の精密なライフタイム領域推論・部分ムーブ・ループ）— `compiler.md` の Open Question 領域
 - 型推論の高度化（リテラルの後方からの確定、ジェネリクスの単一化）
-- コード生成の拡張（文字列の操作・I/O）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
+- コード生成の拡張（文字列のスライス・補間、I/O 拡充）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
 - 並行処理 — `concurrency.md` 未設計
 
 ## 仕様未確定のため独自に決めた点（要確認）

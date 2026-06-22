@@ -296,6 +296,10 @@ impl Borrows<'_> {
                     self.gather(el, out);
                 }
             }
+            ExprKind::Index { base, index } => {
+                self.gather(base, out);
+                self.gather(index, out);
+            }
             // if の条件だけ集め、ブロックは descend で扱う。
             ExprKind::If { cond, .. } => self.gather(cond, out),
             _ => {}
@@ -407,6 +411,10 @@ impl Borrows<'_> {
                 for el in elems {
                     self.descend_expr(el);
                 }
+            }
+            ExprKind::Index { base, index } => {
+                self.descend_expr(base);
+                self.descend_expr(index);
             }
             _ => {}
         }

@@ -366,6 +366,12 @@ impl Flow<'_> {
                 }
                 *st = merged;
             }
+            // 添字アクセス `base[index]` は base を借用して要素を読む（base はムーブしない。
+            // 要素は Copy 限定）。index はオペランド読み。
+            ExprKind::Index { base, index } => {
+                self.use_place(base, st);
+                self.visit_operand(index, st);
+            }
         }
     }
 
@@ -551,6 +557,9 @@ fn is_copy(ty: &Ty, aliases: &HashMap<String, Ty>) -> bool {
                 || FLOAT_TYPES.contains(&name.as_str())
                 || name == "bool"
                 || name == "char"
+                // 文字列は不変な NUL 終端ポインタ。free/drop を持たず（concat の結果は
+                // リーク）、ポインタの複製は安全なので Copy 扱い（Rust の `&str` 相当）。
+                || name == "string"
             {
                 true
             } else if let Some(target) = aliases.get(name) {

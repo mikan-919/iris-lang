@@ -212,3 +212,29 @@ fn parses_array_literal_multiline_and_trailing_comma() {
     }
     assert_eq!(arrays, 3);
 }
+
+#[test]
+fn parses_subscript_index() {
+    // 添字アクセス `base[index]` は後置式として解析され、チェーンできる。
+    let prog = parse_src("fn f() {\n    let x = arr[0]\n    let y = m[i][j]\n}");
+    let Item::Function(func) = &prog.items[0] else {
+        panic!("関数のはず");
+    };
+    // 1 つ目: arr[0] は Index{ base: Ident(arr), index: Int(0) }。
+    let Stmt::Let { value, .. } = &func.body.stmts[0] else {
+        panic!("let のはず");
+    };
+    let ExprKind::Index { base, index } = &value.kind else {
+        panic!("Index のはず");
+    };
+    assert!(matches!(&base.kind, ExprKind::Ident(n) if n == "arr"));
+    assert!(matches!(&index.kind, ExprKind::Int(0)));
+    // 2 つ目: m[i][j] は Index{ base: Index{ ... }, index: j } のチェーン。
+    let Stmt::Let { value, .. } = &func.body.stmts[1] else {
+        panic!("let のはず");
+    };
+    let ExprKind::Index { base, .. } = &value.kind else {
+        panic!("外側 Index のはず");
+    };
+    assert!(matches!(&base.kind, ExprKind::Index { .. }));
+}
