@@ -440,6 +440,88 @@ fn runs_range_pattern_match() {
 }
 
 #[test]
+fn runs_option_some_match() {
+    // builtin Option<i32> の構築と match の縦断テスト: Some(42) を unwrap して 42。
+    let src = "fn unwrap_or_zero(o: Option<i32>): i32 {\n    match o {\n        Some(n) -> n\n        None -> 0\n    }\n}\nfn main(): i32 {\n    return unwrap_or_zero(Some(42))\n}";
+    if let Some(code) = run_exit_code(src, "option_some") {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn runs_result_ok_err_match() {
+    // builtin Result<i32, i32>: Ok/Err の双方を構築・match する。
+    // handle(Ok(7))=7, handle(Err(3))=3 → 7*10 + 3 = 73。
+    let src = "fn handle(r: Result<i32, i32>): i32 {\n    match r {\n        Ok(v) -> v\n        Err(e) -> e\n    }\n}\nfn main(): i32 {\n    return handle(Ok(7)) * 10 + handle(Err(3))\n}";
+    if let Some(code) = run_exit_code(src, "result_ok_err") {
+        assert_eq!(code, 73);
+    }
+}
+
+#[test]
+fn runs_user_generic_enum_match() {
+    // ユーザ定義のジェネリック enum: Pair<i32> を構築・match する。
+    // pick(First(5))=5, pick(Second(3))=6 → 5*10 + 6 = 56。
+    let src = "type Pair<T> = enum {\n    First(T)\n    Second(T)\n}\nfn pick(p: Pair<i32>): i32 {\n    match p {\n        First(x) -> x\n        Second(y) -> y * 2\n    }\n}\nfn main(): i32 {\n    return pick(First(5)) * 10 + pick(Second(3))\n}";
+    if let Some(code) = run_exit_code(src, "user_generic_enum") {
+        assert_eq!(code, 56);
+    }
+}
+
+#[test]
+fn runs_generic_enum_struct_payload() {
+    // 集約ペイロード: Option<Point>（struct）を構築・match してフィールドを取り出す。
+    // per-instantiation レイアウト `%"Option$Point" = type { i8, %Point }` を発行する。
+    let src = "type Point = struct {\n    x: i32\n    y: i32\n}\nfn get_x(o: Option<Point>): i32 {\n    match o {\n        Some(p) -> p.x\n        None -> 0\n    }\n}\nfn main(): i32 {\n    return get_x(Some(Point { x: 9, y: 4 }))\n}";
+    if let Some(code) = run_exit_code(src, "enum_struct_payload") {
+        assert_eq!(code, 9);
+    }
+}
+
+#[test]
+fn runs_user_generic_enum_struct_payload() {
+    // ユーザ定義ジェネリック enum × 集約ペイロード: Wrap<Point>。
+    // get(Holds(Point{3,4})) → 3 + 4 = 7。
+    let src = "type Point = struct {\n    x: i32\n    y: i32\n}\ntype Wrap<T> = enum {\n    Empty\n    Holds(T)\n}\nfn get(w: Wrap<Point>): i32 {\n    match w {\n        Holds(p) -> p.x + p.y\n        Empty -> 0 - 1\n    }\n}\nfn main(): i32 {\n    return get(Holds(Point { x: 3, y: 4 }))\n}";
+    if let Some(code) = run_exit_code(src, "user_enum_struct_payload") {
+        assert_eq!(code, 7);
+    }
+}
+
+#[test]
+fn runs_result_error_propagation() {
+    // `!` で Result を伝播。run(5): parse(5)=Ok(10) → v=10 → Ok(11)。
+    // run(-3): parse(-3)=Err(-3) → run が Err(-3) を早期 return。
+    // ra=11, rb=-3 → 11*10 + (0 - (-3)) = 113。
+    let src = "fn parse(n: i32): Result<i32, i32> {\n    if n < 0 {\n        return Err(n)\n    }\n    return Ok(n * 2)\n}\nfn run(n: i32): Result<i32, i32> {\n    let v = parse(n)!\n    return Ok(v + 1)\n}\nfn main(): i32 {\n    let a = run(5)\n    let b = run(0 - 3)\n    let ra = match a {\n        Ok(x) -> x\n        Err(e) -> 0 - 1\n    }\n    let rb = match b {\n        Ok(x) -> x\n        Err(e) -> e\n    }\n    return ra * 10 + (0 - rb)\n}";
+    if let Some(code) = run_exit_code(src, "try_result") {
+        assert_eq!(code, 113);
+    }
+}
+
+#[test]
+fn runs_option_none_propagation() {
+    // `!` で Option を伝播。doubled(5): first_pos(5)=Some(5) → v=5 → Some(10)。
+    // doubled(0): first_pos(0)=None → doubled が None を早期 return。
+    // ra=10, rb=99 → 109。
+    let src = "fn first_pos(n: i32): Option<i32> {\n    if n > 0 {\n        return Some(n)\n    }\n    return None\n}\nfn doubled(n: i32): Option<i32> {\n    let v = first_pos(n)!\n    return Some(v * 2)\n}\nfn main(): i32 {\n    let a = doubled(5)\n    let b = doubled(0)\n    let ra = match a {\n        Some(x) -> x\n        None -> 0\n    }\n    let rb = match b {\n        Some(x) -> x\n        None -> 99\n    }\n    return ra + rb\n}";
+    if let Some(code) = run_exit_code(src, "try_option") {
+        assert_eq!(code, 109);
+    }
+}
+
+#[test]
+fn runs_result_struct_error_propagation() {
+    // 集約（struct）エラーペイロードの伝播: Result<i32, Fail>。
+    // run(5)=Ok(105)。run(-7): check(-7)=Err(Fail{7}) → run が Err を再構築して return。
+    // ra=105, rb=7 → 112。
+    let src = "type Fail = struct {\n    code: i32\n}\nfn check(n: i32): Result<i32, Fail> {\n    if n < 0 {\n        return Err(Fail { code: 0 - n })\n    }\n    return Ok(n)\n}\nfn run(n: i32): Result<i32, Fail> {\n    let v = check(n)!\n    return Ok(v + 100)\n}\nfn main(): i32 {\n    let a = run(5)\n    let b = run(0 - 7)\n    let ra = match a {\n        Ok(x) -> x\n        Err(f) -> 0\n    }\n    let rb = match b {\n        Ok(x) -> x\n        Err(f) -> f.code\n    }\n    return ra + rb\n}";
+    if let Some(code) = run_exit_code(src, "try_struct_err") {
+        assert_eq!(code, 112);
+    }
+}
+
+#[test]
 fn emits_guard_branch() {
     // ガード付きアームは束縛設定の後にガードを評価し、専用ブロックへ分岐する。
     let ir = emit(
@@ -456,5 +538,85 @@ fn runs_match_guard() {
     let src = "type Shape = enum {\n    Circle\n    Rect(i32)\n}\nfn classify(s: Shape): i32 {\n    match s {\n        Rect(side) if side > 10 -> 3\n        Rect(side) if side > 0 -> 2\n        Rect(side) -> 1\n        Circle -> 0\n        _ -> -1\n    }\n}\nfn pick(n: i32): i32 {\n    match n {\n        _ if n < 0 -> 100\n        0 -> 200\n        _ -> 300\n    }\n}\nfn main(): i32 {\n    let a = classify(Rect(20))\n    let b = classify(Rect(5))\n    let c = classify(Rect(0))\n    return a * 100 + b * 10 + c + pick(0) - pick(5)\n}";
     if let Some(code) = run_exit_code(src, "match_guard") {
         assert_eq!(code, 221);
+    }
+}
+
+#[test]
+fn runs_for_in_iterator() {
+    // 一般イテレータ `for x in it`（ADR-0007）。Counter が Iterator<i32> を実装し、
+    // next() で 0,1,2,3,4 を Some で返し、5 で None。for で総和 0+1+2+3+4 = 10。
+    let src = "type Counter = struct {\n    cur: i32\n    hi: i32\n}\nimpl Iterator<i32> for Counter {\n    fn next(&mut self): Option<i32> {\n        if self.cur < self.hi {\n            let v = self.cur\n            self.cur = self.cur + 1\n            return Some(v)\n        }\n        return None\n    }\n}\nfn main(): i32 {\n    let mut c = Counter { cur: 0, hi: 5 }\n    let mut sum = 0\n    for x in c {\n        sum = sum + x\n    }\n    return sum\n}";
+    if let Some(code) = run_exit_code(src, "for_in_iter") {
+        assert_eq!(code, 10);
+    }
+}
+
+#[test]
+fn runs_for_in_break_continue() {
+    // for-in 内の break / continue。Counter は 0,1,2,... を返す。
+    // x==2 で continue（飛ばす）、x==5 で break（終了）。和 = 0+1+3+4 = 8。
+    let src = "type Counter = struct {\n    cur: i32\n    hi: i32\n}\nimpl Iterator<i32> for Counter {\n    fn next(&mut self): Option<i32> {\n        if self.cur < self.hi {\n            let v = self.cur\n            self.cur = self.cur + 1\n            return Some(v)\n        }\n        return None\n    }\n}\nfn main(): i32 {\n    let mut c = Counter { cur: 0, hi: 100 }\n    let mut sum = 0\n    for x in c {\n        if x == 5 {\n            break\n        }\n        if x == 2 {\n            continue\n        }\n        sum = sum + x\n    }\n    return sum\n}";
+    if let Some(code) = run_exit_code(src, "for_in_brk") {
+        assert_eq!(code, 8);
+    }
+}
+
+#[test]
+fn runs_for_in_struct_element() {
+    // 集約ペイロード: Iterator<Point> を for-in で回す（Option<Point> の per-instantiation
+    // レイアウト・ADR-0010）。Gen は (0,10),(1,11),(2,12) を返す。和 = 36。
+    let src = "type Point = struct {\n    x: i32\n    y: i32\n}\ntype Gen = struct {\n    cur: i32\n    hi: i32\n}\nimpl Iterator<Point> for Gen {\n    fn next(&mut self): Option<Point> {\n        if self.cur < self.hi {\n            let v = self.cur\n            self.cur = self.cur + 1\n            return Some(Point { x: v, y: v + 10 })\n        }\n        return None\n    }\n}\nfn main(): i32 {\n    let mut g = Gen { cur: 0, hi: 3 }\n    let mut sum = 0\n    for p in g {\n        sum = sum + p.x + p.y\n    }\n    return sum\n}";
+    if let Some(code) = run_exit_code(src, "for_in_struct") {
+        assert_eq!(code, 36);
+    }
+}
+
+#[test]
+fn runs_generic_struct() {
+    // ジェネリック struct の単相化。Pair<T> を i32 で具体化し、フィールド和を返す。
+    // a=3, b=4 → 7。
+    let src = "type Pair<T> = struct {\n    a: T\n    b: T\n}\nfn main(): i32 {\n    let p = Pair { a: 3, b: 4 }\n    return p.a + p.b\n}";
+    if let Some(code) = run_exit_code(src, "generic_struct") {
+        assert_eq!(code, 7);
+    }
+}
+
+#[test]
+fn runs_generic_struct_through_fn() {
+    // ジェネリック struct を関数引数として値渡し（シグネチャ経由でインスタンスを収集）。
+    // Pair<i32> を作って渡し、p.a*10 + p.b = 42。
+    let src = "type Pair<T> = struct {\n    a: T\n    b: T\n}\nfn combine(p: Pair<i32>): i32 {\n    return p.a * 10 + p.b\n}\nfn main(): i32 {\n    let p = Pair { a: 4, b: 2 }\n    return combine(p)\n}";
+    if let Some(code) = run_exit_code(src, "gstruct_fn") {
+        assert_eq!(code, 42);
+    }
+}
+
+#[test]
+fn runs_generic_struct_two_params_two_insts() {
+    // 2 つの型パラメータ・2 つの異なるインスタンス（Box2<i32,bool> と Box2<i32,i32>）。
+    // a.second ? a.first : 0 = 30、b.second = 5 → 35。
+    let src = "type Box2<A, B> = struct {\n    first: A\n    second: B\n}\nfn main(): i32 {\n    let a = Box2 { first: 30, second: true }\n    let b = Box2 { first: 12, second: 5 }\n    let s = a.second ? a.first : 0\n    return s + b.second\n}";
+    if let Some(code) = run_exit_code(src, "gstruct_two") {
+        assert_eq!(code, 35);
+    }
+}
+
+#[test]
+fn runs_generic_struct_struct_field() {
+    // ジェネリック struct のフィールドが具象 struct（%Wrap.Point = type { %Point }）。
+    // w.val.x + w.val.y = 5 + 7 = 12。
+    let src = "type Point = struct {\n    x: i32\n    y: i32\n}\ntype Wrap<T> = struct {\n    val: T\n}\nfn main(): i32 {\n    let w = Wrap { val: Point { x: 5, y: 7 } }\n    return w.val.x + w.val.y\n}";
+    if let Some(code) = run_exit_code(src, "gstruct_field") {
+        assert_eq!(code, 12);
+    }
+}
+
+#[test]
+fn runs_option_of_generic_struct() {
+    // 集約 enum × ジェネリック struct: Option<Pair<i32>>（payload = %Pair.i32）。
+    // Some(Pair{8,9}) を match で取り出し p.a + p.b = 17。
+    let src = "type Pair<T> = struct {\n    a: T\n    b: T\n}\nfn first(o: Option<Pair<i32>>): i32 {\n    match o {\n        Some(p) -> p.a + p.b\n        None -> 0\n    }\n}\nfn main(): i32 {\n    let o = Some(Pair { a: 8, b: 9 })\n    return first(o)\n}";
+    if let Some(code) = run_exit_code(src, "opt_gstruct") {
+        assert_eq!(code, 17);
     }
 }

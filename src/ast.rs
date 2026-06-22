@@ -190,6 +190,15 @@ pub enum Stmt {
         body: Block,
         span: Span,
     },
+    /// 一般イテレータループ `for x in iter { ... }`（ADR-0007）。`iter` は `Iterator<T>`
+    /// を実装する値で、要素型 `T` が `var` に束縛される。範囲 `for` とは別ノード。
+    ForIn {
+        var: String,
+        var_span: Span,
+        iter: Expr,
+        body: Block,
+        span: Span,
+    },
     /// `break`（最も内側のループを抜ける）
     Break { span: Span },
     /// `continue`（最も内側のループの先頭へ）

@@ -215,6 +215,21 @@ impl Flow<'_> {
                 }
                 self.visit_loop_body(body, st, ret_is_ref);
             }
+            Stmt::ForIn {
+                iter,
+                body,
+                var_span,
+                ..
+            } => {
+                // イテレータは反復のあいだ可変借用される（next(&mut self)）。ムーブしない。
+                self.use_place(iter, st);
+                // ループ変数は反復ごとに再束縛される。状態をリセットしておく。
+                if let Some(&id) = self.def_spans.get(var_span) {
+                    st.moved.remove(&id);
+                    st.dangling.remove(&id);
+                }
+                self.visit_loop_body(body, st, ret_is_ref);
+            }
             // break / continue は制御フローのみ。ムーブ集合は保守的に直線扱いで足りる。
             Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Expr(e) => self.visit_expr(e, st),

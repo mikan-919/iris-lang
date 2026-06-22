@@ -105,11 +105,10 @@ impl Resolver {
                 self.declare(&f.name, DefKind::Function, f.name_span, false, false);
             }
         }
-        // 非ジェネリック enum のバリアント名をグローバルスコープに登録する。
+        // enum のバリアント名をグローバルスコープに登録する（ジェネリック含む）。
         // バリアントはコンストラクタ（値）として使えるため値の名前空間に入れる。
         for item in &program.items {
             if let Item::TypeDef(t) = item
-                && t.generics.is_empty()
                 && let TypeDefBody::Enum(variants) = &t.body
             {
                 for v in variants {
@@ -202,6 +201,21 @@ impl Resolver {
                 self.resolve_expr(start);
                 self.resolve_expr(end);
                 // ループ変数は本体を囲む独立スコープへ束縛する（不変・反復ごとに再束縛）。
+                self.push_scope();
+                self.declare(var, DefKind::Local, *var_span, false, true);
+                self.resolve_block(body);
+                self.pop_scope();
+            }
+            Stmt::ForIn {
+                var,
+                var_span,
+                iter,
+                body,
+                ..
+            } => {
+                // イテレータ式は本体スコープの外で解決する。
+                self.resolve_expr(iter);
+                // ループ変数は本体を囲む独立スコープへ束縛する（反復ごとに再束縛）。
                 self.push_scope();
                 self.declare(var, DefKind::Local, *var_span, false, true);
                 self.resolve_block(body);

@@ -186,6 +186,8 @@ impl Borrows<'_> {
                 self.gather(start, &mut temps);
                 self.gather(end, &mut temps);
             }
+            // イテレータ式の一時借用はこの文の間だけ。本体は descend で扱う。
+            Stmt::ForIn { iter, .. } => self.gather(iter, &mut temps),
             Stmt::Loop { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Expr(e) => self.gather(e, &mut temps),
         }
@@ -328,6 +330,10 @@ impl Borrows<'_> {
             Stmt::For { start, end, body, .. } => {
                 self.descend_expr(start);
                 self.descend_expr(end);
+                self.visit_block(body);
+            }
+            Stmt::ForIn { iter, body, .. } => {
+                self.descend_expr(iter);
                 self.visit_block(body);
             }
             Stmt::Break { .. } | Stmt::Continue { .. } => {}

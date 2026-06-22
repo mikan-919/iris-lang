@@ -3,7 +3,10 @@
 ## Status
 Accepted・実装済み（ジェネリックトレイト `trait Iterator<T>`・スーパートレイト `trait Sub: Super`
 を実装。適合検査がスーパートレイト実装を要求し、`<T: Sub>` 境界からスーパートレイトのメソッドを
-解決できる。複数 instantiation・`#Iterator<i32>` 修飾は型検査レベルで対応。関連型なし。）
+解決できる。複数 instantiation・`#Iterator<i32>` 修飾は型検査レベルで対応。関連型なし。
+`Iterator<T>` は std が提供する標準トレイトで、**`for x in iter` を構文解析〜型検査〜所有権〜codegen
+まで縦断実装**（`iter.next() -> Option<T>` を回す脱糖・clang 実行。`tests/codegen.rs`）。要素型ごとの
+曖昧解消 `for x#T in iter` は未実装。）
 
 ## Context
 トレイトの「形」を決める: 要素型（Iterator の要素など）をどう表すか、同じトレイトを

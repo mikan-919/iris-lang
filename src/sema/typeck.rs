@@ -16,8 +16,8 @@
 //!
 //! `type` 別名は名前的型付け（別の型）として扱うが、リテラル代入の可否は
 //! 別名の元の型で判定する（`type Meters = f64` に `5.0` は代入可、`f64` 値は不可）。
-//! ジェネリックな型定義の本体・本体内のメンバ型は単一化を実装していないため
-//! 寛容に（`Infer`）扱う。
+//! ジェネリック struct/enum は構築箇所のフィールド/ペイロード値から型パラメータを
+//! `unify` で推論し、メンバ/バリアントの型を型引数で単相化する。
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,6 +48,9 @@ pub struct TypeInfo {
     /// enum バリアント構築の情報。式の span → (enum型名, バリアントインデックス, has_payload)。
     /// コード生成が `Ident`/`Call` を enum 構築に変換するのに使う。
     pub variant_constructions: HashMap<Span, (String, usize, bool)>,
+    /// 一般イテレータ `for x in it` の要素型。ループ変数の var_span → 要素型 `T`。
+    /// コード生成が `next()` の戻り `Option<T>` をアンラップするのに使う。
+    pub for_iter_elem: HashMap<Span, Ty>,
 }
 
 /// 型エラー。
@@ -113,13 +116,16 @@ struct MethodSig {
 enum TyDef {
     /// `type X = T`（名前的型付け）。元の型を持つ。
     Alias(Ty),
-    /// `type X = struct { ... }`。型パラメータ数とフィールド（名前→型）。
+    /// `type X = struct { ... }`。型パラメータ名とフィールド（名前→型）。
+    /// フィールド型は型パラメータ（ジェネリック struct）を含みうる。
     Struct {
-        generics: usize,
+        generics: Vec<String>,
         fields: Vec<(String, Ty)>,
     },
-    /// `type X = enum { ... }`。バリアント一覧（名前, ペイロード型）を持つ。
+    /// `type X = enum { ... }`。型パラメータ名とバリアント一覧（名前, ペイロード型）を持つ。
+    /// ペイロード型は型パラメータ（ジェネリック enum）を含みうる。
     Enum {
+        generics: Vec<String>,
         variants: Vec<(String, Option<Ty>)>,
     },
 }
@@ -172,6 +178,7 @@ pub fn check(program: &Program, res: &Resolution) -> Result<TypeInfo, Vec<TypeEr
             mono: checker.mono,
             method_provider: checker.method_provider,
             variant_constructions: checker.variant_constructions,
+            for_iter_elem: checker.for_iter_elem,
         })
     } else {
         Err(checker.errors)
@@ -212,9 +219,11 @@ struct Checker<'a> {
     /// 現在ネストしているループの深さ（`break`/`continue` のループ外使用の検出に使う）。
     loop_depth: usize,
     /// バリアント名 → (enum型名, タグインデックス, ペイロード型)。非ジェネリック enum のみ。
-    variant_owners: HashMap<String, (String, usize, Option<Ty>)>,
+    variant_owners: HashMap<String, (String, usize, Option<Ty>, Vec<String>)>,
     /// enum バリアント構築の記録（TypeInfo へ引き渡す）。
     variant_constructions: HashMap<Span, (String, usize, bool)>,
+    /// `for x in it` の要素型（var_span → 要素型 T。TypeInfo へ引き渡す）。
+    for_iter_elem: HashMap<Span, Ty>,
 }
 
 impl<'a> Checker<'a> {
@@ -368,16 +377,19 @@ impl<'a> Checker<'a> {
             .map(|(id, def)| (def.span, id))
             .collect();
 
-        // バリアント名 → (enum型名, タグ, ペイロード型)。非ジェネリック enum のみ。
-        let mut variant_owners: HashMap<String, (String, usize, Option<Ty>)> = HashMap::new();
+        // バリアント名 → (enum型名, タグ, ペイロード型, enum の型パラメータ名)。
+        // ジェネリック enum も含む（ペイロード型は型パラメータを含みうる）。
+        let mut variant_owners: HashMap<String, (String, usize, Option<Ty>, Vec<String>)> =
+            HashMap::new();
         for item in &program.items {
             if let Item::TypeDef(t) = item
-                && t.generics.is_empty()
                 && let TypeDefBody::Enum(variants) = &t.body
             {
+                let generics: Vec<String> = t.generics.iter().map(|g| g.name.clone()).collect();
                 for (idx, v) in variants.iter().enumerate() {
                     let payload_ty = v.payload.as_ref().map(Ty::from_ast);
-                    variant_owners.insert(v.name.clone(), (t.name.clone(), idx, payload_ty));
+                    variant_owners
+                        .insert(v.name.clone(), (t.name.clone(), idx, payload_ty, generics.clone()));
                 }
             }
         }
@@ -403,6 +415,7 @@ impl<'a> Checker<'a> {
             loop_depth: 0,
             variant_owners,
             variant_constructions: HashMap::new(),
+            for_iter_elem: HashMap::new(),
         }
     }
 
@@ -504,6 +517,8 @@ impl<'a> Checker<'a> {
                                 ),
                             );
                         }
+                        // 注釈型から enum 構築の未確定型引数を埋める。
+                        self.refine_construction(value, &expected);
                         expected
                     }
                     // 注釈なしはリテラルを既定型へ確定する。
@@ -528,6 +543,8 @@ impl<'a> Checker<'a> {
                                 ),
                             );
                         }
+                        // 戻り型から enum 構築の未確定型引数を埋める（集約レイアウト整合）。
+                        self.refine_construction(v, &ret);
                     }
                     None => {
                         if !self.assignable(&ret, &Ty::unit()) {
@@ -647,6 +664,24 @@ impl<'a> Checker<'a> {
                 self.check_block(body);
                 self.loop_depth -= 1;
             }
+            Stmt::ForIn {
+                var_span,
+                iter,
+                body,
+                span,
+                ..
+            } => {
+                // イテレータ式の型から `Iterator<T>` 実装を探し、要素型 T を取り出す。
+                let iter_ty = self.check_expr(iter);
+                let elem = self.iterator_elem(&iter_ty, *span);
+                if let Some(&id) = self.def_spans.get(var_span) {
+                    self.def_types[id] = elem.clone();
+                }
+                self.for_iter_elem.insert(*var_span, elem);
+                self.loop_depth += 1;
+                self.check_block(body);
+                self.loop_depth -= 1;
+            }
             Stmt::Break { span } => {
                 if self.loop_depth == 0 {
                     self.error(*span, "`break` はループの中でのみ使えます".to_string());
@@ -691,8 +726,8 @@ impl<'a> Checker<'a> {
             ExprKind::Str(_) => Ty::named("string"),
             ExprKind::Bool(_) => Ty::named("bool"),
             ExprKind::Ident(name) => {
-                // ユーザー定義の非ジェネリック enum バリアント（ペイロードなし）。
-                if let Some((enum_name, tag, payload_ty)) = self.variant_owners.get(name.as_str()).cloned() {
+                // ユーザー定義 enum バリアント（ペイロードなし。ジェネリック含む）。
+                if let Some((enum_name, tag, payload_ty, generics)) = self.variant_owners.get(name.as_str()).cloned() {
                     if let Some(&id) = self.res.uses.get(&expr.span)
                         && self.res.defs[id].kind == DefKind::Builtin
                     {
@@ -703,7 +738,20 @@ impl<'a> Checker<'a> {
                             );
                         }
                         self.variant_constructions.insert(expr.span, (enum_name.clone(), tag, false));
-                        return Ty::named(&enum_name);
+                        // ジェネリック enum はペイロードなしでは型引数を推論できないため Infer。
+                        return Ty::Named {
+                            name: enum_name.clone(),
+                            args: vec![Ty::Infer; generics.len()],
+                        };
+                    }
+                }
+                // ビルトイン Option/Result コンストラクタ（ペイロードなし＝ `None`）。
+                if let Some((enum_name, tag, false)) = prelude_variant(name) {
+                    if let Some(&id) = self.res.uses.get(&expr.span)
+                        && self.res.defs[id].kind == DefKind::Builtin
+                    {
+                        self.variant_constructions.insert(expr.span, (enum_name.into(), tag, false));
+                        return builtin_ctor(name, &[]);
                     }
                 }
                 self.res
@@ -758,10 +806,32 @@ impl<'a> Checker<'a> {
     fn infer_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> Ty {
         let scrut_ty = self.check_expr(scrutinee).defaulted();
 
-        // scrutinee が enum 型なら、バリアント情報を取り出す。
+        // scrutinee が enum 型なら、バリアント情報を取り出す。ビルトイン Option/Result は
+        // 型引数を具体ペイロードに反映して合成する（束縛変数へ具体型を付けるため）。
         let enum_variants: Option<Vec<(String, Option<Ty>)>> = match &scrut_ty {
-            Ty::Named { name, .. } => match self.types.get(name) {
-                Some(TyDef::Enum { variants }) => Some(variants.clone()),
+            Ty::Named { name, args } if name == "Option" => {
+                let t = args.first().cloned().unwrap_or(Ty::Infer);
+                Some(vec![("None".into(), None), ("Some".into(), Some(t))])
+            }
+            Ty::Named { name, args } if name == "Result" => {
+                let t = args.first().cloned().unwrap_or(Ty::Infer);
+                let e = args.get(1).cloned().unwrap_or(Ty::Infer);
+                Some(vec![("Ok".into(), Some(t)), ("Err".into(), Some(e))])
+            }
+            Ty::Named { name, args } => match self.types.get(name) {
+                Some(TyDef::Enum { generics, variants }) => {
+                    // ジェネリック enum は scrutinee の型引数でペイロードを単相化する。
+                    let mut subst_map: HashMap<String, Ty> = HashMap::new();
+                    for (g, a) in generics.iter().zip(args) {
+                        subst_map.insert(g.clone(), a.clone());
+                    }
+                    Some(
+                        variants
+                            .iter()
+                            .map(|(n, p)| (n.clone(), p.as_ref().map(|t| subst(t, &subst_map))))
+                            .collect(),
+                    )
+                }
                 _ => None,
             },
             _ => None,
@@ -1001,9 +1071,12 @@ impl<'a> Checker<'a> {
         if let ExprKind::Ident(name) = &callee.kind
             && let Some(&id) = self.res.uses.get(&callee.span)
         {
-            // ユーザー定義の非ジェネリック enum バリアント（ペイロードあり）。
+            // ユーザー定義 enum バリアント（ペイロードあり。ジェネリック含む）。
             if self.res.defs[id].kind == DefKind::Builtin {
-                if let Some((enum_name, tag, payload_ty)) = self.variant_owners.get(name).cloned() {
+                if let Some((enum_name, tag, payload_ty, generics)) = self.variant_owners.get(name).cloned() {
+                    // ジェネリック enum はペイロード引数から型パラメータを推論する。
+                    let gset: HashSet<&str> = generics.iter().map(|s| s.as_str()).collect();
+                    let mut subst_map: HashMap<String, Ty> = HashMap::new();
                     // ペイロード型検査。
                     let payload_expr = args.first();
                     if let Some(pt) = &payload_ty {
@@ -1017,12 +1090,14 @@ impl<'a> Checker<'a> {
                             );
                         } else if let Some(a) = payload_expr {
                             let at = self.check_expr(a);
-                            if !self.assignable(pt, &at) {
+                            unify(pt, &at, &gset, &mut subst_map);
+                            let expected = subst(pt, &subst_map);
+                            if !self.assignable(&expected, &at) {
                                 self.error(
                                     a.span,
                                     format!(
                                         "バリアント `{name}` のペイロードの型が一致しません: `{}` を期待しましたが `{}` でした",
-                                        pt.describe(),
+                                        expected.describe(),
                                         at.describe()
                                     ),
                                 );
@@ -1036,7 +1111,16 @@ impl<'a> Checker<'a> {
                     }
                     // バリアント構築として記録（Call 式全体の span に記録）。
                     self.variant_constructions.insert(call_span, (enum_name.clone(), tag, true));
-                    return Ty::named(&enum_name);
+                    // 推論した型パラメータで enum の型引数を埋める（未束縛は Infer）。
+                    let enum_args: Vec<Ty> = generics
+                        .iter()
+                        .map(|g| subst_map.get(g).cloned().unwrap_or(Ty::Infer))
+                        .collect();
+                    return Ty::Named { name: enum_name.clone(), args: enum_args };
+                }
+                // ビルトイン Option/Result コンストラクタ（ペイロードあり）。
+                if let Some((enum_name, tag, _)) = prelude_variant(name) {
+                    self.variant_constructions.insert(call_span, (enum_name.into(), tag, true));
                 }
                 return builtin_ctor(name, &arg_tys);
             }
@@ -1330,6 +1414,50 @@ impl<'a> Checker<'a> {
         })
     }
 
+    /// `for x in it` の対象型から、実装する `Iterator<T>` の要素型 T を求める（ADR-0007）。
+    /// `Iterator` を実装していなければエラーを記録し `Ty::Error` を返す。複数の `Iterator`
+    /// 実装（`Iterator<i32>`/`Iterator<string>` 同居）は当面曖昧エラー（`for x#T in` 未実装）。
+    fn iterator_elem(&mut self, iter_ty: &Ty, span: Span) -> Ty {
+        if matches!(iter_ty, Ty::Infer | Ty::Error) {
+            return Ty::Infer;
+        }
+        let Ty::Named { name: ty_name, .. } = iter_ty.peel_refs().clone() else {
+            self.error(
+                span,
+                format!("`for ... in` の対象 `{}` はイテレータではありません", iter_ty.describe()),
+            );
+            return Ty::Error;
+        };
+        let elems: Vec<Ty> = self
+            .trait_impls
+            .get(&ty_name)
+            .map(|impls| {
+                impls
+                    .iter()
+                    .filter(|ti| ti.trait_name == "Iterator")
+                    .filter_map(|ti| ti.trait_args.first().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        match elems.len() {
+            1 => elems.into_iter().next().unwrap(),
+            0 => {
+                self.error(
+                    span,
+                    format!("型 `{ty_name}` は `Iterator` を実装していないため `for ... in` で反復できません"),
+                );
+                Ty::Error
+            }
+            _ => {
+                self.error(
+                    span,
+                    format!("型 `{ty_name}` は複数の `Iterator` 実装を持つため要素型が曖昧です"),
+                );
+                Ty::Error
+            }
+        }
+    }
+
     /// 双方向に適合する型同士か（トレイト引数の一致判定。Infer はワイルドカード）。
     fn tys_match(&self, a: &Ty, b: &Ty) -> bool {
         self.assignable(a, b) || self.assignable(b, a)
@@ -1496,13 +1624,18 @@ impl<'a> Checker<'a> {
         while let Ty::Ref { inner, .. } = obj {
             obj = *inner;
         }
-        if let Ty::Named { name, .. } = &obj
+        if let Ty::Named { name, args } = &obj
             && let Some((generics, fields)) = self.struct_fields(name)
         {
             return match fields.iter().find(|(n, _)| n == field) {
-                // ジェネリック struct はフィールド型を単一化できないため Infer。
-                Some(_) if generics > 0 => Ty::Infer,
-                Some((_, fty)) => fty.clone(),
+                // ジェネリック struct はインスタンスの型引数でフィールド型を単相化する。
+                Some((_, fty)) => {
+                    let mut map = HashMap::new();
+                    for (g, a) in generics.iter().zip(args) {
+                        map.insert(g.clone(), a.clone());
+                    }
+                    subst(fty, &map)
+                }
                 None => {
                     self.error(
                         span,
@@ -1539,6 +1672,9 @@ impl<'a> Checker<'a> {
             return Ty::Error;
         };
 
+        // ジェネリック struct は各フィールドの値型から型パラメータを推論する（unify）。
+        let gset: HashSet<&str> = generics.iter().map(|s| s.as_str()).collect();
+        let mut subst_map: HashMap<String, Ty> = HashMap::new();
         let mut seen: HashSet<&str> = HashSet::new();
         for fi in fields {
             let vty = self.check_expr(&fi.value);
@@ -1548,14 +1684,16 @@ impl<'a> Checker<'a> {
             }
             match def_fields.iter().find(|(n, _)| n == &fi.name) {
                 Some((_, fty)) => {
-                    // ジェネリック struct はフィールド型検査を省略する。
-                    if generics == 0 && !self.assignable(fty, &vty) {
+                    // 型パラメータを値型から推論し、置換後の期待型と照合する。
+                    unify(fty, &vty, &gset, &mut subst_map);
+                    let expected = subst(fty, &subst_map);
+                    if !self.assignable(&expected, &vty) {
                         self.error(
                             fi.value.span,
                             format!(
                                 "フィールド `{}` の型が一致しません: `{}` を期待しましたが `{}` でした",
                                 fi.name,
-                                fty.describe(),
+                                expected.describe(),
                                 vty.describe()
                             ),
                         );
@@ -1574,9 +1712,14 @@ impl<'a> Checker<'a> {
             }
         }
 
+        // 推論した型パラメータで型引数を埋める（未束縛は Infer、リテラルは既定型へ確定）。
+        let args: Vec<Ty> = generics
+            .iter()
+            .map(|g| subst_map.get(g).cloned().unwrap_or(Ty::Infer).defaulted())
+            .collect();
         Ty::Named {
             name: name.to_string(),
-            args: vec![Ty::Infer; generics],
+            args,
         }
     }
 
@@ -1601,12 +1744,36 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// enum 構築式の未確定な型引数を、期待型から埋めて `expr_types` を更新する。
+    /// `return Err(Fail { .. })` のように成功側 `Ok` の型が文脈からしか決まらない場合、
+    /// codegen の per-instantiation レイアウト（集約ペイロード）が文脈と一致するようにする。
+    fn refine_construction(&mut self, expr: &Expr, expected: &Ty) {
+        let Some(recorded) = self.expr_types.get(&expr.span).cloned() else {
+            return;
+        };
+        if let (Ty::Named { name: rn, args: ra }, Ty::Named { name: en, args: ea }) =
+            (&recorded, expected)
+            && rn == en
+            && ra.len() == ea.len()
+        {
+            let vague = |t: &Ty| matches!(t, Ty::Infer | Ty::IntLit | Ty::FloatLit);
+            let merged_args: Vec<Ty> = ra
+                .iter()
+                .zip(ea)
+                .map(|(r, e)| if vague(r) && !vague(e) { e.clone() } else { r.clone() })
+                .collect();
+            self.expr_types.insert(
+                expr.span,
+                Ty::Named { name: rn.clone(), args: merged_args },
+            );
+        }
+    }
+
     fn infer_try(&mut self, inner: &Expr) -> Ty {
         let t = self.check_expr(inner);
         // 現在の関数が Result/Option を返さなければ `!` は使えない。
-        let ret_ok =
-            matches!(&self.current_ret, Ty::Infer | Ty::Error) || is_result_or_option(&self.current_ret);
-        if !ret_ok {
+        let ret_known = !matches!(&self.current_ret, Ty::Infer | Ty::Error);
+        if ret_known && !is_result_or_option(&self.current_ret) {
             self.error(
                 inner.span,
                 "`!` は Result または Option を返す関数の中でのみ使えます".to_string(),
@@ -1615,6 +1782,34 @@ impl<'a> Checker<'a> {
         match &t {
             Ty::Infer | Ty::Error => Ty::Infer,
             Ty::Named { name, args } if (name == "Result" || name == "Option") => {
+                // inner の種別（Result/Option）が関数の戻り型の種別と一致すること。
+                // 失敗時、Result は同じ E を伝播し、Option は None を伝播するため。
+                if let Ty::Named { name: ret_name, args: ret_args } = &self.current_ret
+                    && (ret_name == "Result" || ret_name == "Option")
+                {
+                    if ret_name != name {
+                        self.error(
+                            inner.span,
+                            format!(
+                                "`!` で伝播できません: 関数は `{ret_name}` を返しますが `{name}` に使っています"
+                            ),
+                        );
+                    } else if name == "Result" {
+                        // Err の型 E は戻り型の E と互換でなければならない。
+                        let inner_e = args.get(1).cloned().unwrap_or(Ty::Infer);
+                        let ret_e = ret_args.get(1).cloned().unwrap_or(Ty::Infer);
+                        if !self.assignable(&ret_e, &inner_e) {
+                            self.error(
+                                inner.span,
+                                format!(
+                                    "`!` のエラー型が一致しません: 関数の `Err` は `{}` ですが `{}` を伝播しようとしています",
+                                    ret_e.describe(),
+                                    inner_e.describe()
+                                ),
+                            );
+                        }
+                    }
+                }
                 args.first().cloned().unwrap_or(Ty::Infer)
             }
             other => {
@@ -1644,11 +1839,13 @@ impl<'a> Checker<'a> {
     // ---- 型定義の参照ヘルパ ---------------------------------------------
 
     /// 名前を別名チェーンでたどり、struct なら（型パラメータ数, フィールド）を返す。
-    fn struct_fields(&self, name: &str) -> Option<(usize, Vec<(String, Ty)>)> {
+    fn struct_fields(&self, name: &str) -> Option<(Vec<String>, Vec<(String, Ty)>)> {
         let mut cur = name.to_string();
         for _ in 0..32 {
             match self.types.get(&cur)? {
-                TyDef::Struct { generics, fields } => return Some((*generics, fields.clone())),
+                TyDef::Struct { generics, fields } => {
+                    return Some((generics.clone(), fields.clone()));
+                }
                 TyDef::Alias(Ty::Named { name, .. }) => cur = name.clone(),
                 _ => return None,
             }
@@ -1832,18 +2029,31 @@ fn lower_type_def(t: &TypeDef) -> TyDef {
     match &t.body {
         TypeDefBody::Alias(ty) => TyDef::Alias(Ty::from_ast(ty)),
         TypeDefBody::Struct(fields) => TyDef::Struct {
-            generics: t.generics.len(),
+            generics: t.generics.iter().map(|g| g.name.clone()).collect(),
             fields: fields
                 .iter()
                 .map(|f| (f.name.clone(), Ty::from_ast(&f.ty)))
                 .collect(),
         },
         TypeDefBody::Enum(variants) => TyDef::Enum {
+            generics: t.generics.iter().map(|g| g.name.clone()).collect(),
             variants: variants
                 .iter()
                 .map(|v| (v.name.clone(), v.payload.as_ref().map(Ty::from_ast)))
                 .collect(),
         },
+    }
+}
+
+/// プレリュードの Option/Result コンストラクタ名を (enum名, タグ, ペイロード有無) に対応づける。
+/// codegen のバリアント構築記録に使う。タグは codegen の `StructReg.enum_layouts` と一致させる。
+fn prelude_variant(name: &str) -> Option<(&'static str, usize, bool)> {
+    match name {
+        "None" => Some(("Option", 0, false)),
+        "Some" => Some(("Option", 1, true)),
+        "Ok" => Some(("Result", 0, true)),
+        "Err" => Some(("Result", 1, true)),
+        _ => None,
     }
 }
 

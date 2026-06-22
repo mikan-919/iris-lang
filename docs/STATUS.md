@@ -60,7 +60,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   （ADR-0004〜0009、下記）。`trait` も識別子として扱う
 - 構造体リテラル `Name { field: value, ... }`（`if`/三項の条件位置では抑制し曖昧性回避）
 - 文: `let` / `const`、`return`、再代入 `target = value`、式文
-- ループ: `while cond { ... }` / `loop { ... }` / `break` / `continue` / **`for x in lo..hi { ... }`**（整数範囲のみ。`..` 排他・`..=` 包含。一般のイテレータ＝Iterator トレイト経由は未対応）
+- ループ: `while cond { ... }` / `loop { ... }` / `break` / `continue` / **`for x in lo..hi { ... }`**（整数範囲。`..` 排他・`..=` 包含）/ **`for x in iter { ... }`**（一般イテレータ＝`Iterator<T>` トレイト経由、ADR-0007。`iter` が `Iterator` を実装する値、要素型 `T` を `x` に束縛）
 - 型: 名前付き型、ジェネリクス `Vec<T>`、参照 `&T` / `&mut T`、配列 `T[]`、タプル `(A, B)`
 - 式（優先順位対応）:
   - リテラル（整数・浮動小数点・文字列・真偽値）、識別子
@@ -105,6 +105,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   - 不変な束縛（`let`（mut なし）/ `const`）への再代入
   - `while` の条件が bool でない、`break`/`continue` のループ外使用
   - `for x in lo..hi` の範囲境界が整数でない／下限と上限の型不一致。ループ変数 `x` には境界の具体整数型（両方リテラルなら既定 `i32`）を付与し、本体内で使えるようにする
+  - `for x in iter`（一般イテレータ）: `iter` の型が `Iterator<T>` を実装しているか検査し、要素型 `T` をループ変数 `x` に付与（`Iterator` 未実装なら拒否、複数 `Iterator` 実装の同居は当面曖昧エラー）。要素型は codegen が `next()` の戻り `Option<T>` のアンラップに使う
 - `&mut T` は `&T` として使える（参照の可変性は所有権パスで詳細検査）
 
 #### 型定義の扱い（実装済み）
@@ -119,13 +120,14 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   型名そのもので引くため、`type Alias = Struct` の別名値からの呼び出しは現状解決しない（要 exact 名一致）。
   同じ型に同名メソッドがあれば（同一 impl・別 impl を問わず）**二重定義**として型検査で報告する
   （codegen に渡る前に止め、`@Type.method` 記号の衝突＝clang の再定義エラーを防ぐ）
-- **enum**: 定義・型名登録・バリアント構築・`match` 式によるアンラップを実装済み。ジェネリック enum は未対応
-  - **バリアント構築**: ペイロードなし（`Red` → `Ident` ノード）とペイロードあり（`Rect(5)` → `Call` ノード）の両形式。パーサは通常の `Ident`/`Call` として出力し、typeck が `variant_owners` マップ（`バリアント名 → (enum 名, タグ index, ペイロード型)`）を引いて enum 構築と判定。判定結果は `TypeInfo::variant_constructions`（式 span → `(enum 名, タグ, has_payload)`）として codegen へ渡す（AST を書き換えない設計）
+- **enum**: 定義・型名登録・バリアント構築・`match` 式によるアンラップを実装済み。**ジェネリック enum（ビルトイン `Option<T>`/`Result<T,E>` ＋ ユーザ定義 `type Pair<T>` 等）を、スカラ／参照／`string`／**struct 等の集約ペイロード**まで縦断対応**（ADR-0010）
+  - **バリアント構築**: ペイロードなし（`Red` → `Ident` ノード）とペイロードあり（`Rect(5)` → `Call` ノード）の両形式。パーサは通常の `Ident`/`Call` として出力し、typeck が `variant_owners` マップ（`バリアント名 → (enum 名, タグ index, ペイロード型, enum の型パラメータ名)`）を引いて enum 構築と判定。判定結果は `TypeInfo::variant_constructions`（式 span → `(enum 名, タグ, has_payload)`）として codegen へ渡す（AST を書き換えない設計）
+  - **ジェネリック enum の単相化**（ADR-0010）: codegen はペイロードが i64 に収まるかでレイアウトを二分する。**スカラ**（数値・bool・参照・`string`＝ptr）は全インスタンス共通の `%Enum = type { i8, i64 }`（型引数はレイアウトに影響しない＝マングル型を出さない、i64 キャスト格納）。**集約**（struct 等）は per-instantiation の `%Enum.Args = type { i8, <最大サイズのペイロード型> }`（opaque ポインタにより typed store/load で bitcast 不要）。使用インスタンスは式の型と非ジェネリックなシグネチャから収集して型宣言を発行。typeck はバリアント構築でペイロード引数から型パラメータを `unify` で推論し（`First(5)` → `Pair<i32>`）、`match` では scrutinee の型引数で各バリアントのペイロード型を `subst` して束縛変数へ具体型を付与する。ビルトイン `Option`/`Result` は `prelude_variant`（typeck）と `StructReg.enum_layouts`（codegen、enum レイアウトの唯一の真実源）に固定タグ（None=0/Some=1、Ok=0/Err=1）で登録
   - **`match` パターン**: ワイルドカード `_`、enum バリアント名（`Red`）、バリアント＋束縛変数（`Rect(side)` ← ペイロードを取り出してアーム本体スコープへ束縛）、整数・浮動小数・bool・文字列リテラル（**文字列は codegen で `strcmp` 比較を実装済み**）、**数値範囲 `lo..hi`（排他）/ `lo..=hi`（包含）**（境界は整数・浮動小数リテラル）。各アームに**ガード `if cond`** を付けられる
   - **`match` の型検査**: scrutinee の型を確認し、各バリアントパターンが enum に存在するか検証。束縛変数には対応バリアントのペイロード型を付与。範囲パターンは下限・上限が同一数値クラスかつ scrutinee に適合するか検査。ガードは bool 型を要求（束縛変数を参照可）。全アームの結果型を `join` して `match` 式の型を決定
-  - **名前解決**: 非ジェネリック enum のバリアント名はグローバルスコープへ `DefKind::Builtin` として登録。バリアント束縛変数はアームごとの独立スコープへ `DefKind::Local` として登録。ガードはアームスコープ内で解決（束縛変数を参照できる）
+  - **名前解決**: enum のバリアント名（ジェネリック含む）はグローバルスコープへ `DefKind::Builtin` として登録。バリアント束縛変数はアームごとの独立スコープへ `DefKind::Local` として登録。ガードはアームスコープ内で解決（束縛変数を参照できる）
   - **所有権**: scrutinee はムーブ扱い。各アームは `if` の分岐と同様に独立した状態で評価し、全アームのムーブ集合を合流（flow.rs）。ガードは本体より先に読み取りとして評価。借用競合は各アームをブロックスコープとして扱い解放し、ガードもそのスコープ内で訪問（borrows.rs）
-- ジェネリックな型定義の本体・本体内のフィールド型は単一化未実装のため寛容（`Infer`）に扱う
+- ジェネリック struct は構造体リテラルのフィールド値から型パラメータを `unify` で推論し（`Pair { a: 1, b: 2 }` → `Pair<i32>`）、メンバアクセスはインスタンスの型引数でフィールド型を単相化する（`p.a: i32`）。フィールド値の型不一致（同じ `T` のフィールドに別型）も検出する
 
 ### 所有権 DAG（実装済み）
 
@@ -174,12 +176,24 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   ループ `while` / `loop` / `break` / `continue`（基本ブロック＋後方辺。`break`/`continue` はラベルスタックで解決）、
   **`for x in lo..hi`**（整数範囲をカウンタループへ落とす。下限を変数 `x` の場所へ格納し、上限を preheader で一度だけ評価、
   `cond`/`body`/`step`/`end` の 4 ブロックで `x < hi`（包含なら `x <= hi`、符号は `num_kind` で `slt`/`ult`/`sle`/`ule` を選択）が
-  成り立つ間反復。`continue` は増分 `step` へ、`break` は `end` へ分岐）
+  成り立つ間反復。`continue` は増分 `step` へ、`break` は `end` へ分岐）、
+  **`for x in iter`**（一般イテレータ・ADR-0007。`loop { match iter.next() { Some(x) -> body, None -> break } }` 相当へ脱糖。
+  イテレータの可変借用ポインタをループ前に一度だけ求め、`head` で `iter.next()`（`@Type.next`、提供元ラベルは `Iterator`）を呼んで
+  `Option<T>` を退避、タグが `Some`（=1）なら要素を `x` に束縛して `body`、`None` なら `end` へ。`continue` は `head`（next 再呼び出し）へ、
+  `break` は `end` へ。要素型 `T` は typeck の `for_iter_elem`、Some ペイロードのアンラップは `load_enum_payload` を共用し、
+  スカラ／集約（struct 要素＝`Option<Point>` 等）の双方に対応）
 - **数値型**: 整数 `i8..u64`（符号付き/なしで `sdiv`/`udiv`・`icmp slt`/`ult` 等を選択）と浮動小数 `f32`/`f64`
   （`fadd`/`fsub`/`fmul`/`fdiv`/`frem`・`fcmp o*`・`fneg`）。LLVM 型は符号を持たないため数値クラス（`NumKind`）を
   iris の `Ty` から導いて命令を選ぶ。浮動小数リテラルは double ビット列（`0x...`）で出力
 - ローカルは alloca + load/store（SSA 化は LLVM の mem2reg に委ねられる）
-- **struct**: 名前付き LLVM 構造体型 `%Name = type { ... }` を宣言（非ジェネリックのみ）。
+- **struct**: 名前付き LLVM 構造体型 `%Name = type { ... }` を宣言。**ジェネリック struct は
+  per-instantiation で単相化**（`type Pair<T> = struct {...}` → 使用ごとに `%Pair.i32 = type {...}`、
+  記号は `mono_symbol`、フィールド型は型引数で置換。使用インスタンスは式の型・非ジェネリックな
+  シグネチャから収集し、入れ子のジェネリック struct・集約 enum も辿って宣言）。typeck は構造体
+  リテラルのフィールド値から型パラメータを `unify` で推論（`Pair { a: 1, b: 2 }` → `Pair<i32>`、整数/
+  小数リテラルは既定 `i32`/`f64` へ確定）。`StructReg.struct_layout_of` が非ジェネリック（正規名）と
+  ジェネリックインスタンス（単相化記号＋置換フィールド）を統一的に解決し、構築・フィールドアクセス・
+  構造的 `==` で共用する。
   構造体値は first-class 値として扱う（関数引数・戻り値・`let` で値渡し）。
   - 構造体リテラル `Name { ... }`: alloca → 各フィールドへ `getelementptr` + `store` → 全体を `load`
   - メンバアクセス `a.b`: フィールドの `getelementptr` から `load`（ネストした `a.b.c` のチェーン、
@@ -198,20 +212,25 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
   リテラルの符号化は印字可能 ASCII 以外と `"` `\` を `\XX`（16進）でエスケープし末尾に NUL を付ける
   （マルチバイト UTF-8 はバイト単位）。値渡し（引数・戻り値・`let`）に対応。`extern fn puts`（std）で
   libc に渡して出力できる。**長さ・索引・連結・補間などの操作はまだ無い**（リテラルを渡す/返すのみ）
-- **enum**: LLVM 表現は全 enum 共通で `%EnumName = type { i8, i64 }`（i8 = タグ、i64 = ペイロードの記憶域）。ジェネリック enum は型宣言を出力しない
+- **enum**: 非ジェネリック・スカラペイロードのジェネリックは `%EnumName = type { i8, i64 }`（i8 = タグ、i64 = ペイロードの記憶域）。**集約ペイロードのジェネリック enum（`Option<Point>` 等）は per-instantiation の `%Enum.Args = type { i8, <記憶域> }`**（ADR-0010）。`StructReg.enum_layouts`（ビルトイン Option/Result ＋ ユーザ enum、generics 付き）が enum レイアウトの唯一の真実源で、`enum_tag`/`enum_payload_of`/`enum_is_aggregate`/`enum_storage_ty` を提供。`llvm_ty` は enum 名を、スカラなら `%Name`・集約なら `%Name.Args`（`mono_symbol`）へ写す。`gen_enum_construction`/`gen_match` は集約なら typed store/load、スカラなら i64 キャストを使う
   - **バリアント構築** `gen_enum_construction`: alloca → タグを `getelementptr` + `store i8` → ペイロードを `getelementptr` + `cast_to_i64` + `store i64` → `load %EnumName`。`cast_to_i64` は `i32`→`sext`、`bool`→`zext`、`f64`→`bitcast`、`ptr`→`ptrtoint` で i64 へ変換。typeck が `variant_constructions` に記録した span で `gen_expr` の先頭で命中したら `gen_enum_construction` へ分岐（AST ノード種を変えない）
   - **`match` 式** `gen_match`: 結果を受け取る alloca（result slot）を確保 → scrutinee を alloca へ退避 → `getelementptr` でタグフィールドを load → アームを順に if-else 連鎖でチェック（ワイルドカードは無条件 `br`）→ 各アームでペイロード束縛変数（`cast_from_i64` で元の型へ変換し alloca に退避）を用意 → アーム本体を評価して result slot へ store → `match.end` ラベルで合流 → result slot を load して値を返す。`cast_from_i64` は `trunc`/`fptrunc`/`inttoptr` 等で元の型へ戻す
     - **パターンの条件生成**: リテラルは `icmp eq`/`fcmp oeq`、enum バリアントはタグの `icmp eq`、**文字列は `call i32 @strcmp(...)` の結果を `icmp eq ..., 0`** で比較、**数値範囲は下限 `*ge` と上限 `*lt`/`*le`（排他/包含）を `and i1` で合成**（符号は `num_kind` で `s`/`u`/`fcmp o` を選択）
     - **ガード**: パターン一致後、束縛変数を設定してからガード式を評価し、`br i1 guard, %match.guarded, %skip`（不成立なら次アームのチェックへフォールスルー）。最終アームのガード不成立は exhaustiveness 未検査のため result slot 未初期化のまま合流する（保守的に許容）
-- **struct**（上記）。**トレイト**（`impl Trait for Type` のメソッド emit・既定実装の合成・
-  ジェネリック関数の単相化・構造的 `==`）は実装済み（上記トレイト節）。`!`・ジェネリック
-  **型**の単相化は未対応
+- **struct**（上記。ジェネリック struct の単相化を含む）。**トレイト**（`impl Trait for Type` の
+  メソッド emit・既定実装の合成・ジェネリック関数の単相化・構造的 `==`）は実装済み（上記トレイト節）
+- **`!`（エラー伝播、ADR-0002）** `gen_try`: inner（Result/Option）を評価して alloca へ退避し
+  タグを読む。成功タグ（Some=1 / Ok=0）と一致すれば継続ブロックでペイロードをアンラップして
+  式の値とし、不一致なら伝播ブロックで**関数の戻り型へ `Err(e)` / `None` を再構築して早期 `ret`**
+  （`gen_enum_value`／`load_enum_payload` を共用）。スカラ・集約（struct エラー）両ペイロードに対応。
+  typeck は inner の種別が戻り型の種別（Result/Option）と一致し、Result では Err の型 E が
+  戻り型の E と互換であることを検査。集約レイアウト整合のため、`return`／注釈付き `let` で
+  enum 構築式の未確定型引数を文脈から埋める（`refine_construction`）
 - `main(): i32` の戻り値が終了コードになり、`clang` で実行して検証できる
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
-- 未対応（今後）: `!`（Result/Option 伝播）、文字列の操作（長さ・索引・連結・補間）、ジェネリック**型**の単相化
-  （ジェネリック**関数**の単相化は実装済み）
+- 未対応（今後）: 文字列の操作（長さ・索引・連結・補間）（`!` エラー伝播・ジェネリック **enum**（集約ペイロード）＝ADR-0010・ジェネリック**関数**・ジェネリック **struct 型**の単相化はいずれも実装済み）。なお整数/小数リテラルからジェネリック struct を構築すると型パラメータは既定（`i32`/`f64`）に確定し、`Pair<i64>` 等の非既定幅の明示注釈は構築式へ伝播しない（型エラーになる。enum の `refine_construction` と同種の制約）
 
 ### 標準ライブラリ（最小・iris 自身で記述）
 
@@ -219,7 +238,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 ライブラリ。コンパイル時に各プログラムの先頭へ自動で前置される（単一の文字列として
 連結し span を一意に保つ）。
 
-- 提供: `putchar` / `puts` / `strcmp`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`
+- 提供: `putchar` / `puts` / `strcmp`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`、`trait Iterator<T> { fn next(&mut self): Option<T> }`（`for x in iter` が要求する標準トレイト・ADR-0007）
 - `puts` は NUL 終端文字列を出力し末尾に改行を付ける（文字列リテラルの出力に使える）
 - `strcmp` は libc から借りる文字列比較。`match` の文字列リテラルパターンの codegen が呼び出す（未使用でも `declare` のみ出力され無害）
 - 現状のコード生成に合わせ `i32` / `bool` / `string` の範囲で記述
@@ -259,11 +278,12 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 
 ### 未実装
 
-- ループ `for`: **整数範囲 `for x in lo..hi` / `lo..=hi` は実装済み**（縦断・clang 実行）。**残り**: 一般のイテレータ（ADR-0007 の `Iterator<T>` 経由 `for x in collection`。`Option<T>` のジェネリック enum codegen・反復可能なコレクションが必要）、浮動小数範囲
+- ループ `for`: **整数範囲 `for x in lo..hi` / `lo..=hi`** と **一般イテレータ `for x in iter`（`Iterator<T>` 経由・ADR-0007）は実装済み**（いずれも縦断・clang 実行）。**残り**: 反復可能な標準コレクション（`Vec<T>` 等。ジェネリック struct 単相化が前提）、複数 `Iterator` 実装の同居を解く `for x#T in iter` 修飾構文、浮動小数範囲
 - `match` の拡張: リテラル（整数・浮動小数・bool・**文字列**）・**範囲 `1..10` / `1..=10`**・**ガード `if cond`**・ワイルドカード `_`・enum バリアント束縛・enum タグ比較による if-else 連鎖は実装済み。**残り**: 範囲の浮動小数境界の網羅性、識別子束縛パターン（`x ->` で scrutinee 全体を束縛）、ネストパターン、`|`（or パターン）、exhaustiveness 検査
 - ラムダ `(x): T -> expr`、関数型シグネチャ
 - 一般の型合成 `A + B`（ADR-0001。引数位置の匿名トレイト境界としては実装済み）
-- ジェネリックな**型**定義のコード生成（`type Box<T>` の単相化。関数のジェネリクス `fn f<T>` は実装済み）
+- ジェネリック **enum**（`Option`/`Result`/ユーザ定義）: スカラ／参照／`string`＝ptr ペイロードは i64 共通レイアウト、**struct 等の集約ペイロードは per-instantiation レイアウトで実装済み**（ADR-0010、`Option<Point>`・`Wrap<Point>` 等が縦断・clang 実行）。**残り**: 複数異種ペイロードの過小整列（記憶域＝最大サイズ型のため最大整列とは限らない）、ジェネリック関数の単相化の内側でのみ現れる集約インスタンスの型宣言収集（ADR-0010「Consequences」参照）
+- ジェネリックな **struct 型**定義のコード生成（`type Pair<T>`/`type Box<T>` の per-instantiation 単相化）は**実装済み**（enum・関数のジェネリクスと合わせ、`tests/codegen.rs` で縦断・clang 実行）。**残り**: 整数/小数リテラル構築での非既定幅の型引数の文脈伝播、ジェネリック関数の内側でのみ現れるインスタンスの型宣言収集（ADR-0010 と同種）
 - `use`（インポート）、可視性のモジュール解決
 - 文字列補間（バッククォート `` `...{expr}...` ``）
 - `as` による型変換

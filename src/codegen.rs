@@ -62,22 +62,74 @@ struct StructReg {
     layouts: HashMap<String, Vec<(String, Ty)>>,
     /// 別名 `type A = B`（B は引数なし名前付き型）の A → B。
     alias_to: HashMap<String, String>,
+    /// enum 名 → (型パラメータ名, バリアント列（名前, ペイロード型）)。ジェネリック含む。
+    /// ビルトイン Option/Result も。enum の唯一の真実源（タグ＝バリアントの宣言順 index）。
+    /// `llvm_ty` が名前付き enum 型を `%Name`（スカラペイロード＝i64 共通レイアウト）か
+    /// `%Enum.Args`（集約ペイロード＝per-instantiation）のどちらへ写すか判定し、
+    /// 構築/`match` のタグ・ペイロード解決にも使う。
+    enum_layouts: HashMap<String, (Vec<String>, Vec<(String, Option<Ty>)>)>,
+    /// ジェネリック struct 名 → (型パラメータ名, フィールド（名前, 型。型パラメータを含む）)。
+    /// 使用箇所の型引数で per-instantiation レイアウト `%Name.Args` を作る（単相化）。
+    generic_structs: HashMap<String, (Vec<String>, Vec<(String, Ty)>)>,
 }
 
 impl StructReg {
     /// プログラムの型定義から struct レイアウトと別名を集める。
     fn build(program: &Program) -> StructReg {
         let mut reg = StructReg::default();
+        // ビルトイン Option/Result（タグ＝宣言順: None=0/Some=1、Ok=0/Err=1）。
+        reg.enum_layouts.insert(
+            "Option".to_string(),
+            (
+                vec!["T".to_string()],
+                vec![
+                    ("None".to_string(), None),
+                    ("Some".to_string(), Some(Ty::named("T"))),
+                ],
+            ),
+        );
+        reg.enum_layouts.insert(
+            "Result".to_string(),
+            (
+                vec!["T".to_string(), "E".to_string()],
+                vec![
+                    ("Ok".to_string(), Some(Ty::named("T"))),
+                    ("Err".to_string(), Some(Ty::named("E"))),
+                ],
+            ),
+        );
         for item in &program.items {
             let Item::TypeDef(t) = item else { continue };
+            if let TypeDefBody::Enum(variants) = &t.body {
+                reg.enum_layouts.insert(
+                    t.name.clone(),
+                    (
+                        t.generics.iter().map(|g| g.name.clone()).collect(),
+                        variants
+                            .iter()
+                            .map(|v| (v.name.clone(), v.payload.as_ref().map(Ty::from_ast)))
+                            .collect(),
+                    ),
+                );
+            }
             match &t.body {
-                // ジェネリックな struct は単一化未実装のためコード生成では扱わない。
                 TypeDefBody::Struct(fields) if t.generics.is_empty() => {
                     let layout = fields
                         .iter()
                         .map(|f| (f.name.clone(), Ty::from_ast(&f.ty)))
                         .collect();
                     reg.layouts.insert(t.name.clone(), layout);
+                }
+                // ジェネリック struct は型パラメータ付きで保持し、使用箇所で単相化する。
+                TypeDefBody::Struct(fields) => {
+                    let layout = fields
+                        .iter()
+                        .map(|f| (f.name.clone(), Ty::from_ast(&f.ty)))
+                        .collect();
+                    reg.generic_structs.insert(
+                        t.name.clone(),
+                        (t.generics.iter().map(|g| g.name.clone()).collect(), layout),
+                    );
                 }
                 // `type A = B`（引数なし名前付き型）は別名としてたどれるようにする。
                 TypeDefBody::Alias(Type::Named { name, args, .. }) if args.is_empty() => {
@@ -103,45 +155,161 @@ impl StructReg {
         }
         None
     }
-}
 
-/// enum のレイアウト情報。
-///
-/// 非ジェネリックな enum を名前 → バリアント列（宣言順）で持つ。
-/// LLVM 表現は `{ i8, i64 }` 固定（タグ＋ペイロードを i64 に格納）。
-#[derive(Default)]
-struct EnumReg {
-    /// enum 名 → バリアント（名前, ペイロード型）の宣言順リスト。
-    layouts: HashMap<String, Vec<(String, Option<Ty>)>>,
-}
+    fn is_enum(&self, name: &str) -> bool {
+        self.enum_layouts.contains_key(name)
+    }
 
-impl EnumReg {
-    fn build(program: &Program) -> EnumReg {
-        let mut reg = EnumReg::default();
-        for item in &program.items {
-            let Item::TypeDef(t) = item else { continue };
-            if let TypeDefBody::Enum(variants) = &t.body
-                && t.generics.is_empty()
-            {
-                let layout = variants
-                    .iter()
-                    .map(|v| (v.name.clone(), v.payload.as_ref().map(|p| Ty::from_ast(p))))
-                    .collect();
-                reg.layouts.insert(t.name.clone(), layout);
-            }
+    fn is_generic_struct(&self, name: &str) -> bool {
+        self.generic_structs.contains_key(name)
+    }
+
+    /// ジェネリック struct インスタンス（`Pair<i32>` 等）の LLVM 記号と、型引数で
+    /// 単相化したフィールド列を返す。記号は `mono_symbol`（`Pair.i32`）。
+    fn generic_struct_instance(
+        &self,
+        name: &str,
+        args: &[Ty],
+    ) -> Option<(String, Vec<(String, Ty)>)> {
+        let (generics, fields) = self.generic_structs.get(name)?;
+        let mut subst = HashMap::new();
+        for (g, a) in generics.iter().zip(args) {
+            subst.insert(g.clone(), a.clone());
         }
-        reg
+        let fields = fields
+            .iter()
+            .map(|(n, t)| (n.clone(), subst_ty(t, &subst)))
+            .collect();
+        Some((mono_symbol(name, args), fields))
     }
 
-    /// バリアント名からタグインデックスを返す。
-    fn tag_of(&self, enum_name: &str, variant: &str) -> Option<usize> {
-        let vs = self.layouts.get(enum_name)?;
-        vs.iter().position(|(n, _)| n == variant)
+    /// 型（参照は剥がす）から struct レイアウトを解決する。非ジェネリックは正規名と
+    /// 宣言フィールド、ジェネリックインスタンスは単相化記号と置換後フィールドを返す。
+    fn struct_layout_of(&self, ty: &Ty) -> Option<(String, Vec<(String, Ty)>)> {
+        match ty.peel_refs() {
+            Ty::Named { name, args } if !args.is_empty() && self.is_generic_struct(name) => {
+                self.generic_struct_instance(name, args)
+            }
+            Ty::Named { name, .. } => self
+                .struct_def(name)
+                .map(|(canon, fields)| (canon, fields.clone())),
+            _ => None,
+        }
     }
 
-    /// enum 名 → バリアント一覧を返す。
-    fn variants(&self, enum_name: &str) -> Option<&Vec<(String, Option<Ty>)>> {
-        self.layouts.get(enum_name)
+    /// enum 名 → バリアント列（名前, ペイロード型。ペイロードは型パラメータを含みうる）。
+    fn enum_variants(&self, name: &str) -> Option<&Vec<(String, Option<Ty>)>> {
+        self.enum_layouts.get(name).map(|(_, vs)| vs)
+    }
+
+    /// バリアント名 → タグ（宣言順 index）。
+    fn enum_tag(&self, name: &str, variant: &str) -> Option<usize> {
+        self.enum_variants(name)?
+            .iter()
+            .position(|(n, _)| n == variant)
+    }
+
+    /// あるバリアントのペイロード型を、scrutinee/構築箇所の型引数で単相化して返す。
+    fn enum_payload_of(&self, name: &str, variant: &str, args: &[Ty]) -> Option<Ty> {
+        let (generics, variants) = self.enum_layouts.get(name)?;
+        let (_, payload) = variants.iter().find(|(n, _)| n == variant)?;
+        let payload = payload.clone()?;
+        let mut subst = HashMap::new();
+        for (g, a) in generics.iter().zip(args) {
+            subst.insert(g.clone(), a.clone());
+        }
+        Some(subst_ty(&payload, &subst))
+    }
+
+    /// enum インスタンス（`Option<i32>` 等）の各バリアントのペイロード型を型引数で
+    /// 単相化して返す（なしは None）。
+    fn enum_payloads(&self, name: &str, args: &[Ty]) -> Option<Vec<Option<Ty>>> {
+        let (generics, variants) = self.enum_layouts.get(name)?;
+        let mut subst = HashMap::new();
+        for (g, a) in generics.iter().zip(args) {
+            subst.insert(g.clone(), a.clone());
+        }
+        Some(
+            variants
+                .iter()
+                .map(|(_, p)| p.as_ref().map(|t| subst_ty(t, &subst)))
+                .collect(),
+        )
+    }
+
+    /// enum インスタンスが集約ペイロード（i64 に収まらない）を持つか。持つ場合は
+    /// per-instantiation レイアウト `%Enum.Args` を使う。スカラのみなら i64 共通 `%Enum`。
+    fn enum_is_aggregate(&self, name: &str, args: &[Ty]) -> bool {
+        self.enum_payloads(name, args).is_some_and(|ps| {
+            ps.iter()
+                .any(|p| p.as_ref().is_some_and(|t| !self.fits_i64(t)))
+        })
+    }
+
+    /// 集約 enum インスタンスの記憶域型（最大サイズのペイロード型）を返す。
+    fn enum_storage_ty(&self, name: &str, args: &[Ty]) -> Option<Ty> {
+        let ps = self.enum_payloads(name, args)?;
+        ps.into_iter()
+            .flatten()
+            .max_by_key(|t| self.size_of(t))
+    }
+
+    /// 型が i64 スロットに収まる（スカラ・参照・ポインタ）か。struct/配列/タプルは集約。
+    fn fits_i64(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Ref { .. } => true,
+            // 未確定型は保守的にスカラ（i64 共通レイアウト）扱い。
+            Ty::Infer | Ty::IntLit | Ty::FloatLit => true,
+            Ty::Named { name, args } if args.is_empty() => match name.as_str() {
+                "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64" | "u64" | "f32" | "f64"
+                | "bool" | "char" | "string" => true,
+                // 別名は元の型で判定。struct/enum は集約扱い。
+                other => self
+                    .alias_to
+                    .get(other)
+                    .is_some_and(|t| self.fits_i64(&Ty::named(t))),
+            },
+            // enum インスタンス（Option<i32> 等）はそれ自体が { i8, i64 } 以上＝集約。
+            _ => false,
+        }
+    }
+
+    /// 記憶域型を選ぶための概算サイズ（バイト）。整列は LLVM に委ねるため近似でよい。
+    fn size_of(&self, ty: &Ty) -> usize {
+        match ty {
+            Ty::Ref { .. } => 8,
+            Ty::Named { name, args } if args.is_empty() => match name.as_str() {
+                "bool" | "char" | "i8" | "u8" => 1,
+                "i16" | "u16" => 2,
+                "i32" | "u32" | "f32" => 4,
+                "i64" | "u64" | "f64" | "string" => 8,
+                other => {
+                    if let Some((_, fields)) = self.struct_def(other) {
+                        fields.iter().map(|(_, t)| self.size_of(t)).sum()
+                    } else if let Some(t) = self.alias_to.get(other) {
+                        self.size_of(&Ty::named(t))
+                    } else {
+                        8
+                    }
+                }
+            },
+            // enum インスタンスはタグ + 記憶域。集約なら記憶域分を加える。
+            Ty::Named { name, args } if self.is_enum(name) => {
+                let payload = self
+                    .enum_storage_ty(name, args)
+                    .map_or(8, |t| self.size_of(&t));
+                1 + payload
+            }
+            // ジェネリック struct インスタンスは置換後フィールドの合計。
+            Ty::Named { name, args } if self.is_generic_struct(name) => self
+                .generic_struct_instance(name, args)
+                .map_or(8, |(_, fields)| {
+                    fields.iter().map(|(_, t)| self.size_of(t)).sum()
+                }),
+            Ty::Array(t) => self.size_of(t),
+            Ty::Tuple(es) => es.iter().map(|e| self.size_of(e)).sum(),
+            _ => 8,
+        }
     }
 }
 
@@ -293,19 +461,104 @@ pub fn emit_module(
         module.push('\n');
     }
 
-    // 非ジェネリック enum の型宣言 `%Name = type { i8, i64 }` を出力する。
-    let enums = EnumReg::build(program);
-    let mut enum_decls_emitted = false;
+    // enum の型宣言 `%Name = type { i8, i64 }` を出力する。ジェネリック enum も
+    // 全インスタンス共通の `{ i8, i64 }` レイアウトを使う（ペイロードは i64 にキャスト格納）。
+    // ビルトイン Option/Result を含め、再現性のため宣言順（プログラム順）で出力する。
+    let mut enum_names: Vec<String> = Vec::new();
+    for name in ["Option", "Result"] {
+        enum_names.push(name.to_string());
+    }
     for item in &program.items {
         if let Item::TypeDef(t) = item
             && let TypeDefBody::Enum(_) = &t.body
-            && t.generics.is_empty()
         {
-            let _ = writeln!(module, "%{} = type {{ i8, i64 }}", t.name);
-            enum_decls_emitted = true;
+            enum_names.push(t.name.clone());
         }
     }
-    if enum_decls_emitted {
+    for name in &enum_names {
+        let _ = writeln!(module, "%{name} = type {{ i8, i64 }}");
+    }
+    if !enum_names.is_empty() {
+        module.push('\n');
+    }
+
+    // 集約ペイロード（struct 等）を持つ enum インスタンスの per-instantiation 型宣言
+    // `%Enum.Args = type { i8, <記憶域> }` を出力する。記憶域は最大サイズのペイロード型。
+    // 使用インスタンスは式の型と（非ジェネリック）シグネチャから集める。
+    let mut agg_seen: HashSet<String> = HashSet::new();
+    let mut agg_decls: Vec<(String, Ty)> = Vec::new();
+    for ty in type_info.expr_types.values() {
+        collect_agg_enum(ty, &structs, &mut agg_seen, &mut agg_decls);
+    }
+    let mut consider_sig = |f: &Function, structs: &StructReg| {
+        if !f.generics.is_empty() {
+            return;
+        }
+        for p in &f.params {
+            collect_agg_enum(&Ty::from_ast(&p.ty), structs, &mut agg_seen, &mut agg_decls);
+        }
+        if let Some(r) = &f.ret {
+            collect_agg_enum(&Ty::from_ast(r), structs, &mut agg_seen, &mut agg_decls);
+        }
+    };
+    for item in &program.items {
+        match item {
+            Item::Function(f) => consider_sig(f, &structs),
+            Item::Impl(im) => {
+                for m in &im.methods {
+                    consider_sig(m, &structs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ジェネリック struct インスタンスの per-instantiation 型 `%Name.Args = type { ... }` を
+    // 集める（フィールド型が新たな集約 enum を含めば agg_decls にも追加される）。
+    let mut gs_seen: HashSet<String> = HashSet::new();
+    let mut gs_decls: Vec<(String, Vec<(String, Ty)>)> = Vec::new();
+    for ty in type_info.expr_types.values() {
+        collect_generic_struct(ty, &structs, &mut gs_seen, &mut gs_decls, &mut agg_seen, &mut agg_decls);
+    }
+    let mut consider_sig_gs = |f: &Function| {
+        if !f.generics.is_empty() {
+            return;
+        }
+        for p in &f.params {
+            collect_generic_struct(&Ty::from_ast(&p.ty), &structs, &mut gs_seen, &mut gs_decls, &mut agg_seen, &mut agg_decls);
+        }
+        if let Some(r) = &f.ret {
+            collect_generic_struct(&Ty::from_ast(r), &structs, &mut gs_seen, &mut gs_decls, &mut agg_seen, &mut agg_decls);
+        }
+    };
+    for item in &program.items {
+        match item {
+            Item::Function(f) => consider_sig_gs(f),
+            Item::Impl(im) => {
+                for m in &im.methods {
+                    consider_sig_gs(m);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !agg_decls.is_empty() {
+        for (mono, storage) in &agg_decls {
+            let st = llvm_ty(storage, &structs).map_err(|m| CodegenError::new(Span::new(0, 0), m))?;
+            let _ = writeln!(module, "%{mono} = type {{ i8, {st} }}");
+        }
+        module.push('\n');
+    }
+
+    if !gs_decls.is_empty() {
+        for (mono, fields) in &gs_decls {
+            let mut field_tys = Vec::new();
+            for (_, ft) in fields {
+                field_tys.push(llvm_ty(ft, &structs).map_err(|m| CodegenError::new(Span::new(0, 0), m))?);
+            }
+            let _ = writeln!(module, "%{mono} = type {{ {} }}", field_tys.join(", "));
+        }
         module.push('\n');
     }
 
@@ -328,7 +581,6 @@ pub fn emit_module(
             method_collisions: &method_collisions,
             method_provider: &type_info.method_provider,
             structs: &structs,
-            enums: &enums,
             variant_constructions: &type_info.variant_constructions,
             strings: &strings,
             body: String::new(),
@@ -340,6 +592,7 @@ pub fn emit_module(
             ret_ty: Ty::unit(),
             type_subst: subst,
             mono: &type_info.mono,
+            for_iter_elem: &type_info.for_iter_elem,
         };
         let func_ir = cg.emit_function(f, symbol)?;
         module.push_str(&func_ir);
@@ -464,7 +717,6 @@ struct FnCodegen<'a> {
     /// メソッド呼び出しの解決済み提供元（typeck が記録。callee span → ラベル）。
     method_provider: &'a HashMap<Span, String>,
     structs: &'a StructReg,
-    enums: &'a EnumReg,
     /// バリアント構築の情報（typeck が記録）。
     variant_constructions: &'a HashMap<Span, (String, usize, bool)>,
     /// 文字列リテラルのグローバル定数プール（全関数で共有）。
@@ -484,6 +736,8 @@ struct FnCodegen<'a> {
     type_subst: &'a HashMap<String, Ty>,
     /// 単相化情報（callee span → (関数名, 型引数)）。ジェネリック呼び出しの記号解決に使う。
     mono: &'a HashMap<Span, (String, Vec<Ty>)>,
+    /// `for x in it` の要素型（typeck が記録。var_span → 要素型 T）。
+    for_iter_elem: &'a HashMap<Span, Ty>,
 }
 
 /// 型パラメータ名を具体型へ置換する（単相化）。
@@ -540,6 +794,10 @@ fn walk_stmt_calls(stmt: &Stmt, out: &mut Vec<Span>) {
         Stmt::For { start, end, body, .. } => {
             walk_expr_calls(start, out);
             walk_expr_calls(end, out);
+            collect_call_callees(body, out);
+        }
+        Stmt::ForIn { iter, body, .. } => {
+            walk_expr_calls(iter, out);
             collect_call_callees(body, out);
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => {}
@@ -629,6 +887,75 @@ fn mono_symbol(name: &str, args: &[Ty]) -> String {
         s.push_str(&mangle_ty(a));
     }
     s
+}
+
+/// 集約 enum インスタンスの記憶域フィールドの LLVM 型を返す（zeroinitializer 用）。
+fn inst_ty_storage_llty(
+    inst_ty: &Ty,
+    structs: &StructReg,
+    span: Span,
+) -> Result<String, CodegenError> {
+    if let Ty::Named { name, args } = inst_ty
+        && let Some(storage) = structs.enum_storage_ty(name, args)
+    {
+        return llvm_ty(&storage, structs).map_err(|m| CodegenError::new(span, m));
+    }
+    Ok("i64".to_string())
+}
+
+/// `ty` が集約ペイロードを持つ enum インスタンスなら、その per-instantiation 記号と
+/// 記憶域型を `out` へ集める（重複は `seen` で除外）。型宣言の発行に使う。
+fn collect_agg_enum(
+    ty: &Ty,
+    structs: &StructReg,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<(String, Ty)>,
+) {
+    if let Ty::Named { name, args } = ty
+        && structs.is_enum(name)
+        // 未確定の型引数を含むインスタンスはレイアウトを決められないため除外
+        // （文脈で確定した同一インスタンスが別途収集される）。
+        && !args.iter().any(|a| matches!(a, Ty::Infer | Ty::IntLit | Ty::FloatLit))
+        && structs.enum_is_aggregate(name, args)
+    {
+        let mono = mono_symbol(name, args);
+        if seen.insert(mono.clone())
+            && let Some(storage) = structs.enum_storage_ty(name, args)
+        {
+            out.push((mono, storage));
+        }
+    }
+}
+
+/// `ty` から使用されているジェネリック struct インスタンスを集める（per-instantiation の
+/// 型宣言 `%Name.Args = type { ... }` 発行用）。型引数・置換後フィールドへ再帰し、入れ子の
+/// ジェネリック struct と集約 enum も拾う。未確定型引数を含むインスタンスは除外。
+fn collect_generic_struct(
+    ty: &Ty,
+    structs: &StructReg,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<(String, Vec<(String, Ty)>)>,
+    agg_seen: &mut HashSet<String>,
+    agg_out: &mut Vec<(String, Ty)>,
+) {
+    let Ty::Named { name, args } = ty else { return };
+    // 型引数の中の入れ子インスタンス（`Option<Pair<i32>>` 等）も辿る。
+    for a in args {
+        collect_generic_struct(a, structs, seen, out, agg_seen, agg_out);
+        collect_agg_enum(a, structs, agg_seen, agg_out);
+    }
+    if !args.is_empty()
+        && structs.is_generic_struct(name)
+        && !args.iter().any(|a| matches!(a, Ty::Infer | Ty::IntLit | Ty::FloatLit))
+        && let Some((mono, fields)) = structs.generic_struct_instance(name, args)
+        && seen.insert(mono.clone())
+    {
+        for (_, ft) in &fields {
+            collect_generic_struct(ft, structs, seen, out, agg_seen, agg_out);
+            collect_agg_enum(ft, structs, agg_seen, agg_out);
+        }
+        out.push((mono, fields));
+    }
 }
 
 /// 型を記号に使える名前へ変換する。
@@ -803,6 +1130,12 @@ impl<'a> FnCodegen<'a> {
                 body,
                 ..
             } => self.gen_for(var_span, start, end, *inclusive, body),
+            Stmt::ForIn {
+                var_span,
+                iter,
+                body,
+                ..
+            } => self.gen_for_in(var_span, iter, body),
             Stmt::Break { span } => {
                 let (_, brk) = self
                     .loops
@@ -954,6 +1287,105 @@ impl<'a> FnCodegen<'a> {
         Ok(())
     }
 
+    /// 一般イテレータ `for x in it`（ADR-0007）を生成する。`it` が実装する `Iterator<T>`
+    /// の `next()` を毎反復で呼び、`Some(x)` なら x を束縛して本体を実行、`None` で終了する。
+    /// 脱糖は `loop { match it.next() { Some(x) -> body, None -> break } }` に相当。
+    fn gen_for_in(
+        &mut self,
+        var_span: &Span,
+        iter: &Expr,
+        body: &Block,
+    ) -> Result<(), CodegenError> {
+        let recv_ty = self.raw_ty(iter).defaulted();
+        let ty_name = struct_name_of(&recv_ty).ok_or_else(|| {
+            CodegenError::new(iter.span, "`for ... in` の対象が型を持ちません")
+        })?;
+
+        // 要素型 T と Option<T> インスタンス型。
+        let elem_ty = self
+            .for_iter_elem
+            .get(var_span)
+            .cloned()
+            .unwrap_or(Ty::Infer)
+            .defaulted();
+        let opt_ty = Ty::Named {
+            name: "Option".to_string(),
+            args: vec![elem_ty.clone()],
+        };
+        let opt_llty = llvm_ty(&opt_ty, self.structs).map_err(|m| CodegenError::new(iter.span, m))?;
+        let elem_llty =
+            llvm_ty(&elem_ty, self.structs).map_err(|m| CodegenError::new(iter.span, m))?;
+
+        // next() メソッドの記号を引く（提供元ラベルは Iterator トレイト）。
+        let label = "Iterator".to_string();
+        let func = *self
+            .method_defs
+            .get(&(ty_name.clone(), "next".to_string(), label.clone()))
+            .ok_or_else(|| {
+                CodegenError::new(
+                    iter.span,
+                    format!("型 `{ty_name}` は `Iterator::next` を実装していません"),
+                )
+            })?;
+        let colliding = self
+            .method_collisions
+            .contains(&(ty_name.clone(), "next".to_string()));
+        let symbol = method_symbol(&ty_name, "next", &label, colliding);
+
+        // イテレータの可変借用ポインタはループ前に一度だけ求める（反復間で状態を保つ）。
+        let _ = func; // self_kind は &mut self 前提（typeck が検査済み）
+        let itp = self.self_pointer(iter, &recv_ty)?;
+
+        // Option を受ける退避スロットと、要素 x の束縛スロットを確保する。
+        let opt_slot = self.fresh_tmp();
+        self.emit(&format!("{opt_slot} = alloca {opt_llty}"));
+        let id = self.def_spans.get(var_span).copied().ok_or_else(|| {
+            CodegenError::new(*var_span, "ループ変数の定義が見つかりません")
+        })?;
+        let var_slot = format!("%v.slot{id}");
+        self.emit(&format!("{var_slot} = alloca {elem_llty}"));
+        self.locals.insert(id, (var_slot.clone(), elem_llty.clone()));
+
+        let head_l = self.fresh_label("forin.head");
+        let body_l = self.fresh_label("forin.body");
+        let end_l = self.fresh_label("forin.end");
+
+        self.emit(&format!("br label %{head_l}"));
+        self.emit_label(&head_l);
+        // opt = it.next()
+        let opt = self.fresh_tmp();
+        self.emit(&format!("{opt} = call {opt_llty} @{symbol}(ptr {itp})"));
+        self.emit(&format!("store {opt_llty} {opt}, ptr {opt_slot}"));
+        // タグを読み、Some なら本体へ、None なら終了へ。
+        let tag_ptr = self.fresh_tmp();
+        self.emit(&format!(
+            "{tag_ptr} = getelementptr inbounds {opt_llty}, ptr {opt_slot}, i32 0, i32 0"
+        ));
+        let tag = self.fresh_tmp();
+        self.emit(&format!("{tag} = load i8, ptr {tag_ptr}"));
+        let some_tag = self.structs.enum_tag("Option", "Some").unwrap_or(1);
+        let is_some = self.fresh_tmp();
+        self.emit(&format!("{is_some} = icmp eq i8 {tag}, {some_tag}"));
+        self.emit(&format!(
+            "br i1 {is_some}, label %{body_l}, label %{end_l}"
+        ));
+
+        self.emit_label(&body_l);
+        // Some のペイロードを取り出して x へ束縛する。
+        let (payload, pllty) = self.load_enum_payload(&opt_slot, &opt_ty, &elem_ty, iter.span)?;
+        self.emit(&format!("store {pllty} {payload}, ptr {var_slot}"));
+        // continue は next 再呼び出し（head）へ、break は終了へ。
+        self.loops.push((head_l.clone(), end_l.clone()));
+        self.gen_block(body)?;
+        self.loops.pop();
+        if !self.terminated {
+            self.emit(&format!("br label %{head_l}"));
+        }
+
+        self.emit_label(&end_l);
+        Ok(())
+    }
+
     /// 代入先の場所のポインタと型を返す。
     fn place_ptr(&mut self, target: &Expr) -> Result<(String, String), CodegenError> {
         match &target.kind {
@@ -985,11 +1417,11 @@ impl<'a> FnCodegen<'a> {
         field: &str,
         span: Span,
     ) -> Result<(String, String, Ty), CodegenError> {
-        let (base, sname) = self.struct_base_ptr(object, span)?;
+        let (base, sty) = self.struct_base_ptr(object, span)?;
         let (canon, fields) = self
             .structs
-            .struct_def(&sname)
-            .ok_or_else(|| CodegenError::new(span, format!("型 `{sname}` は構造体ではありません")))?;
+            .struct_layout_of(&sty)
+            .ok_or_else(|| CodegenError::new(span, format!("型 `{}` は構造体ではありません", sty.describe())))?;
         let idx = fields
             .iter()
             .position(|(n, _)| n == field)
@@ -1005,14 +1437,14 @@ impl<'a> FnCodegen<'a> {
         Ok((p, fllty, fty))
     }
 
-    /// メンバアクセスの基底となる struct のポインタと（正規化前の）struct 名を返す。
-    /// 参照越しのアクセスは参照値（ポインタ）を辿る。場所でない値（関数の戻り値など）は
-    /// 一時 alloca に退避してアドレスを得る。
+    /// メンバアクセスの基底となる struct のポインタと、その struct インスタンス型
+    /// （参照は剥がす。ジェネリックなら型引数つき）を返す。参照越しのアクセスは参照値
+    /// （ポインタ）を辿る。場所でない値（関数の戻り値など）は一時 alloca に退避する。
     fn struct_base_ptr(
         &mut self,
         object: &Expr,
         span: Span,
-    ) -> Result<(String, String), CodegenError> {
+    ) -> Result<(String, Ty), CodegenError> {
         let oty = self.raw_ty(object).defaulted();
         if let Ty::Ref { .. } = oty {
             // object は値としてポインタを返す。多段参照は値の文脈で 1 段ずつ load する。
@@ -1031,23 +1463,24 @@ impl<'a> FnCodegen<'a> {
                     break;
                 }
             }
-            let name = struct_name_of(&cur).ok_or_else(|| {
-                CodegenError::new(span, "メンバアクセスの対象が構造体ではありません")
-            })?;
-            return Ok((ptr, name));
+            if self.structs.struct_layout_of(&cur).is_none() {
+                return Err(CodegenError::new(span, "メンバアクセスの対象が構造体ではありません"));
+            }
+            return Ok((ptr, cur));
         }
         // 場所ならそのアドレス、そうでなければ一時 alloca に退避する。
-        let name = struct_name_of(&oty)
-            .ok_or_else(|| CodegenError::new(span, "メンバアクセスの対象が構造体ではありません"))?;
+        if self.structs.struct_layout_of(&oty).is_none() {
+            return Err(CodegenError::new(span, "メンバアクセスの対象が構造体ではありません"));
+        }
         match self.place_ptr(object) {
-            Ok((p, _)) => Ok((p, name)),
+            Ok((p, _)) => Ok((p, oty)),
             Err(_) => {
                 let llty = llvm_ty(&oty, self.structs).map_err(|m| CodegenError::new(span, m))?;
                 let val = self.gen_expr(object, &llty)?;
                 let slot = self.fresh_tmp();
                 self.emit(&format!("{slot} = alloca {llty}"));
                 self.emit(&format!("store {llty} {val}, ptr {slot}"));
-                Ok((slot, name))
+                Ok((slot, oty))
             }
         }
     }
@@ -1058,14 +1491,13 @@ impl<'a> FnCodegen<'a> {
         &mut self,
         lhs: &Expr,
         rhs: &Expr,
-        sname: &str,
+        ty: &Ty,
         negate: bool,
         span: Span,
     ) -> Result<String, CodegenError> {
         let (lbase, _) = self.struct_base_ptr(lhs, span)?;
         let (rbase, _) = self.struct_base_ptr(rhs, span)?;
-        let ty = Ty::named(sname);
-        let eq = self.gen_eq_at(&lbase, &rbase, &ty, span)?;
+        let eq = self.gen_eq_at(&lbase, &rbase, ty, span)?;
         if negate {
             let r = self.fresh_tmp();
             self.emit(&format!("{r} = xor i1 {eq}, true"));
@@ -1084,10 +1516,7 @@ impl<'a> FnCodegen<'a> {
         ty: &Ty,
         span: Span,
     ) -> Result<String, CodegenError> {
-        if let Some(sname) = struct_name_of(ty)
-            && let Some((canon, fields)) =
-                self.structs.struct_def(&sname).map(|(c, f)| (c, f.clone()))
-        {
+        if let Some((canon, fields)) = self.structs.struct_layout_of(ty) {
             let mut acc: Option<String> = None;
             for (idx, (_, fty)) in fields.iter().enumerate() {
                 let lp = self.fresh_tmp();
@@ -1133,16 +1562,28 @@ impl<'a> FnCodegen<'a> {
         fields: &[FieldInit],
         span: Span,
     ) -> Result<String, CodegenError> {
-        let (canon, def_fields) = self
-            .structs
-            .struct_def(name)
-            .map(|(c, f)| (c, f.clone()))
-            .ok_or_else(|| {
-                CodegenError::new(
-                    span,
-                    format!("`{name}` の構造体定義が見つかりません（ジェネリック struct は未対応）"),
-                )
-            })?;
+        // ジェネリック struct はリテラル式の型（型引数つき）から単相化レイアウトを引く。
+        let inst_ty = self
+            .types
+            .get(&span)
+            .cloned()
+            .map(|t| subst_ty(&t, self.type_subst));
+        let (canon, def_fields) = match &inst_ty {
+            Some(ty @ Ty::Named { name: n, args })
+                if !args.is_empty() && self.structs.is_generic_struct(n) =>
+            {
+                self.structs.struct_layout_of(ty).ok_or_else(|| {
+                    CodegenError::new(span, format!("`{name}` の単相化レイアウトを解決できません"))
+                })?
+            }
+            _ => self
+                .structs
+                .struct_def(name)
+                .map(|(c, f)| (c, f.clone()))
+                .ok_or_else(|| {
+                    CodegenError::new(span, format!("`{name}` の構造体定義が見つかりません"))
+                })?,
+        };
         let slot = self.fresh_tmp();
         self.emit(&format!("{slot} = alloca %{canon}"));
         // 宣言順にフィールドを書き込む。
@@ -1165,44 +1606,169 @@ impl<'a> FnCodegen<'a> {
 
     // ---- 式 -------------------------------------------------------------
 
-    /// enum バリアントを構築し、`{ i8, i64 }` 値を返す。
-    /// `enum_name`・`tag`・ペイロード expr を受け取る。
+    /// enum バリアントを構築し、enum 値を返す。ペイロードは式から評価する。
     fn gen_enum_construction(
         &mut self,
-        enum_name: &str,
+        inst_ty: &Ty,
         tag: usize,
         payload_expr: Option<&Expr>,
         span: Span,
     ) -> Result<String, CodegenError> {
+        // ペイロード式を先に評価してから値ベースの構築へ委ねる。
+        let payload = match payload_expr {
+            Some(pe) => {
+                let payload_ty = self.iris_ty(pe);
+                Some(self.gen_value(pe, &payload_ty)?)
+            }
+            None => None,
+        };
+        self.gen_enum_value(inst_ty, tag, payload, span)
+    }
+
+    /// enum バリアントを、評価済みのペイロード値から構築して enum 値を返す。
+    /// インスタンス型でレイアウトを決める（スカラ＝`%Enum` の i64 共通、集約＝
+    /// per-instantiation の `%Enum.Args`）。
+    fn gen_enum_value(
+        &mut self,
+        inst_ty: &Ty,
+        tag: usize,
+        payload: Option<(String, String)>,
+        span: Span,
+    ) -> Result<String, CodegenError> {
+        let ellty = llvm_ty(inst_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        let aggregate = matches!(inst_ty, Ty::Named { name, args }
+            if self.structs.is_enum(name) && self.structs.enum_is_aggregate(name, args));
         let slot = self.fresh_tmp();
-        self.emit(&format!("{slot} = alloca %{enum_name}"));
+        self.emit(&format!("{slot} = alloca {ellty}"));
         // タグを書き込む。
         let tag_ptr = self.fresh_tmp();
         self.emit(&format!(
-            "{tag_ptr} = getelementptr inbounds %{enum_name}, ptr {slot}, i32 0, i32 0"
+            "{tag_ptr} = getelementptr inbounds {ellty}, ptr {slot}, i32 0, i32 0"
         ));
         self.emit(&format!("store i8 {tag}, ptr {tag_ptr}"));
-        // ペイロードを書き込む（i64 にキャスト）。
-        if let Some(pe) = payload_expr {
-            let payload_ty = self.iris_ty(pe);
-            let (v, vllty) = self.gen_value(pe, &payload_ty)?;
-            let payload_i64 = self.cast_to_i64(&v, &vllty, span)?;
-            let payload_ptr = self.fresh_tmp();
-            self.emit(&format!(
-                "{payload_ptr} = getelementptr inbounds %{enum_name}, ptr {slot}, i32 0, i32 1"
-            ));
-            self.emit(&format!("store i64 {payload_i64}, ptr {payload_ptr}"));
+        let payload_ptr = self.fresh_tmp();
+        self.emit(&format!(
+            "{payload_ptr} = getelementptr inbounds {ellty}, ptr {slot}, i32 0, i32 1"
+        ));
+        // ペイロードを書き込む。集約はペイロード型のまま typed store（opaque ポインタ
+        // なので bitcast 不要）、スカラは i64 へキャストして格納。
+        if let Some((v, vllty)) = payload {
+            if aggregate {
+                self.emit(&format!("store {vllty} {v}, ptr {payload_ptr}"));
+            } else {
+                let payload_i64 = self.cast_to_i64(&v, &vllty, span)?;
+                self.emit(&format!("store i64 {payload_i64}, ptr {payload_ptr}"));
+            }
+        } else if aggregate {
+            // ペイロードなしの集約 enum は記憶域を 0 初期化する。
+            let storage = inst_ty_storage_llty(inst_ty, self.structs, span)?;
+            self.emit(&format!("store {storage} zeroinitializer, ptr {payload_ptr}"));
         } else {
-            // ペイロードなしは 0 を格納。
-            let payload_ptr = self.fresh_tmp();
-            self.emit(&format!(
-                "{payload_ptr} = getelementptr inbounds %{enum_name}, ptr {slot}, i32 0, i32 1"
-            ));
             self.emit(&format!("store i64 0, ptr {payload_ptr}"));
         }
         let r = self.fresh_tmp();
-        self.emit(&format!("{r} = load %{enum_name}, ptr {slot}"));
+        self.emit(&format!("{r} = load {ellty}, ptr {slot}"));
         Ok(r)
+    }
+
+    /// enum スロット（`slot`＝インスタンス型のアドレス）から、あるバリアントのペイロードを
+    /// 型 `payload_ty` で読み出して (値, LLVM型) を返す。集約は typed load、スカラは
+    /// i64 から読みキャスト。
+    fn load_enum_payload(
+        &mut self,
+        slot: &str,
+        inst_ty: &Ty,
+        payload_ty: &Ty,
+        span: Span,
+    ) -> Result<(String, String), CodegenError> {
+        let ellty = llvm_ty(inst_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        let pllty = llvm_ty(payload_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        let aggregate = matches!(inst_ty, Ty::Named { name, args }
+            if self.structs.is_enum(name) && self.structs.enum_is_aggregate(name, args));
+        let payload_ptr = self.fresh_tmp();
+        self.emit(&format!(
+            "{payload_ptr} = getelementptr inbounds {ellty}, ptr {slot}, i32 0, i32 1"
+        ));
+        let v = if aggregate {
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = load {pllty}, ptr {payload_ptr}"));
+            r
+        } else {
+            let raw = self.fresh_tmp();
+            self.emit(&format!("{raw} = load i64, ptr {payload_ptr}"));
+            self.cast_from_i64(&raw, &pllty, span)?
+        };
+        Ok((v, pllty))
+    }
+
+    /// `!`（エラー伝播）を生成する。inner（Result/Option）を評価し、成功なら
+    /// ペイロードをアンラップして式の値とする。失敗なら現在の関数から `Err(e)` /
+    /// `None` を早期 return する（関数の戻り型へ再構築）。
+    fn gen_try(&mut self, inner: &Expr, span: Span) -> Result<String, CodegenError> {
+        let inner_ty = self.iris_ty(inner);
+        let (ename, eargs) = match &inner_ty {
+            Ty::Named { name, args } if name == "Result" || name == "Option" => {
+                (name.clone(), args.clone())
+            }
+            other => {
+                return Err(CodegenError::new(
+                    span,
+                    format!("`!` は Result/Option にのみ使えますが `{}` でした", other.describe()),
+                ));
+            }
+        };
+        let is_option = ename == "Option";
+        let inner_llty = llvm_ty(&inner_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+
+        // inner を評価してアドレス（slot）へ退避し、タグを読む。
+        let (v, _) = self.gen_value(inner, &inner_ty)?;
+        let slot = self.fresh_tmp();
+        self.emit(&format!("{slot} = alloca {inner_llty}"));
+        self.emit(&format!("store {inner_llty} {v}, ptr {slot}"));
+        let tag_ptr = self.fresh_tmp();
+        self.emit(&format!(
+            "{tag_ptr} = getelementptr inbounds {inner_llty}, ptr {slot}, i32 0, i32 0"
+        ));
+        let tag = self.fresh_tmp();
+        self.emit(&format!("{tag} = load i8, ptr {tag_ptr}"));
+
+        // 成功タグ（Some / Ok）と一致するか。一致しなければ伝播ブロックへ。
+        let success_variant = if is_option { "Some" } else { "Ok" };
+        let success_tag = self.structs.enum_tag(&ename, success_variant).ok_or_else(|| {
+            CodegenError::new(span, format!("`{ename}` に `{success_variant}` がありません"))
+        })?;
+        let ok = self.fresh_tmp();
+        self.emit(&format!("{ok} = icmp eq i8 {tag}, {success_tag}"));
+        let cont_l = self.fresh_label("try.cont");
+        let prop_l = self.fresh_label("try.prop");
+        self.emit(&format!("br i1 {ok}, label %{cont_l}, label %{prop_l}"));
+
+        // 伝播ブロック: 関数の戻り型で Err(e) / None を作って return する。
+        self.emit_label(&prop_l);
+        let ret_ty = self.ret_ty.clone();
+        let ret_llty = llvm_ty(&ret_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+        let ret_name = match &ret_ty {
+            Ty::Named { name, .. } => name.clone(),
+            _ => String::new(),
+        };
+        let rv = if is_option {
+            let none_tag = self.structs.enum_tag(&ret_name, "None").unwrap_or(0);
+            self.gen_enum_value(&ret_ty, none_tag, None, span)?
+        } else {
+            // Err のペイロード e（型 E）を inner から取り出し、戻り型の Err として再構築。
+            let e_ty = eargs.get(1).cloned().unwrap_or(Ty::Infer);
+            let e_val = self.load_enum_payload(&slot, &inner_ty, &e_ty, span)?;
+            let err_tag = self.structs.enum_tag(&ret_name, "Err").unwrap_or(1);
+            self.gen_enum_value(&ret_ty, err_tag, Some(e_val), span)?
+        };
+        self.emit(&format!("ret {ret_llty} {rv}"));
+        self.terminated = true;
+
+        // 継続ブロック: 成功ペイロード（型 T）をアンラップして式の値とする。
+        self.emit_label(&cont_l);
+        let t_ty = eargs.first().cloned().unwrap_or(Ty::Infer);
+        let (pv, _) = self.load_enum_payload(&slot, &inner_ty, &t_ty, span)?;
+        Ok(pv)
     }
 
     /// 値を i64 にキャストする（enum ペイロード格納用）。
@@ -1260,7 +1826,7 @@ impl<'a> FnCodegen<'a> {
     /// 式を評価し、結果の値（レジスタまたは定数）を返す。`hint` はリテラルの型。
     fn gen_expr(&mut self, expr: &Expr, hint: &str) -> Result<String, CodegenError> {
         // enum バリアント構築（typeck が記録。Ident/Call のどちらでも来る）。
-        if let Some((enum_name, tag, has_payload)) = self.variant_constructions.get(&expr.span).cloned() {
+        if let Some((_enum_name, tag, has_payload)) = self.variant_constructions.get(&expr.span).cloned() {
             let payload_expr = if has_payload {
                 // Call の場合、最初の引数がペイロード。
                 match &expr.kind {
@@ -1270,7 +1836,9 @@ impl<'a> FnCodegen<'a> {
             } else {
                 None
             };
-            return self.gen_enum_construction(&enum_name, tag, payload_expr, expr.span);
+            // インスタンス型（型引数つき）から scalar/aggregate レイアウトを決める。
+            let inst_ty = self.iris_ty(expr);
+            return self.gen_enum_construction(&inst_ty, tag, payload_expr, expr.span);
         }
         match &expr.kind {
             ExprKind::Int(v) => Ok(v.to_string()),
@@ -1315,9 +1883,7 @@ impl<'a> FnCodegen<'a> {
                 self.gen_if(cond, then, otherwise.as_deref())?;
                 Ok(String::new())
             }
-            ExprKind::Try(_) => {
-                Err(CodegenError::new(expr.span, "`!` 演算子のコード生成は未対応です"))
-            }
+            ExprKind::Try(inner) => self.gen_try(inner, expr.span),
             ExprKind::EnumLit { span, .. } => {
                 Err(CodegenError::new(*span, "この enum リテラルのコード生成は未対応です"))
             }
@@ -1353,31 +1919,36 @@ impl<'a> FnCodegen<'a> {
 
         let merge_l = self.fresh_label("match.end");
 
-        // scrutinee の型から enum かどうか判定。
+        // scrutinee の型から enum かどうか判定。enum なら LLVM 型はインスタンス型
+        // （スカラ＝`%Enum`、集約＝`%Enum.Args`）。
         let scrut_ty = self.iris_ty(scrutinee);
         let enum_name: Option<String> = match &scrut_ty {
-            Ty::Named { name, .. } if self.enums.variants(name).is_some() => Some(name.clone()),
+            Ty::Named { name, .. } if self.structs.is_enum(name) => Some(name.clone()),
             _ => None,
+        };
+        let enum_llty: Option<String> = match &enum_name {
+            Some(_) => Some(llvm_ty(&scrut_ty, self.structs).map_err(|m| CodegenError::new(span, m))?),
+            None => None,
         };
 
         // scrutinee を評価する。enum の場合はポインタ経由でタグを読みたいので alloca。
-        let (scrut_val, scrut_llty) = if let Some(ref ename) = enum_name {
+        let (scrut_val, scrut_llty) = if let Some(ref eltty) = enum_llty {
             // enum: alloca に格納してポインタ経由でタグを読む。
             let ev = self.gen_value(scrutinee, &scrut_ty)?;
             let slot = self.fresh_tmp();
-            self.emit(&format!("{slot} = alloca %{ename}"));
-            self.emit(&format!("store %{ename} {}, ptr {slot}", ev.0));
-            (slot, format!("%{ename}"))
+            self.emit(&format!("{slot} = alloca {eltty}"));
+            self.emit(&format!("store {eltty} {}, ptr {slot}", ev.0));
+            (slot, eltty.clone())
         } else {
             let v = self.gen_value(scrutinee, &scrut_ty)?;
             (v.0, v.1)
         };
 
         // タグを読み出す（enum の場合）。
-        let tag_val = if let Some(ref ename) = enum_name {
+        let tag_val = if let Some(ref eltty) = enum_llty {
             let tag_ptr = self.fresh_tmp();
             self.emit(&format!(
-                "{tag_ptr} = getelementptr inbounds %{ename}, ptr {scrut_val}, i32 0, i32 0"
+                "{tag_ptr} = getelementptr inbounds {eltty}, ptr {scrut_val}, i32 0, i32 0"
             ));
             let tv = self.fresh_tmp();
             self.emit(&format!("{tv} = load i8, ptr {tag_ptr}"));
@@ -1474,7 +2045,7 @@ impl<'a> FnCodegen<'a> {
                     let ename = enum_name.as_deref().ok_or_else(|| {
                         CodegenError::new(span, "バリアントパターンを非 enum 型に使っています")
                     })?;
-                    let tag = self.enums.tag_of(ename, name).ok_or_else(|| {
+                    let tag = self.structs.enum_tag(ename, name).ok_or_else(|| {
                         CodegenError::new(span, format!("バリアント `{name}` が見つかりません"))
                     })?;
                     let cmp = self.fresh_tmp();
@@ -1494,26 +2065,37 @@ impl<'a> FnCodegen<'a> {
             // バリアントパターンのペイロード束縛を設定する。
             if let Pattern::Variant { name, binding: Some((bname, bspan)), .. } = &arm.pattern {
                 let ename = enum_name.as_deref().unwrap();
-                if let Some(vs) = self.enums.variants(ename) {
-                    if let Some((_, Some(payload_ty))) = vs.iter().find(|(n, _)| n == name) {
-                        let payload_ty = payload_ty.clone();
-                        let pllty = llvm_ty(&payload_ty, self.structs)
-                            .map_err(|m| CodegenError::new(span, m))?;
-                        // ペイロードを i64 フィールドから読み出してキャスト。
-                        let payload_ptr = self.fresh_tmp();
-                        self.emit(&format!(
-                            "{payload_ptr} = getelementptr inbounds %{ename}, ptr {scrut_val}, i32 0, i32 1"
-                        ));
+                // scrutinee の型引数でペイロード型を単相化する（Option<i32> なら T→i32）。
+                let concrete_args = match &scrut_ty {
+                    Ty::Named { args, .. } => args.clone(),
+                    _ => Vec::new(),
+                };
+                if let Some(payload_ty) = self.structs.enum_payload_of(ename, name, &concrete_args) {
+                    let pllty = llvm_ty(&payload_ty, self.structs)
+                        .map_err(|m| CodegenError::new(span, m))?;
+                    let eltty = enum_llty.as_deref().unwrap();
+                    let aggregate = self.structs.enum_is_aggregate(ename, &concrete_args);
+                    // ペイロードフィールドのアドレスを求める（インスタンス型でアクセス）。
+                    let payload_ptr = self.fresh_tmp();
+                    self.emit(&format!(
+                        "{payload_ptr} = getelementptr inbounds {eltty}, ptr {scrut_val}, i32 0, i32 1"
+                    ));
+                    // 集約はペイロード型のまま typed load、スカラは i64 から読みキャスト。
+                    let typed = if aggregate {
+                        let v = self.fresh_tmp();
+                        self.emit(&format!("{v} = load {pllty}, ptr {payload_ptr}"));
+                        v
+                    } else {
                         let raw = self.fresh_tmp();
                         self.emit(&format!("{raw} = load i64, ptr {payload_ptr}"));
-                        let typed = self.cast_from_i64(&raw, &pllty, span)?;
-                        // 束縛変数を alloca に格納する。
-                        if let Some(&id) = self.def_spans.get(bspan) {
-                            let slot = format!("%{bname}.slot{id}");
-                            self.emit(&format!("{slot} = alloca {pllty}"));
-                            self.emit(&format!("store {pllty} {typed}, ptr {slot}"));
-                            self.locals.insert(id, (slot, pllty));
-                        }
+                        self.cast_from_i64(&raw, &pllty, span)?
+                    };
+                    // 束縛変数を alloca に格納する。
+                    if let Some(&id) = self.def_spans.get(bspan) {
+                        let slot = format!("%{bname}.slot{id}");
+                        self.emit(&format!("{slot} = alloca {pllty}"));
+                        self.emit(&format!("store {pllty} {typed}, ptr {slot}"));
+                        self.locals.insert(id, (slot, pllty));
                     }
                 }
             }
@@ -1607,10 +2189,8 @@ impl<'a> FnCodegen<'a> {
         // struct の `==` / `!=` は構造的フィールド比較（ADR-0009）。
         if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
             let lty = self.raw_ty(lhs).peel_refs().clone();
-            if let Some(sname) = struct_name_of(&lty)
-                && self.structs.struct_def(&sname).is_some()
-            {
-                return self.gen_struct_eq(lhs, rhs, &sname, op == BinaryOp::NotEq, span);
+            if self.structs.struct_layout_of(&lty).is_some() {
+                return self.gen_struct_eq(lhs, rhs, &lty, op == BinaryOp::NotEq, span);
             }
         }
 
@@ -2071,6 +2651,20 @@ fn llvm_ty(ty: &Ty, reg: &StructReg) -> Result<String, String> {
         Ty::FloatLit => Ok("double".to_string()),
         // 参照は opaque ポインタ（指す先の型は命令側で扱う）。
         Ty::Ref { .. } => Ok("ptr".to_string()),
+        // enum（ジェネリック含む。Option<T>/Result<T,E> も）。スカラペイロードは全
+        // インスタンス共通の `%Name = type { i8, i64 }`、集約ペイロード（struct 等）は
+        // per-instantiation の `%Name.Args = type { i8, <記憶域> }` を使う。
+        Ty::Named { name, args } if reg.is_enum(name) => {
+            if reg.enum_is_aggregate(name, args) {
+                Ok(format!("%{}", mono_symbol(name, args)))
+            } else {
+                Ok(format!("%{name}"))
+            }
+        }
+        // ジェネリック struct インスタンスは per-instantiation 型 `%Name.Args`。
+        Ty::Named { name, args } if !args.is_empty() && reg.is_generic_struct(name) => {
+            Ok(format!("%{}", mono_symbol(name, args)))
+        }
         Ty::Named { name, args } if args.is_empty() => match name.as_str() {
             // 整数は LLVM では符号を型に持たない（幅だけ）。符号は命令側で扱う。
             "i8" | "u8" => Ok("i8".to_string()),

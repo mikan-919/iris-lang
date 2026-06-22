@@ -80,6 +80,16 @@ fn try_unwraps_result() {
 }
 
 #[test]
+fn rejects_try_kind_mismatch() {
+    // Result を返す関数で Option に `!` は使えない（伝播する値が無い）。
+    let errs = typecheck(
+        "fn o(): Option<i32> {\n    return Some(1)\n}\nfn f(): Result<i32, string> {\n    let x = o()!\n    return Ok(x)\n}",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("伝播できません")));
+}
+
+#[test]
 fn rejects_try_on_non_result() {
     let errs = typecheck("fn f(): Result<i32, string> {\n    let x = 1!\n    return Ok(0)\n}")
         .unwrap_err();
@@ -257,4 +267,24 @@ fn rejects_mixed_range_bounds() {
 fn example_hello_typechecks() {
     let src = include_str!("../examples/hello.iris");
     typecheck(src).expect("サンプルは型検査を通るはず");
+}
+
+#[test]
+fn rejects_for_in_non_iterator() {
+    // Iterator を実装していない型は `for ... in` で反復できない。
+    let errs = typecheck(
+        "type P = struct {\n    a: i32\n}\nfn f() {\n    let p = P { a: 1 }\n    for x in p {\n        let y = x\n    }\n}",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("Iterator")));
+}
+
+#[test]
+fn rejects_generic_struct_inconsistent_fields() {
+    // Pair<T> の両フィールドは同じ T。a で T=整数に推論され、b: bool は不一致。
+    let errs = typecheck(
+        "type Pair<T> = struct {\n    a: T\n    b: T\n}\nfn f() {\n    let p = Pair { a: 1, b: true }\n}",
+    )
+    .unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("型が一致しません")));
 }

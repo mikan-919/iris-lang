@@ -11,6 +11,12 @@ extern fn puts(s: string): i32
 // C の strcmp（NUL 終端文字列を比較。等しければ 0）。match の文字列パターン比較に使う。
 extern fn strcmp(a: string, b: string): i32
 
+// イテレータ（ADR-0007）。next() で次の要素を Some で返し、終端で None を返す。
+// `for x in it { ... }` はこのトレイトの実装を要求し、next() を回して要素を束縛する。
+trait Iterator<T> {
+    fn next(&mut self): Option<T>
+}
+
 // 1 桁の数字 (0-9) を出力する。
 fn put_digit(d: i32): i32 {
     return putchar(d + 48)

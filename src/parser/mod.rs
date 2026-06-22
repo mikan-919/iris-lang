@@ -885,15 +885,24 @@ fn parse_for(input: Tokens) -> PResult<Stmt> {
     let (input, (var, var_span)) = ident(input.take_from(1))?;
     let (input, _) = expect(input, &TokenKind::In, "`in`")?;
     let (input, lo) = parse_expr_r(input, true)?;
-    // `..`（排他）か `..=`（包含）。範囲以外の `for` 反復は未対応。
+    // `..`（排他）か `..=`（包含）なら整数範囲 `for`。それ以外は一般イテレータ
+    // `for x in iter`（lo がイテレータ式）。
     let (input, inclusive) = match input.peek() {
         TokenKind::DotDotEq => (input.take_from(1), true),
         TokenKind::DotDot => (input.take_from(1), false),
         _ => {
-            return Err(nom::Err::Failure(ParseErr::expected(
-                "`..` または `..=`（範囲）",
-                input.first(),
-            )));
+            let (input, body) = parse_block(input)?;
+            let span = kw_span.merge(body.span);
+            return Ok((
+                input,
+                Stmt::ForIn {
+                    var,
+                    var_span,
+                    iter: lo,
+                    body,
+                    span,
+                },
+            ));
         }
     };
     let (input, hi) = parse_expr_r(input, true)?;
