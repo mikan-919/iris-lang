@@ -168,6 +168,8 @@ pub fn check(program: &Program, res: &Resolution) -> Result<TypeInfo, Vec<TypeEr
                 checker.ambient_generics = HashMap::new();
             }
             Item::TypeDef(_) => {}
+            // use 宣言はモジュールローダーが処理済み。型検査では無視する。
+            Item::Use(_) => {}
         }
     }
     // すべての `impl Trait for Type` の適合（conformance）を検査する。

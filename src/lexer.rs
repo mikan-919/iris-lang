@@ -207,6 +207,7 @@ fn lex_ident_or_keyword(input: LSpan) -> nom::IResult<LSpan, Token> {
         "enum" => TokenKind::Enum,
         "extern" => TokenKind::Extern,
         "match" => TokenKind::Match,
+        "use" => TokenKind::Use,
         "true" => TokenKind::Bool(true),
         "false" => TokenKind::Bool(false),
         _ => TokenKind::Ident(text.to_string()),

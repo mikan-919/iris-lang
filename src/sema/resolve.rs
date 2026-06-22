@@ -12,7 +12,7 @@
 //!
 //! 検出したエラーは 1 件で止めずすべて収集し、まとめて報告できるようにする。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Block, Else, Expr, ExprKind, Function, Item, Pattern, Program, Stmt, TypeDefBody};
 use crate::span::Span;
@@ -52,6 +52,9 @@ pub struct Resolution {
     pub defs: Vec<Def>,
     /// 識別子の使用位置（span）から、それが指す定義への対応。
     pub uses: HashMap<Span, DefId>,
+    /// モジュールパス経由の関数呼び出し: callee span → 関数名。
+    /// `use std.lib` + `std.lib.fmt(...)` のような呼び出しで使う。
+    pub module_fn_calls: HashMap<Span, String>,
 }
 
 /// 名前解決エラー。
@@ -63,14 +66,24 @@ pub struct ResolveError {
 
 /// プログラムの名前解決を行う。
 ///
+/// `module_namespaces`: `use a.b`（Plain import）で登録されたパス → pub 関数名集合。
 /// 成功すれば [`Resolution`] を、エラーがあればすべての [`ResolveError`] を返す。
-pub fn resolve(program: &Program) -> Result<Resolution, Vec<ResolveError>> {
+pub fn resolve(
+    program: &Program,
+    module_namespaces: HashMap<Vec<String>, Vec<String>>,
+) -> Result<Resolution, Vec<ResolveError>> {
     let mut r = Resolver::default();
+    // Vec<String> → HashSet<String> に変換して登録する。
+    r.module_namespaces = module_namespaces
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect();
     r.run(program);
     if r.errors.is_empty() {
         Ok(Resolution {
             defs: r.defs,
             uses: r.uses,
+            module_fn_calls: r.module_fn_calls,
         })
     } else {
         Err(r.errors)
@@ -87,8 +100,13 @@ struct Scope {
 struct Resolver {
     defs: Vec<Def>,
     uses: HashMap<Span, DefId>,
+    /// モジュールパス経由の関数呼び出し: callee span → 関数名。
+    module_fn_calls: HashMap<Span, String>,
     scopes: Vec<Scope>,
     errors: Vec<ResolveError>,
+    /// `use a.b` で登録されたモジュール名前空間: パス → pub 関数名集合。
+    /// `a.b.fmt(...)` 形式の呼び出しを解決するために使う。
+    module_namespaces: HashMap<Vec<String>, HashSet<String>>,
 }
 
 impl Resolver {
@@ -137,6 +155,8 @@ impl Resolver {
                     }
                 }
                 Item::TypeDef(_) => {}
+                // use 宣言は lib.rs のモジュールローダーが処理済み。ここでは無視する。
+                Item::Use(_) => {}
             }
         }
         self.pop_scope();
@@ -245,8 +265,28 @@ impl Resolver {
                     self.resolve_expr(a);
                 }
             }
-            // メンバ名（field）は型情報が無いと解決できないため object のみ解決する。
-            ExprKind::Member { object, .. } => self.resolve_expr(object),
+            // メンバアクセス `a.b` または モジュールパス `std.lib.fmt`。
+            // モジュールパス呼び出しを先に試み、失敗なら通常のフィールドアクセスとして扱う。
+            ExprKind::Member { object, field, .. } => {
+                // `object.field` の object 以下をドット連鎖として取り出す。
+                if let Some(mut path) = Self::extract_ident_chain(object) {
+                    path.push(field.clone());
+                    // path[0..n-1] がモジュールパスで、path[n-1] がそのエクスポートか確認する。
+                    if path.len() >= 2 {
+                        let module_path = &path[..path.len() - 1];
+                        let fn_name = path.last().unwrap();
+                        if let Some(ns) = self.module_namespaces.get(module_path) {
+                            if ns.contains(fn_name.as_str()) {
+                                // モジュールパス経由の呼び出しとして記録する。
+                                self.module_fn_calls.insert(expr.span, fn_name.clone());
+                                return;
+                            }
+                        }
+                    }
+                }
+                // 通常のメンバアクセス: object だけ解決する（field は型情報が必要）。
+                self.resolve_expr(object);
+            }
             ExprKind::Ternary {
                 cond,
                 then,
@@ -307,6 +347,24 @@ impl Resolver {
                     self.resolve_expr(e);
                 }
             }
+        }
+    }
+
+    /// `Member(Member(...Ident("a"), "b"), "c")` のような純粋なドット連鎖から
+    /// セグメント列 `["a", "b", "c"]` を取り出す。連鎖でない式は `None` を返す。
+    fn extract_ident_chain(expr: &Expr) -> Option<Vec<String>> {
+        match &expr.kind {
+            ExprKind::Ident(name) => Some(vec![name.clone()]),
+            ExprKind::Member {
+                object,
+                field,
+                qualifier: None,
+            } => {
+                let mut segs = Self::extract_ident_chain(object)?;
+                segs.push(field.clone());
+                Some(segs)
+            }
+            _ => None,
         }
     }
 

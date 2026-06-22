@@ -8,7 +8,7 @@ use iris_lang::sema::{check, resolve};
 fn typecheck(src: &str) -> Result<(), Vec<String>> {
     let tokens = lex(src).expect("字句解析");
     let program = parse(&tokens).expect("構文解析");
-    let resolution = resolve(&program).expect("名前解決");
+    let resolution = resolve(&program, Default::default()).expect("名前解決");
     check(&program, &resolution)
         .map(|_| ())
         .map_err(|errs| errs.into_iter().map(|e| e.message).collect())
@@ -212,7 +212,7 @@ fn for_loop_var_out_of_scope_after_loop() {
     // ループ変数はループ本体の外では未定義（名前解決で弾く）。
     let tokens = lex("fn f() {\n    for i in 0..3 {\n    }\n    let x = i\n}").expect("字句解析");
     let program = parse(&tokens).expect("構文解析");
-    assert!(resolve(&program).is_err(), "ループ変数 i はループ外では見えないはず");
+    assert!(resolve(&program, Default::default()).is_err(), "ループ変数 i はループ外では見えないはず");
 }
 
 #[test]

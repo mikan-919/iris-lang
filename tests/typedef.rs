@@ -13,7 +13,7 @@ fn program(src: &str) -> iris_lang::ast::Program {
 /// 型検査まで通す。エラーがあればメッセージ一覧を返す。
 fn typecheck(src: &str) -> Result<(), Vec<String>> {
     let prog = program(src);
-    let resolution = resolve(&prog).expect("名前解決");
+    let resolution = resolve(&prog, Default::default()).expect("名前解決");
     check(&prog, &resolution)
         .map(|_| ())
         .map_err(|errs| errs.into_iter().map(|e| e.message).collect())

@@ -9,7 +9,7 @@ fn ownck(src: &str) -> Result<(), Vec<String>> {
         let tokens = lex(src).expect("字句解析");
         parse(&tokens).expect("構文解析")
     };
-    let resolution = resolve(&prog).expect("名前解決");
+    let resolution = resolve(&prog, Default::default()).expect("名前解決");
     let type_info = check(&prog, &resolution).expect("型検査");
     check_ownership(&prog, &resolution, &type_info)
         .map_err(|errs| errs.into_iter().map(|e| e.message).collect())

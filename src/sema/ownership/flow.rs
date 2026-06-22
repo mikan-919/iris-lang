@@ -90,6 +90,7 @@ pub fn check_functions(
                 }
             }
             Item::TypeDef(_) => {}
+            Item::Use(_) => {}
         }
     }
 }

@@ -17,6 +17,28 @@ pub enum Item {
     /// 実装ブロック `impl [Trait for] Type { fn ... }`。
     /// `trait_ref` が `None` なら固有メソッド、`Some` なら `impl Trait for Type`。
     Impl(Impl),
+    /// モジュールインポート宣言 `use a.b.c [{ x, y } | .*]`。
+    Use(UseDecl),
+}
+
+/// `use` 宣言。`path` はドット区切りのモジュールパス、`tree` はインポートの種別。
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseDecl {
+    /// モジュールパスのセグメント列。`use std.lib` → `["std", "lib"]`。
+    pub path: Vec<String>,
+    pub tree: UseTree,
+    pub span: Span,
+}
+
+/// use のインポート種別。
+#[derive(Debug, Clone, PartialEq)]
+pub enum UseTree {
+    /// `use a.b` — モジュール名前空間を登録し `a.b.x(...)` 形式でアクセスできる。
+    Plain,
+    /// `use a.b { x, y }` — 指定した名前だけを現在のスコープへ注入する。
+    Named(Vec<String>),
+    /// `use a.b.*` — pub なすべての名前を現在のスコープへ注入する。
+    Glob,
 }
 
 /// トレイト定義 `trait Name<T>: Super1 + Super2 { メソッド... }`。

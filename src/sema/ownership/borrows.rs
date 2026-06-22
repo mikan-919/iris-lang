@@ -68,6 +68,7 @@ pub fn check_borrows(
                 bodies.extend(tr.methods.iter().filter(|m| m.default).map(|m| &m.func));
             }
             Item::TypeDef(_) => {}
+            Item::Use(_) => {}
         }
     }
     for f in bodies {

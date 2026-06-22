@@ -716,6 +716,8 @@ pub fn emit_module(
             Item::Trait(_) => {}
             // 型定義はコード生成では型情報としてのみ使い、IR には出さない。
             Item::TypeDef(_) => {}
+            // use 宣言はモジュールローダーが処理済み。codegen では無視する。
+            Item::Use(_) => {}
         }
     }
 
@@ -2476,6 +2478,34 @@ impl<'a> FnCodegen<'a> {
         args: &[Expr],
         span: Span,
     ) -> Result<String, CodegenError> {
+        // モジュールパス経由の呼び出し `std.lib.fmt(...)` など。
+        // callee span が module_fn_calls に登録されていれば、関数名に直接変換して呼び出す。
+        if let Some(fn_name) = self.res.module_fn_calls.get(&callee.span).cloned() {
+            let func = self
+                .find_function(&fn_name)
+                .ok_or_else(|| CodegenError::new(span, format!("`{fn_name}` の定義が見つかりません")))?;
+            let ret_ty = match &func.ret {
+                Some(t) => llvm_ty(&Ty::from_ast(t), self.structs)
+                    .map_err(|m| CodegenError::new(t.span(), m))?,
+                None => "void".to_string(),
+            };
+            let mut arg_strs = Vec::new();
+            for (i, a) in args.iter().enumerate() {
+                let want = func.params.get(i).map(|p| Ty::from_ast(&p.ty)).unwrap_or(Ty::Infer);
+                let (v, pty) = self.gen_value(a, &want)?;
+                arg_strs.push(format!("{pty} {v}"));
+            }
+            let call = format!("call {ret_ty} @{fn_name}({})", arg_strs.join(", "));
+            return if ret_ty == "void" {
+                self.emit(&call);
+                Ok(String::new())
+            } else {
+                let r = self.fresh_tmp();
+                self.emit(&format!("{r} = {call}"));
+                Ok(r)
+            };
+        }
+
         // メソッド呼び出し `object.method(args)`。
         if let ExprKind::Member {
             object,

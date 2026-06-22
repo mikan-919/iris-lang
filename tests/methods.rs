@@ -13,7 +13,7 @@ use iris_lang::sema::{check, check_ownership, resolve};
 fn typecheck(src: &str) -> Result<(), Vec<String>> {
     let tokens = lex(src).expect("字句解析");
     let program = parse(&tokens).expect("構文解析");
-    let resolution = resolve(&program).expect("名前解決");
+    let resolution = resolve(&program, Default::default()).expect("名前解決");
     check(&program, &resolution)
         .map(|_| ())
         .map_err(|errs| errs.into_iter().map(|e| e.message).collect())
@@ -23,7 +23,7 @@ fn typecheck(src: &str) -> Result<(), Vec<String>> {
 fn ownck(src: &str) -> Result<(), Vec<String>> {
     let tokens = lex(src).expect("字句解析");
     let program = parse(&tokens).expect("構文解析");
-    let resolution = resolve(&program).expect("名前解決");
+    let resolution = resolve(&program, Default::default()).expect("名前解決");
     let type_info = check(&program, &resolution).expect("型検査");
     check_ownership(&program, &resolution, &type_info)
         .map_err(|errs| errs.into_iter().map(|e| e.message).collect())

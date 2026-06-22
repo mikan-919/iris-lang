@@ -107,11 +107,80 @@ fn parse_item(input: Tokens) -> PResult<Item> {
         TokenKind::Ident(name) if name == "trait" => {
             parse_trait(input, is_pub).map(|(i, t)| (i, Item::Trait(t)))
         }
+        TokenKind::Use => parse_use_item(input).map(|(i, u)| (i, Item::Use(u))),
         _ => Err(nom::Err::Error(ParseErr::expected(
-            "宣言 (`fn`・`extern fn`・`type`・`trait`・`impl`)",
+            "宣言 (`fn`・`extern fn`・`type`・`trait`・`impl`・`use`)",
             input.first(),
         ))),
     }
+}
+
+/// `use a.b.c [{ x, y } | .*]` を解析する。
+///
+/// - `use a.b.c`         → `UseTree::Plain`
+/// - `use a.b.c { x, y }` → `UseTree::Named(["x", "y"])`
+/// - `use a.b.c.*`       → `UseTree::Glob`
+fn parse_use_item(input: Tokens) -> PResult<UseDecl> {
+    let start = input.first().span;
+    let (mut input, _) = eat(input, &TokenKind::Use, "`use`")?;
+
+    // パス: `a.b.c`（ドット区切りの識別子列）
+    let (rest, (first_seg, _)) = ident(input)?;
+    input = rest;
+    let mut path = vec![first_seg];
+    // ドットが続く限り次のセグメントを読む。ただし `.*` の `*` は識別子でないので先に確認する。
+    loop {
+        // `.` の後に `*` が来るなら Glob、識別子が来るならパスセグメント。
+        if input.peek() != &TokenKind::Dot {
+            break;
+        }
+        // Dot を消費してから次を見る。
+        let after_dot = input.take_from(1);
+        match after_dot.peek() {
+            TokenKind::Star => {
+                // `.*` → Glob。
+                let end = after_dot.first().span;
+                input = after_dot.take_from(1);
+                let span = start.merge(end);
+                return Ok((input, UseDecl { path, tree: UseTree::Glob, span }));
+            }
+            TokenKind::Ident(_) => {
+                let (rest, (seg, _)) = ident(after_dot)?;
+                path.push(seg);
+                input = rest;
+            }
+            _ => break,
+        }
+    }
+
+    // `{ x, y }` の選択インポート。
+    if input.peek() == &TokenKind::LBrace {
+        input = input.take_from(1);
+        let mut names = Vec::new();
+        loop {
+            input = skip_newlines(input);
+            match input.peek() {
+                TokenKind::RBrace | TokenKind::Eof => break,
+                _ => {}
+            }
+            let (rest, (name, _)) = ident(input)?;
+            names.push(name);
+            input = rest;
+            // カンマまたは改行で区切る。
+            match input.peek() {
+                TokenKind::Comma => { input = input.take_from(1); }
+                TokenKind::Newline => { input = input.take_from(1); }
+                _ => {}
+            }
+        }
+        let (rest, rbrace) = expect(input, &TokenKind::RBrace, "`}`")?;
+        let span = start.merge(rbrace.span);
+        return Ok((rest, UseDecl { path, tree: UseTree::Named(names), span }));
+    }
+
+    // Plain import。
+    let span = start.merge(input.first().span);
+    Ok((input, UseDecl { path, tree: UseTree::Plain, span }))
 }
 
 /// `impl [Trait for] Type { メソッド... }` を解析する。メソッドは `fn ...`（`self` 可）。

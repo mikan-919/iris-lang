@@ -27,7 +27,7 @@ fn best_ms(runs: u32, mut f: impl FnMut()) -> f64 {
 fn measure_ownership(src: &str, runs: u32) -> (f64, usize) {
     let tokens = lex(src).expect("lex");
     let program = parse(&tokens).expect("parse");
-    let resolution = resolve(&program).expect("resolve");
+    let resolution = resolve(&program, Default::default()).expect("resolve");
     let type_info = check(&program, &resolution).expect("typeck");
     let ms = best_ms(runs, || {
         check_ownership(&program, &resolution, &type_info).expect("ownership");

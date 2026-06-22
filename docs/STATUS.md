@@ -44,6 +44,9 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 | `tests/traits.rs` | trait 定義・`impl Trait for`・適合・`#`・既定実装・スーパートレイト・境界/単相化・構造的 `==` の縦断回帰テスト | ✅ |
 | `tests/codegen.rs` | LLVM IR 生成・clang 実行の回帰テスト | ✅ |
 | `tests/std_io.rs` | std を使った出力プログラムの実行テスト | ✅ |
+| `tests/module.rs` | モジュール use・pub 可視性・モジュールパス呼び出しの回帰テスト | ✅ |
+| `src/module.rs` | モジュールローダー（ファイル読み込み・pub アイテム抽出・パス解決） | ✅ |
+| `std/prelude.iris` | 最小 std（旧 std/std.iris からリネーム） | ✅ |
 
 ## 構文の実装状況
 
@@ -297,7 +300,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-22。
 - 一般の型合成 `A + B`（ADR-0001。引数位置の匿名トレイト境界としては実装済み）
 - ジェネリック **enum**（`Option`/`Result`/ユーザ定義）: スカラ／参照／`string`＝ptr ペイロードは i64 共通レイアウト、**struct 等の集約ペイロードは per-instantiation レイアウトで実装済み**（ADR-0010、`Option<Point>`・`Wrap<Point>` 等が縦断・clang 実行）。**残り**: 複数異種ペイロードの過小整列（記憶域＝最大サイズ型のため最大整列とは限らない）、ジェネリック関数の単相化の内側でのみ現れる集約インスタンスの型宣言収集（ADR-0010「Consequences」参照）
 - ジェネリックな **struct 型**定義のコード生成（`type Pair<T>`/`type Box<T>` の per-instantiation 単相化）は**実装済み**（enum・関数のジェネリクスと合わせ、`tests/codegen.rs` で縦断・clang 実行）。**残り**: 整数/小数リテラル構築での非既定幅の型引数の文脈伝播、ジェネリック関数の内側でのみ現れるインスタンスの型宣言収集（ADR-0010 と同種）
-- `use`（インポート）、可視性のモジュール解決
+- **`use`・モジュール解決（実装済み）**: `use a.b.*`（glob）・`use a.b { x, y }`（選択）・`use a.b`（Plain）+ `a.b.x(...)` モジュールパス呼び出し。ドット区切り＝ファイルパス区切り（`use foo.bar` → `foo/bar.iris`）。`std` は `CARGO_MANIFEST_DIR/std/` または実行ファイル隣から解決。pub 可視性（モジュールから pub アイテムのみ提供）。**残り**: `use` の選択インポートによる名前制限（現状 Named は Glob と同じ動作）、モジュール自身の相互 use、可視性のモジュール間強制（main 側 pub/private の制限）。
 - 文字列補間（バッククォート `` `...{expr}...` ``）
 - `as` による型変換
 - ブロックコメント
