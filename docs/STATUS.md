@@ -263,7 +263,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（汎用 sys
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
 - **`as` 型変換**: `expr as Type` を数値↔数値・`bool`→数値で実装済み（`gen_cast`。`trunc`/`sext`/`zext`／`sitofp`/`uitofp`／`fptosi`/`fptoui`／`fptrunc`/`fpext`、LLVM 表現が同一なら無変換）。**ポインタ裏付けの型（`RawPtr`/`string`）→ `i64` は `ptrtoint`**（ADR-0011、syscall 引数用。`i64`＝ポインタ幅のみ許可）。
-- **汎用 syscall 原語（ADR-0011 実装順①）**: 組み込みの `syscall0`〜`syscall6`（番号＋N 引数、すべて `i64`、戻り `i64`）を `is_null` と同じく名前で特別扱いし、codegen が x86-64 Linux 規約の **inline asm**（`call i64 asm sideeffect "syscall", "={rax},{rax},{rdi},...,~{rcx},~{r11},~{memory}"`）へ展開する（`declare` を出さない）。resolve（`PRELUDE`）→ typeck（`syscall_arity` で個数・i64 引数検査）→ codegen に配線。`tests/codegen.rs` で `write(2)`／`exit(2)` を libc を介さず実走検証（write は stdout へ "hi"、exit は終了コード 7）。**残り**: 実装順②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）以降は未着手
+- **汎用 syscall 原語（ADR-0011 実装順①）**: 組み込みの `syscall0`〜`syscall6`（番号＋N 引数、すべて `i64`、戻り `i64`）を `is_null` と同じく名前で特別扱いし、codegen が x86-64 Linux 規約の **inline asm**（`call i64 asm sideeffect "syscall", "={rax},{rax},{rdi},...,~{rcx},~{r11},~{memory}"`）へ展開する（`declare` を出さない）。resolve（`PRELUDE`）→ typeck（`syscall_arity` で個数・i64 引数検査）→ codegen に配線。`tests/codegen.rs` で `write(2)`／`exit(2)` を libc を介さず実走検証（write は stdout へ "hi"、exit は終了コード 7）。**実装順②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）も完了**: `exit` は `syscall1(60, code as i64)`、`write(fd, buf, len)` は `syscall3(1, fd as i64, buf as i64, len)` を iris で記述し、libc の `exit`/`puts`/`fputs` を介さず `define` ＋ inline asm へ展開する（`runs_os_exit`／`runs_os_write_to_stdout`）。**残り**: 実装順③（残りの os ラッパ＝`fopen`/`fputs`/`fgets`/`getenv` 等の syscall 移行）は未着手
 - 未対応（今後）: 文字列補間・スライス（長さ `s.len()`・索引 `s[i]`→`u8`・連結 `a.concat(b)` は実装済み）（`!` エラー伝播・ジェネリック **enum**（集約ペイロード）＝ADR-0010・ジェネリック**関数**・ジェネリック **struct 型**の単相化・`as` 型変換はいずれも実装済み）。なお整数/小数リテラルからジェネリック struct を構築すると型パラメータは既定（`i32`/`f64`）に確定し、`Pair<i64>` 等の非既定幅の明示注釈は構築式へ伝播しない（型エラーになる。enum の `refine_construction` と同種の制約）
 
 ### 標準ライブラリ（最小・iris 自身で記述）
@@ -353,14 +353,15 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 ### self-contained ランタイム（計画・ADR-0011 / ADR-0012）
 
 libc 依存を生成物から外していく中間目標。設計は確定（Accepted）。**実装順①（syscall 原語＋
-`ptr as i64`）は実装済み**、②以降は未着手。
+`ptr as i64`）・②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）は実装済み**、③以降は未着手。
 詳細は [ADR-0011](adr/0011-syscall-primitive-for-libc-independence.md)（syscall 原語）/
 [ADR-0012](adr/0012-global-allocator-with-override.md)（アロケータ）を参照。
 
 - **汎用 syscall 原語（ADR-0011・実装済み）**: コンパイラは「syscall 命令の出し方」だけを知る組み込み原語
   `syscall0`〜`syscall6`（番号＋N 引数・すべて `i64`・戻り `i64`）を持ち、codegen が x86-64 Linux 規約の
   **inline asm** へ展開する（`declare` を出さない）。番号付けと `read`/`write`/`open`/`exit` 等のラッパは
-  `std/os.iris` 側で iris として書く予定（実装順②、未着手）。`RawPtr`/`is_null` と同じ「最小原語は
+  `std/os.iris` 側で iris として書く。**`exit`（番号 60）/`write`（番号 1）は移行済み**（実装順②）、
+  残りの os ラッパ（`fopen`/`getenv` 等）は実装順③で移行予定。`RawPtr`/`is_null` と同じ「最小原語は
   コンパイラ・命名は std」路線。前提の **`ptr as i64`**（`RawPtr`/`string`→`i64`、`ptrtoint`）も `as` に
   追加済み。**外れるのは libc 依存であって clang ではない**（アセンブル/リンクには引き続き clang が要る。
   x86-64 Linux 固定）。`write`/`exit` の実走で回帰を張った（`tests/codegen.rs`）。
@@ -370,8 +371,8 @@ libc 依存を生成物から外していく中間目標。設計は確定（Acc
   `alloc`（`{ ptr, len, cap, alloc }`、`alloc == 0` ⇒ グローバル直呼び）を持たせて差し込む。公開型は
   常に `Vec<T>`（ADR-0003 を満たす）。`Vec` の `malloc`/`free` 直呼びを「グローバルアロケータ呼び出し」
   へ一段抽象化することが、libc→`MmapAlloc`（mmap ベース）差替の seam になる。
-- **実装順**: ✅① `syscall` 原語 ＋ `ptr as i64`（実装済み）→ ② `exit`/`write` を syscall 版にして「libc 無しで
-  1 本動く」実証 → ③ `Allocator` トレイト ＋ `LibcAlloc` ＋ Vec ヘッダ拡張（挙動は現状同一の seam）
+- **実装順**: ✅① `syscall` 原語 ＋ `ptr as i64`（実装済み）→ ✅② `exit`/`write` を syscall 版にして「libc 無しで
+  1 本動く」実証（実装済み）→ ③ `Allocator` トレイト ＋ `LibcAlloc` ＋ Vec ヘッダ拡張（挙動は現状同一の seam）
   → ④ `MmapAlloc` でグローバル差替（libc malloc 消滅）→ ⑤ `-nostdlib` ＋ 自前 `_start`。
 
 ## 仕様未確定のため独自に決めた点（要確認）

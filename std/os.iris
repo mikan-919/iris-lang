@@ -33,8 +33,18 @@ pub extern fn fputs(s: string, f: File): i32
 // `malloc(n)` 等で確保した書き込み可能なバッファを渡す。
 pub extern fn fgets(buf: string, n: i32, f: File): string
 
-// プロセスを終了コード `code` で終了する（戻らない）。
-pub extern fn exit(code: i32): void
+// プロセスを終了コード `code` で終了する（戻らない）。Linux の exit(2)（番号 60）を
+// 汎用 syscall 原語 `syscall1` で直接呼び、libc の `exit` を介さない（ADR-0011 実装順②）。
+pub fn exit(code: i32): void {
+    syscall1(60, code as i64)
+}
+
+// `fd` へ `buf` の先頭 `len` バイトを書き出し、書き込んだバイト数（負ならエラー）を返す。
+// Linux の write(2)（番号 1）を `syscall3` で直接呼ぶ。stdout は `fd = 1`、stderr は `fd = 2`。
+// libc の `puts`/`fputs` を介さずに出力できる（ADR-0011 実装順②）。
+pub fn write(fd: i32, buf: string, len: i64): i64 {
+    syscall3(1, fd as i64, buf as i64, len)
+}
 
 // 環境変数 `name` の値を返す（生）。未設定なら NULL。NULL 安全な `env` の利用を推奨する。
 pub extern fn getenv(name: string): string

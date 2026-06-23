@@ -950,3 +950,24 @@ fn runs_syscall_write_to_stdout() {
     let _ = std::fs::remove_file(&ll);
     let _ = std::fs::remove_file(&exe);
 }
+
+#[test]
+fn runs_os_write_to_stdout() {
+    // std.os の write(fd, buf, len) は syscall3(1, ...) へ展開され、libc を介さず stdout に書く
+    // （ADR-0011 実装順②）。fd = 1 = stdout。
+    if !clang_available() {
+        return;
+    }
+    let src = "use std.os.*\nfn main(): i32 {\n    let msg: string = \"hi\"\n    let n = write(1, msg, 2)\n    return 0\n}";
+    let ir = emit(src);
+    let dir = std::env::temp_dir();
+    let ll = dir.join("iris_cg_os_write.ll");
+    let exe = dir.join("iris_cg_os_write.bin");
+    std::fs::write(&ll, ir).unwrap();
+    let ok = Command::new("clang").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
+    assert!(ok.status.success(), "clang 失敗:\n{}", String::from_utf8_lossy(&ok.stderr));
+    let out = Command::new(&exe).output().expect("実行");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi");
+    let _ = std::fs::remove_file(&ll);
+    let _ = std::fs::remove_file(&exe);
+}
