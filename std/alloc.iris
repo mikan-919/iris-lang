@@ -1,6 +1,8 @@
 // ADR-0012: メモリ確保の抽象層。`use std.alloc` または `use std.alloc.*` で取り込む。
-// `Allocator` トレイトと libc malloc/free を薄くラップした `LibcAlloc` を提供する。
-// Vec が保持する `alloc` フィールド（null = グローバル直呼び）の将来の差し込み先。
+// `Allocator` トレイト・`LibcAlloc`（libc malloc/free）・`MmapAlloc`（syscall mmap/munmap）を提供する。
+// Vec が保持する `alloc` フィールド（null = グローバル直呼び）の差し込み先。
+// コンパイラ内部の Vec 確保/解放は `MmapAlloc` 相当の `@__iris_alloc`/`@__iris_free` を直接呼ぶ
+// （ADR-0012 ④ 静的差替。libc malloc を Vec の管理から排除）。
 
 // メモリ確保・解放の共通インターフェース。
 pub trait Allocator {
@@ -8,7 +10,7 @@ pub trait Allocator {
     fn free(p: RawPtr, size: i64): void
 }
 
-// libc の `malloc`/`free` を委譲する既定実装。状態を持たない空の struct。
+// libc の `malloc`/`free` を委譲する実装。状態を持たない空の struct。
 pub type LibcAlloc = struct {}
 
 impl Allocator for LibcAlloc {
@@ -17,5 +19,29 @@ impl Allocator for LibcAlloc {
     }
     fn free(p: RawPtr, size: i64): void {
         free(p)
+    }
+}
+
+// Linux x86-64 の mmap(2)/munmap(2) syscall でメモリを確保/解放する実装。
+// libc の malloc/free を一切使わない。状態を持たない空の struct。
+// ADR-0012 ④: コンパイラ内部の Vec 確保もこれと同等の inline asm 関数へ差し替え済み。
+pub type MmapAlloc = struct {}
+
+impl Allocator for MmapAlloc {
+    fn alloc(size: i64): RawPtr {
+        // ページサイズ（4096 バイト）に切り上げる。
+        let page: i64 = 4096
+        let aligned = ((size + page - 1) / page) * page
+        // mmap(addr=0, length=aligned, prot=PROT_READ|PROT_WRITE=3,
+        //      flags=MAP_PRIVATE|MAP_ANONYMOUS=0x22=34, fd=-1, offset=0)
+        // Linux x86-64 mmap syscall 番号 = 9。
+        let result = syscall6(9, 0, aligned, 3, 34, -1, 0)
+        return result as RawPtr
+    }
+    fn free(p: RawPtr, size: i64): void {
+        let page: i64 = 4096
+        let aligned = ((size + page - 1) / page) * page
+        // munmap(addr, length)。Linux x86-64 munmap syscall 番号 = 11。
+        syscall2(11, p as i64, aligned)
     }
 }

@@ -49,6 +49,7 @@ fn run_exit_code(src: &str, tag: &str) -> Option<i32> {
     let exe = dir.join(format!("iris_trait_{tag}.bin"));
     std::fs::write(&ll, ir).unwrap();
     let status = Command::new("clang")
+        .arg("-nostartfiles")
         .arg(&ll)
         .arg("-o")
         .arg(&exe)

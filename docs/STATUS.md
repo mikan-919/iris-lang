@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（ADR-0012 実装順③: `Allocator` トレイト＋`LibcAlloc`（`std/alloc.iris`）・`%Vec` を 4 フィールド化（alloc seam）・`malloc` を `i64` 引数・`RawPtr↔string` の `as` 変換追加）。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-24（ADR-0012 実装順⑤: `-nostartfiles` ＋ 自前 `@_start` 生成）。
 
 ## パイプライン
 
@@ -233,12 +233,13 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（ADR-0012 �
   落とす（`getelementptr` で要素アドレス→`load`→`x` のスロットへ `store`。`continue`/`break` はラベル
   スタックで解決）。**索引 `coll[i]`** はデータポインタを `extractvalue 0` で取り出し `getelementptr` +
   `load` で要素を読む（要素型は typeck の `expr_types` から、添字はネイティブ整数型のまま GEP 添字に使う）。
-  malloc は `extern fn malloc(n: i64): RawPtr`（prelude）として宣言し（ADR-0012、libc の `size_t` と一致）、
-  `Vec` リテラルの確保も `i64` 引数で呼ぶ。
-  **所有権ベースの解放（Drop/free）**: ヒープ所有する `Vec<T>` ローカルを**スコープ末で `free` する**（`declare void @free(ptr)`）。
+  malloc は `extern fn malloc(n: i64): RawPtr`（prelude）として宣言（string.concat 等の libc 依存コードで使用）。
+  **`Vec` の内部確保は `@malloc` ではなく codegen 組み込みの `@__iris_alloc`（mmap syscall 経由）を呼ぶ**（ADR-0012 ④）。
+  **所有権ベースの解放（Drop/free）**: ヒープ所有する `Vec<T>` ローカルを**スコープ末で `@__iris_free`（munmap 経由）で解放する**（ADR-0012 ④）。
   各 Vec ローカルに**ドロップフラグ**（`i1` の alloca、entry で `false` 初期化・`let` 格納後に `true`）を持たせ、
   値が move された地点（値渡し引数・`return`・別束縛・struct フィールドへの格納＝裸の Vec 識別子の消費）で `false` に戻す。
-  各 `ret` の直前で `emit_drops` がフラグの立つ Vec だけを `free`（`extractvalue 0` でデータポインタを取り出す）。
+  各 `ret` の直前で `emit_drops` がフラグの立つ Vec だけを `@__iris_free(ptr dp, i64 size)` で解放
+  （`size` = `cap * sizeof(T)` を実行時に計算し munmap に渡す。ドロップフラグに要素 LLVM 型を紐付けて管理）。
   **条件分岐の move も正確に追える**（Rust の動的 drop flag 相当。片方の分岐だけで move された値は実行時にフラグで解放可否が決まる）。
   借用 `&v`・添字 `v[i]`・`for x in v` は move でなく別経路で評価されるためフラグを落とさない（借用後も解放される）。
   **未対応**: `push`/`len`・スライス・非 Copy 要素。Drop の**スコープ粒度は関数末のみ**（ループ本体・ネストブロック単位の早期解放は未実装＝
@@ -340,7 +341,7 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 - **`use`・モジュール解決（実装済み）**: `use a.b.*`（glob）・`use a.b { x, y }`（選択）・`use a.b`（Plain）+ `a.b.x(...)` モジュールパス呼び出し。ドット区切り＝ファイルパス区切り（`use foo.bar` → `foo/bar.iris`）。`std` は `CARGO_MANIFEST_DIR/std/` または実行ファイル隣から解決。pub 可視性（モジュールから pub アイテムのみ提供）。**残り**: `use` の選択インポートによる名前制限（現状 Named は Glob と同じ動作）、モジュール自身の相互 use、可視性のモジュール間強制（main 側 pub/private の制限）。
 - **文字列操作（実装済み）**: 長さ `s.len()`（libc `strlen`）・添字 `s[i]`（i 番目のバイト→`u8`）・連結 `a.concat(b)`（`malloc`+`strcpy`+`strcat`、ヒープ結果はリーク許容）を `impl string`＋libc extern で縦断実装。**汎用添字 `expr[i]`** は固定長配列 `T[]`・`Vec<T>` にも対応（要素型を返す）。**残り**: 文字列補間・スライス・`push`/再代入索引・非 Copy 要素の索引
 - 文字列補間（バッククォート `` `...{expr}...` ``）
-- **`as` 型変換（実装済み）**: `expr as Type` を字句解析（`as` キーワード）〜構文解析（二項より強く・単項/後置より弱い優先順位、左結合で連鎖可）〜型検査（数値↔数値・`bool`→数値のみ許可。それ以外は拒否）〜所有権（被変換値の読み。参照は auto-deref）〜codegen（`trunc`/`sext`/`zext`／`sitofp`/`uitofp`／`fptosi`/`fptoui`／`fptrunc`/`fpext`。LLVM 表現が同一なら無変換）まで縦断実装。これにより `s[i] as i32`（`u8`→`i32`）等が書けるようになった。**残り**: ポインタ・参照・`string`・enum/struct との変換、別名（`type Meters = f64`）への変換、リテラルの後方確定との連携
+- **`as` 型変換（実装済み）**: `expr as Type` を字句解析（`as` キーワード）〜構文解析（二項より強く・単項/後置より弱い優先順位、左結合で連鎖可）〜型検査（数値↔数値・`bool`→数値・**`i64`→ポインタ**のみ許可。それ以外は拒否）〜所有権（被変換値の読み。参照は auto-deref）〜codegen（`trunc`/`sext`/`zext`／`sitofp`/`uitofp`／`fptosi`/`fptoui`／`fptrunc`/`fpext`。LLVM 表現が同一なら無変換）まで縦断実装。これにより `s[i] as i32`（`u8`→`i32`）・`mmap() as RawPtr`（`i64`→`RawPtr`、`inttoptr`）等が書けるようになった。**残り**: 参照・`string`・enum/struct との変換、別名（`type Meters = f64`）への変換、リテラルの後方確定との連携
 - ブロックコメント
 
 ### バックエンド・解析（未着手）
@@ -369,13 +370,17 @@ libc 依存を生成物から外していく中間目標。設計は確定（Acc
   将来 `realloc`）を std に置き、既定はグローバル単一アロケータ（静的・直呼び・ゼロコスト）。
   カスタムアロケータは**型引数 `Vec<T, A>` にせず**、`Vec` ヘッダに既定付き実行時フィールド
   `alloc`（`{ ptr, len, cap, alloc }`、`alloc == 0` ⇒ グローバル直呼び）を持たせて差し込む。公開型は
-  常に `Vec<T>`（ADR-0003 を満たす）。`Vec` の `malloc`/`free` 直呼びを「グローバルアロケータ呼び出し」
-  へ一段抽象化することが、libc→`MmapAlloc`（mmap ベース）差替の seam になる。
+  常に `Vec<T>`（ADR-0003 を満たす）。`Vec` の内部確保/解放は `@__iris_alloc`/`@__iris_free`（ADR-0012 ④
+  静的差替・mmap/munmap syscall 経由）を呼ぶ。`malloc` は Vec から切り離され string.concat 等の
+  libc 依存コードでのみ呼ばれる。
 - **実装順**: ✅① `syscall` 原語 ＋ `ptr as i64`（実装済み）→ ✅② `exit`/`write` を syscall 版にして「libc 無しで
   1 本動く」実証（実装済み）→ ✅③ `Allocator` トレイト ＋ `LibcAlloc`（`std/alloc.iris`）＋ Vec ヘッダ拡張（`%Vec`
   が `{ptr,i64,i64,ptr}`・4 番目 alloc フィールドは null で初期化・malloc を `i64` 引数へ移行・`RawPtr↔string` の
   `as` 変換を追加。実装済み）
-  → ④ `MmapAlloc` でグローバル差替（libc malloc 消滅）→ ⑤ `-nostdlib` ＋ 自前 `_start`。
+  → ✅④ `MmapAlloc` でグローバル差替（libc malloc 消滅。実装済み）→ ✅⑤ `-nostartfiles` ＋ 自前 `_start`
+  （`fn main` があるとき codegen が `@_start` を生成。libc の `exit()` を呼んで stdio をフラッシュ後終了。
+  std.os の iris `exit` が定義済みの場合はそちらを呼ぶ。将来 puts/putchar を write syscall に移行したら
+  raw syscall 60 に切り替え可能。実装済み）。
 
 ## 仕様未確定のため独自に決めた点（要確認）
 

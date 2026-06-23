@@ -22,6 +22,7 @@ fn run(src: &str, tag: &str) -> Option<(String, i32)> {
     let exe = dir.join(format!("iris_std_{tag}.bin"));
     std::fs::write(&ll, ir).unwrap();
     let build = Command::new("clang")
+        .arg("-nostartfiles")
         .arg(&ll)
         .arg("-o")
         .arg(&exe)

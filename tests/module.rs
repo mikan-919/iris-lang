@@ -143,7 +143,7 @@ fn main(): i32 { add(10, 32) }
     let exe = std::env::temp_dir().join("iris_module_test");
     std::fs::write(&ll, &ir).unwrap();
     let status = Command::new("clang")
-        .args(["-O0", "-Wno-override-module", ll.to_str().unwrap(), "-o", exe.to_str().unwrap()])
+        .args(["-O0", "-nostartfiles", "-Wno-override-module", ll.to_str().unwrap(), "-o", exe.to_str().unwrap()])
         .status().unwrap();
     assert!(status.success(), "clang が成功するはず");
     let exit = Command::new(&exe).status().unwrap();

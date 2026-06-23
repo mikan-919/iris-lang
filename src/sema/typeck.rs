@@ -836,14 +836,17 @@ impl<'a> Checker<'a> {
         // ポインタ裏付けの型（`RawPtr`/`string`）→ `i64`（`ptrtoint`）。syscall 引数で
         // ポインタを整数として渡すために使う（ADR-0011）。
         let ptr_to_int = self.is_rawptr_like(src_inner) && dst == Ty::named("i64");
+        // `i64` → ポインタ（`RawPtr`/`string`）。`inttoptr`。mmap 等の syscall 戻り値（i64）を
+        // RawPtr に変換するために使う（ADR-0012 MmapAlloc）。
+        let int_to_ptr = src_inner == &Ty::named("i64") && self.is_rawptr_like(&dst);
         // ポインタ同士の変換（`RawPtr` ↔ `string`）。LLVM 上はいずれも `ptr` で表現され
         // 変換は no-op。malloc の戻り値を文字列バッファとして使う場面等で必要。
         let ptr_to_ptr = self.is_rawptr_like(src_inner) && self.is_rawptr_like(&dst);
-        if !ok && !ptr_to_int && !ptr_to_ptr {
+        if !ok && !ptr_to_int && !int_to_ptr && !ptr_to_ptr {
             self.error(
                 span,
                 format!(
-                    "`{}` から `{}` への `as` 変換は未対応です（数値間・`bool`→数値・ポインタ→`i64`・ポインタ間のみ）",
+                    "`{}` から `{}` への `as` 変換は未対応です（数値間・`bool`→数値・`i64`↔ポインタ・ポインタ間のみ）",
                     src.describe(),
                     dst.describe()
                 ),

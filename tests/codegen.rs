@@ -28,6 +28,7 @@ fn run_exit_code(src: &str, tag: &str) -> Option<i32> {
     let exe = dir.join(format!("iris_cg_{tag}.bin"));
     std::fs::write(&ll, ir).unwrap();
     let status = Command::new("clang")
+        .arg("-nostartfiles") // @_start は iris が生成するため CRT スタートアップを除外
         .arg(&ll)
         .arg("-o")
         .arg(&exe)
@@ -726,13 +727,14 @@ fn runs_index_with_variable_subscript() {
 
 #[test]
 fn vec_local_is_freed_at_scope_end() {
-    // ヒープ所有する Vec ローカルは、関数スコープ末で `free` される。
-    // ドロップフラグの alloca と、フラグで保護された `free` 呼び出しが出る。
+    // ヒープ所有する Vec ローカルは、関数スコープ末で `@__iris_free`（mmap 経由）で解放される。
+    // ドロップフラグの alloca と、フラグで保護された free 呼び出しが出る。
     let ir = emit("fn main(): i32 {\n    let v: Vec<i32> = [1, 2, 3]\n    return v[0]\n}");
-    assert!(ir.contains("declare void @free(ptr)"));
+    // ADR-0012 ④: Vec の解放は libc free ではなく mmap 経由の @__iris_free を呼ぶ。
+    assert!(ir.contains("define private void @__iris_free(ptr %p, i64 %n)"));
     assert!(ir.contains("%drop.flag0 = alloca i1"));
     assert!(ir.contains("store i1 true, ptr %drop.flag0"));
-    assert!(ir.contains("call void @free(ptr"));
+    assert!(ir.contains("call void @__iris_free(ptr"));
     // clang で実行しても（free を踏んでも）正しい値を返す。
     if let Some(code) =
         run_exit_code("fn main(): i32 {\n    let v: Vec<i32> = [1, 2, 3]\n    return v[0]\n}", "vec_drop")
@@ -746,7 +748,7 @@ fn fixed_array_local_is_not_freed() {
     // スタック裏付けの固定長配列 `T[]` は解放対象でない（drop フラグも free も出ない）。
     let ir = emit("fn main(): i32 {\n    let a: i32[] = [1, 2, 3]\n    return a[0]\n}");
     assert!(!ir.contains("%drop.flag"));
-    assert!(!ir.contains("call void @free"));
+    assert!(!ir.contains("call void @__iris_free"));
 }
 
 #[test]
@@ -774,7 +776,7 @@ fn conditionally_moved_vec_uses_drop_flag() {
     let ir = emit(src);
     // スコープ末の free はフラグの load → 分岐で保護されている。
     assert!(ir.contains("load i1, ptr %drop.flag0"));
-    assert!(ir.contains("call void @free(ptr"));
+    assert!(ir.contains("call void @__iris_free(ptr"));
     if let Some(code) = run_exit_code(src, "vec_cond_move") {
         assert_eq!(code, 0);
     }
@@ -889,7 +891,7 @@ fn runs_os_env_some_and_none() {
     let ll = dir.join("iris_cg_os_env.ll");
     let exe = dir.join("iris_cg_os_env.bin");
     std::fs::write(&ll, ir).unwrap();
-    let ok = Command::new("clang").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
+    let ok = Command::new("clang").arg("-nostartfiles").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
     assert!(ok.status.success(), "clang 失敗:\n{}", String::from_utf8_lossy(&ok.stderr));
     // 未設定 → 7。
     let none = Command::new(&exe).env_remove("IRIS_ENV_TEST").status().expect("実行");
@@ -943,12 +945,78 @@ fn runs_syscall_write_to_stdout() {
     let ll = dir.join("iris_cg_syscall_write.ll");
     let exe = dir.join("iris_cg_syscall_write.bin");
     std::fs::write(&ll, ir).unwrap();
-    let ok = Command::new("clang").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
+    let ok = Command::new("clang").arg("-nostartfiles").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
     assert!(ok.status.success(), "clang 失敗:\n{}", String::from_utf8_lossy(&ok.stderr));
     let out = Command::new(&exe).output().expect("実行");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi");
     let _ = std::fs::remove_file(&ll);
     let _ = std::fs::remove_file(&exe);
+}
+
+#[test]
+fn emits_start_entrypoint_for_main() {
+    // ADR-0012 ⑤: fn main があるとき @_start と libc exit() 宣言が生成される。
+    let ir = emit("fn main(): i32 { return 0 }");
+    assert!(ir.contains("define void @_start() noreturn"), "@_start が生成されるはず\n{ir}");
+    assert!(ir.contains("declare void @exit(i32) noreturn"), "libc exit の declare が生成されるはず\n{ir}");
+    assert!(ir.contains("call void @exit(i32 %ret)"), "@main の戻り値を exit に渡すはず\n{ir}");
+    // main を持たないモジュールには @_start は出ない。
+    let ir2 = emit("fn f(x: i32): i32 { return x }");
+    assert!(!ir2.contains("@_start"), "main なしモジュールには @_start が出ないはず\n{ir2}");
+}
+
+#[test]
+fn emits_start_calls_iris_exit_when_std_os_loaded() {
+    // use std.os.* があると iris の exit（syscall ベース）が定義される。
+    // @_start はその @exit を呼ぶ（declare void @exit は出さない）。
+    let src = "use std.os.*\nfn main(): i32 { return 0 }";
+    let ir = iris_lang::compile_ir("test", src).expect("IR 生成");
+    assert!(ir.contains("define void @_start() noreturn"), "@_start が生成されるはず\n{ir}");
+    assert!(!ir.contains("declare void @exit(i32)"), "std.os の exit と衝突しないはず\n{ir}");
+    assert!(ir.contains("call void @exit(i32 %ret)"), "@main 戻り値を exit に渡すはず\n{ir}");
+}
+
+#[test]
+fn emits_i64_as_rawptr_as_inttoptr() {
+    // i64 → RawPtr は `inttoptr i64 ... to ptr`（ADR-0012 MmapAlloc の戻り値変換用）。
+    let ir = emit("fn main(): i32 {\n    let r: i64 = syscall6(9, 0, 4096, 3, 34, -1, 0)\n    let p: RawPtr = r as RawPtr\n    return 0\n}");
+    assert!(ir.contains("inttoptr i64"), "i64 as RawPtr は inttoptr になるはず\n{ir}");
+}
+
+#[test]
+fn emits_vec_alloc_via_mmap_not_malloc() {
+    // ADR-0012 ④: Vec の確保は libc @malloc ではなく mmap 経由の @__iris_alloc を呼ぶ。
+    let ir = emit("fn main(): i32 {\n    let v: Vec<i32> = [1, 2, 3]\n    return v[0]\n}");
+    assert!(ir.contains("define private ptr @__iris_alloc"), "@__iris_alloc が定義されるはず\n{ir}");
+    assert!(ir.contains("call ptr @__iris_alloc(i64"), "Vec 確保は @__iris_alloc を呼ぶはず\n{ir}");
+    // @main 関数内に @malloc への直呼びが出ていないことを確認
+    // （string.concat の @malloc は prelude 由来で許容）。
+    let main_body = ir.split("define i32 @main()").nth(1).unwrap_or("");
+    assert!(!main_body.contains("call ptr @malloc"), "main 内で Vec が @malloc を直呼びしないはず\n{main_body}");
+}
+
+#[test]
+fn runs_vec_alloc_and_drop_via_mmap() {
+    // Vec の確保（mmap）・要素アクセス・解放（munmap）が正しく動く。
+    let src = "fn main(): i32 {\n    let v: Vec<i32> = [3, 5, 7]\n    return v[1]\n}";
+    if let Some(code) = run_exit_code(src, "vec_mmap") {
+        assert_eq!(code, 5);
+    }
+}
+
+#[test]
+fn compiles_std_alloc_module() {
+    // `use std.alloc` が型検査まで通ることを確認。
+    // MmapAlloc の iris 実装（syscall6/munmap）がビルドエラーにならない。
+    // 注: alloc.iris のスパンと prelude のスパンが衝突する既知の問題により、
+    //     `use std.alloc.*` を使うプログラムの codegen は現状動作しない。
+    //     alloc.iris の MmapAlloc は std 側の仕様実装・将来のスパン修正後に使う想定。
+    // Vec 経由の mmap 確保の動作確認は runs_vec_alloc_and_drop_via_mmap で行う。
+    let src = "use std.alloc.*\nfn main(): i32 { return 0 }";
+    // codegen まで通るかは問わない（span 衝突で失敗することがある）が、型検査は通るはず。
+    let result = iris_lang::compile("test", src);
+    // compile（AST まで）は成功する。
+    assert!(result.is_ok(), "std.alloc のコンパイル（型検査まで）に失敗: {:?}", result.err());
 }
 
 #[test]
@@ -964,7 +1032,7 @@ fn runs_os_write_to_stdout() {
     let ll = dir.join("iris_cg_os_write.ll");
     let exe = dir.join("iris_cg_os_write.bin");
     std::fs::write(&ll, ir).unwrap();
-    let ok = Command::new("clang").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
+    let ok = Command::new("clang").arg("-nostartfiles").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
     assert!(ok.status.success(), "clang 失敗:\n{}", String::from_utf8_lossy(&ok.stderr));
     let out = Command::new(&exe).output().expect("実行");
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi");

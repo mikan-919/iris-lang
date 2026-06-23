@@ -565,7 +565,7 @@ pub fn emit_module(
 
     // 配列 `T[]` / 動的配列 `Vec<T>` の名前付き型を、使われている場合だけ宣言する。
     // `%Array = { データポインタ, 長さ }`（スタック裏付け）、
-    // `%Vec = { データポインタ, 長さ, 容量 }`（ヒープ。`malloc` で確保）。
+    // `%Vec = { データポインタ, 長さ, 容量, アロケータポインタ }`（ヒープ。mmap 経由）。
     let mut need_array = false;
     let mut need_vec = false;
     for ty in type_info.expr_types.values() {
@@ -593,21 +593,34 @@ pub fn emit_module(
     if need_vec {
         // 4 番目フィールド `ptr` はアロケータポインタ（0 = null = グローバル直呼び・ADR-0012）。
         let _ = writeln!(module, "%Vec = type {{ ptr, i64, i64, ptr }}");
-        // `malloc` がユーザ extern で宣言されていなければここで declare を出す。
-        let has_malloc = program.items.iter().any(|it| {
-            matches!(it, Item::Function(f) if f.name == "malloc")
-        });
-        if !has_malloc {
-            let _ = writeln!(module, "declare ptr @malloc(i64)");
-        }
-        // `Vec` バッファの解放に使う libc `free`。スコープ末のドロップが呼ぶ
-        // （未使用でも `declare` のみ出力され無害）。
-        let has_free = program.items.iter().any(|it| {
-            matches!(it, Item::Function(f) if f.name == "free")
-        });
-        if !has_free {
-            let _ = writeln!(module, "declare void @free(ptr)");
-        }
+        // ADR-0012 ④: Vec の確保/解放は libc malloc/free ではなく mmap/munmap syscall 経由の
+        // `@__iris_alloc`/`@__iris_free` で行う。x86-64 Linux inline asm。ページアライン付き。
+        let _ = writeln!(
+            module,
+            "define private ptr @__iris_alloc(i64 %n) {{\n\
+             entry:\n\
+             \x20 %n1 = add i64 %n, 4095\n\
+             \x20 %aligned = and i64 %n1, -4096\n\
+             \x20 %res = call i64 asm sideeffect \"syscall\", \
+             \"={{rax}},{{rax}},{{rdi}},{{rsi}},{{rdx}},{{r10}},{{r8}},{{r9}},~{{rcx}},~{{r11}},~{{memory}}\"\
+             (i64 9, i64 0, i64 %aligned, i64 3, i64 34, i64 -1, i64 0)\n\
+             \x20 %ptr = inttoptr i64 %res to ptr\n\
+             \x20 ret ptr %ptr\n\
+             }}"
+        );
+        let _ = writeln!(
+            module,
+            "define private void @__iris_free(ptr %p, i64 %n) {{\n\
+             entry:\n\
+             \x20 %n1 = add i64 %n, 4095\n\
+             \x20 %aligned = and i64 %n1, -4096\n\
+             \x20 %addr = ptrtoint ptr %p to i64\n\
+             \x20 call i64 asm sideeffect \"syscall\", \
+             \"={{rax}},{{rax}},{{rdi}},{{rsi}},~{{rcx}},~{{r11}},~{{memory}}\"\
+             (i64 11, i64 %addr, i64 %aligned)\n\
+             \x20 ret void\n\
+             }}"
+        );
     }
     if need_array || need_vec {
         module.push('\n');
@@ -758,6 +771,51 @@ pub fn emit_module(
         }
     }
 
+    // `fn main` がある場合、OS エントリポイント `@_start` を生成する（ADR-0012 ⑤）。
+    // `-nostartfiles` でリンクするため crt0.o は含まれず、`_start` は自前で提供する。
+    // libc の `exit()` を呼ぶことで stdio バッファをフラッシュしてから終了する
+    // （prelude の puts/putchar はバッファリングされているため、raw syscall 60 では消える）。
+    // I/O が全て write syscall に移行したら raw syscall へ切り替え可能。
+    if let Some(main_fn) = func_table.get("main") {
+        let main_ret_ll = main_fn
+            .ret
+            .as_ref()
+            .and_then(|t| llvm_ty(&Ty::from_ast(t), &structs).ok())
+            .unwrap_or_else(|| "void".to_string());
+        // `exit` が既に iris 側で定義されている（std.os 等）場合は declare を出さない。
+        // 未定義の場合は libc の `exit()` を declare して呼ぶ（stdio バッファをフラッシュ）。
+        let exit_decl = if func_table.contains_key("exit") {
+            String::new()
+        } else {
+            "declare void @exit(i32) noreturn\n".to_string()
+        };
+        let start_body = if main_ret_ll == "i32" {
+            format!(
+                "{exit_decl}\
+                 define void @_start() noreturn {{\n\
+                 entry:\n\
+                 \x20 %ret = call i32 @main()\n\
+                 \x20 call void @exit(i32 %ret)\n\
+                 \x20 unreachable\n\
+                 }}"
+            )
+        } else {
+            // void / その他: 終了コード 0 で抜ける。
+            format!(
+                "{exit_decl}\
+                 define void @_start() noreturn {{\n\
+                 entry:\n\
+                 \x20 call void @main()\n\
+                 \x20 call void @exit(i32 0)\n\
+                 \x20 unreachable\n\
+                 }}"
+            )
+        };
+        module.push('\n');
+        module.push_str(&start_body);
+        module.push('\n');
+    }
+
     Ok(module)
 }
 
@@ -795,12 +853,12 @@ struct FnCodegen<'a> {
     /// `for x in it` の要素型（typeck が記録。var_span → 要素型 T）。
     for_iter_elem: &'a HashMap<Span, Ty>,
     /// ヒープ所有する `Vec<T>` ローカルのドロップ追跡（所有権ベースの解放）。
-    /// DefId → ドロップフラグの alloca（`i1`）。フラグが真のままスコープ末（＝各 `ret`
-    /// の直前）に到達した値だけ `free` する。値が move（値渡し・return・別束縛へ）された
+    /// DefId → (ドロップフラグの alloca（`i1`）, Vec 要素の LLVM 型)。フラグが真のままスコープ末（＝各 `ret`
+    /// の直前）に到達した値だけ `@__iris_free` する。値が move（値渡し・return・別束縛へ）された
     /// 時点でフラグを偽にし、二重解放を防ぐ。条件分岐の move もフラグで正確に追える
     /// （Rust の動的 drop flag 相当）。第一スライスは `Vec` ローカルのみ・解放位置は
     /// 関数スコープ末（ループ本体・ネストブロック単位の早期解放は今後）。
-    drop_flags: HashMap<DefId, String>,
+    drop_flags: HashMap<DefId, (String, String)>,
     /// ドロップフラグなど、entry ブロック先頭に置きたい alloca/初期化を貯める。
     entry_allocas: String,
     /// ドロップフラグ用の連番。
@@ -1206,8 +1264,16 @@ impl<'a> FnCodegen<'a> {
                     // ヒープ所有する Vec はスコープ末で解放する。フラグを真にして
                     // 「この束縛が生存・所有している」ことを記録する。
                     if is_vec_ty(&want) {
-                        self.register_vec_drop(id);
-                        if let Some(flag) = self.drop_flags.get(&id).cloned() {
+                        // Vec の要素型（drop 時のサイズ計算に使う）。
+                        let elem_llty = if let Ty::Named { args, .. } = &want
+                            && let Some(elem) = args.first()
+                        {
+                            llvm_ty(elem, self.structs).unwrap_or_else(|_| "i32".to_string())
+                        } else {
+                            "i32".to_string()
+                        };
+                        self.register_vec_drop(id, elem_llty);
+                        if let Some((flag, _)) = self.drop_flags.get(&id).cloned() {
                             self.emit(&format!("store i1 true, ptr {flag}"));
                         }
                     }
@@ -2142,6 +2208,12 @@ impl<'a> FnCodegen<'a> {
             self.emit(&format!("{r} = ptrtoint ptr {v} to {dst_ll}"));
             return Ok(r);
         }
+        // `i64` → ポインタ（`RawPtr`/`string`）。`inttoptr`（ADR-0012、mmap 戻り値を RawPtr へ）。
+        if dst_ll == "ptr" && !is_float_ll(&src_ll) {
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = inttoptr {src_ll} {v} to ptr"));
+            return Ok(r);
+        }
         let src_kind = num_kind(&src_ty);
         let dst_kind = num_kind(dst_ty);
         let r = self.fresh_tmp();
@@ -2228,7 +2300,7 @@ impl<'a> FnCodegen<'a> {
 
     /// 配列リテラル `[e1, e2, ...]` を生成する。typeck が確定した型（`T[]` か `Vec<T>`）で
     /// 表現を決める。`T[]` はスタックに `[N x T]` を確保した fat pointer `%Array { ptr, len }`、
-    /// `Vec<T>` は `malloc` で確保したバッファへコピーした `%Vec { ptr, len, cap }`。
+    /// `Vec<T>` は `@__iris_alloc`（mmap 経由）で確保したバッファへコピーした `%Vec { ptr, len, cap, alloc }`。
     fn gen_array_lit(&mut self, elems: &[Expr], span: Span) -> Result<String, CodegenError> {
         // typeck が記録した確定型（単相化中なら型引数を置換）。
         let ty = subst_ty(&self.types.get(&span).cloned().unwrap_or(Ty::Infer), self.type_subst)
@@ -2251,16 +2323,16 @@ impl<'a> FnCodegen<'a> {
         let n = elems.len();
 
         if is_vec {
-            // sizeof(T) = ptrtoint (getelementptr T, null, 1)。要素数を掛けて malloc。
+            // sizeof(T) = ptrtoint (getelementptr T, null, 1)。要素数を掛けて確保サイズを算出。
             let szp = self.fresh_tmp();
             self.emit(&format!("{szp} = getelementptr {ellty}, ptr null, i64 1"));
             let sz = self.fresh_tmp();
             self.emit(&format!("{sz} = ptrtoint ptr {szp} to i64"));
             let total = self.fresh_tmp();
             self.emit(&format!("{total} = mul i64 {sz}, {n}"));
-            // malloc は i64 引数（prelude の `extern fn malloc(n: i64): RawPtr`、ADR-0012）。
+            // `@__iris_alloc` で mmap ベースに確保する（ADR-0012 ④ 静的差替）。
             let buf = self.fresh_tmp();
-            self.emit(&format!("{buf} = call ptr @malloc(i64 {total})"));
+            self.emit(&format!("{buf} = call ptr @__iris_alloc(i64 {total})"));
             for (i, e) in elems.iter().enumerate() {
                 let (v, _) = self.gen_value(e, &elem_ty)?;
                 let p = self.fresh_tmp();
@@ -3004,7 +3076,8 @@ impl<'a> FnCodegen<'a> {
     /// `Vec<T>` ローカルのドロップフラグを登録する。フラグは entry で `false` に初期化し、
     /// 呼び出し側（`let` の格納後）で `true` にする。これにより、宣言前の早期 return では
     /// フラグが偽のまま＝解放されない（未初期化スロットを読まない）。
-    fn register_vec_drop(&mut self, id: DefId) {
+    /// `elem_llty` は `@__iris_free` 呼び出し時のサイズ計算（`cap * sizeof(T)`）に使う。
+    fn register_vec_drop(&mut self, id: DefId, elem_llty: String) {
         if self.drop_flags.contains_key(&id) {
             return;
         }
@@ -3012,7 +3085,7 @@ impl<'a> FnCodegen<'a> {
         self.drop_counter += 1;
         self.entry_allocas
             .push_str(&format!("  {flag} = alloca i1\n  store i1 false, ptr {flag}\n"));
-        self.drop_flags.insert(id, flag);
+        self.drop_flags.insert(id, (flag, elem_llty));
     }
 
     /// 値が move された地点でドロップ責務を手放す（フラグを偽にする）。`expr` が裸の識別子で
@@ -3021,18 +3094,22 @@ impl<'a> FnCodegen<'a> {
     fn note_move(&mut self, expr: &Expr) {
         if let ExprKind::Ident(_) = &expr.kind
             && let Some(id) = self.res.uses.get(&expr.span)
-            && let Some(flag) = self.drop_flags.get(id).cloned()
+            && let Some((flag, _)) = self.drop_flags.get(id).cloned()
         {
             self.emit(&format!("store i1 false, ptr {flag}"));
         }
     }
 
     /// 現在の関数スコープ末（各 `ret` の直前）で、生存している `Vec` ローカルを解放する。
-    /// フラグが真のものだけ `free`（条件分岐の move もフラグで正しく除外される）。
+    /// フラグが真のものだけ `@__iris_free`（条件分岐の move もフラグで正しく除外される）。
+    /// サイズは `cap * sizeof(T)` を実行時に計算する（munmap に渡すため必要）。
     fn emit_drops(&mut self) {
-        let entries: Vec<(DefId, String)> =
-            self.drop_flags.iter().map(|(k, v)| (*k, v.clone())).collect();
-        for (id, flag) in entries {
+        let entries: Vec<(DefId, String, String)> = self
+            .drop_flags
+            .iter()
+            .map(|(k, (flag, ellty))| (*k, flag.clone(), ellty.clone()))
+            .collect();
+        for (id, flag, elem_llty) in entries {
             let Some((slot, _)) = self.locals.get(&id).cloned() else {
                 continue;
             };
@@ -3046,7 +3123,16 @@ impl<'a> FnCodegen<'a> {
             self.emit(&format!("{vv} = load %Vec, ptr {slot}"));
             let dp = self.fresh_tmp();
             self.emit(&format!("{dp} = extractvalue %Vec {vv}, 0"));
-            self.emit(&format!("call void @free(ptr {dp})"));
+            let cap = self.fresh_tmp();
+            self.emit(&format!("{cap} = extractvalue %Vec {vv}, 2"));
+            // sizeof(T) = ptrtoint (getelementptr T, null, 1)。cap と掛けて確保サイズを算出。
+            let szp = self.fresh_tmp();
+            self.emit(&format!("{szp} = getelementptr {elem_llty}, ptr null, i64 1"));
+            let sz = self.fresh_tmp();
+            self.emit(&format!("{sz} = ptrtoint ptr {szp} to i64"));
+            let total = self.fresh_tmp();
+            self.emit(&format!("{total} = mul i64 {cap}, {sz}"));
+            self.emit(&format!("call void @__iris_free(ptr {dp}, i64 {total})"));
             self.emit(&format!("br label %{skip_l}"));
             self.emit_label(&skip_l);
         }

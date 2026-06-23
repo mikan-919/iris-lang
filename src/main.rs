@@ -135,9 +135,12 @@ fn build(path: &str, src: &str, release: bool, out: Option<&str>, run: bool) -> 
     };
 
     // 3. clang で実行ファイル化。既定 -O0、--release で -O2。
+    // `-nostartfiles`: crt0.o 等の CRT を除外（`@_start` は iris が自前で生成）。
+    // libc 自体は動的リンクのまま（puts/strlen 等はまだ libc 依存）。
     let opt = if release { "-O2" } else { "-O0" };
     let clang = Command::new("clang")
         .arg(opt)
+        .arg("-nostartfiles")
         .arg("-Wno-override-module") // モジュール triple 上書きの警告を抑制
         .arg(&ll)
         .arg("-o")
