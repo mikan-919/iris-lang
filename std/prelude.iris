@@ -12,9 +12,9 @@ extern fn puts(s: string): i32
 extern fn strcmp(a: string, b: string): i32
 
 // C の文字列操作を借りる。strlen は長さ、malloc はバッファ確保、strcpy/strcat は連結に使う。
-// （malloc は size_t を取るが、x86-64 では i32 引数も edi 経由で rdi へゼロ拡張されるため安全。）
 extern fn strlen(s: string): i32
-extern fn malloc(n: i32): string
+extern fn malloc(n: i64): RawPtr
+extern fn free(p: RawPtr): void
 extern fn strcpy(dst: string, src: string): string
 extern fn strcat(dst: string, src: string): string
 
@@ -26,10 +26,10 @@ impl string {
     }
 
     // 自身と other を連結した新しい文字列を返す。結果はヒープ（malloc）に確保する
-    // （現状 free は無く、Vec と同様にリークを許容する）。
+    // （Vec と同様にリークを許容する）。
     fn concat(&self, other: string): string {
         let n = strlen(self) + strlen(other) + 1
-        let buf = malloc(n)
+        let buf = malloc(n as i64) as string
         let a = strcpy(buf, self)
         let b = strcat(buf, other)
         return buf

@@ -627,9 +627,9 @@ fn emits_array_and_vec_types() {
     // 配列・Vec を使うと名前付き型と malloc 宣言が出る。
     let ir = emit("fn main(): i32 {\n    let a: i32[] = [1, 2]\n    let v: Vec<i32> = [3]\n    return 0\n}");
     assert!(ir.contains("%Array = type { ptr, i64 }"));
-    assert!(ir.contains("%Vec = type { ptr, i64, i64 }"));
-    // malloc は prelude の `extern fn malloc(n: i32)` として宣言される。
-    assert!(ir.contains("declare ptr @malloc(i32)"));
+    assert!(ir.contains("%Vec = type { ptr, i64, i64, ptr }"));
+    // malloc は prelude の `extern fn malloc(n: i64): RawPtr` として宣言される（ADR-0012）。
+    assert!(ir.contains("declare ptr @malloc(i64)"));
 }
 
 #[test]
@@ -827,7 +827,7 @@ fn emits_rawptr_extern_as_pointer() {
 #[test]
 fn runs_os_file_roundtrip() {
     // ファイルへ書き込み → 読み戻し、先頭バイトを i32 へ変換して返す（'Z' = 90）。
-    let src = "use std.os.*\nfn main(): i32 {\n    let path = \"/tmp/iris_os_roundtrip.txt\"\n    let w = fopen(path, \"w\")\n    let r1 = fputs(\"Zebra\\n\", w)\n    let c1 = fclose(w)\n    let f = fopen(path, \"r\")\n    let buf = malloc(64)\n    let line = fgets(buf, 64, f)\n    let c2 = fclose(f)\n    return buf[0] as i32\n}";
+    let src = "use std.os.*\nfn main(): i32 {\n    let path = \"/tmp/iris_os_roundtrip.txt\"\n    let w = fopen(path, \"w\")\n    let r1 = fputs(\"Zebra\\n\", w)\n    let c1 = fclose(w)\n    let f = fopen(path, \"r\")\n    let buf = malloc(64) as string\n    let line = fgets(buf, 64, f)\n    let c2 = fclose(f)\n    return buf[0] as i32\n}";
     if let Some(code) = run_exit_code(src, "os_roundtrip") {
         assert_eq!(code, 90);
     }

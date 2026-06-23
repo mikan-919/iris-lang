@@ -591,13 +591,14 @@ pub fn emit_module(
         let _ = writeln!(module, "%Array = type {{ ptr, i64 }}");
     }
     if need_vec {
-        let _ = writeln!(module, "%Vec = type {{ ptr, i64, i64 }}");
+        // 4 番目フィールド `ptr` はアロケータポインタ（0 = null = グローバル直呼び・ADR-0012）。
+        let _ = writeln!(module, "%Vec = type {{ ptr, i64, i64, ptr }}");
         // `malloc` がユーザ extern で宣言されていなければここで declare を出す。
         let has_malloc = program.items.iter().any(|it| {
             matches!(it, Item::Function(f) if f.name == "malloc")
         });
         if !has_malloc {
-            let _ = writeln!(module, "declare ptr @malloc(i32)");
+            let _ = writeln!(module, "declare ptr @malloc(i64)");
         }
         // `Vec` バッファの解放に使う libc `free`。スコープ末のドロップが呼ぶ
         // （未使用でも `declare` のみ出力され無害）。
@@ -2257,27 +2258,25 @@ impl<'a> FnCodegen<'a> {
             self.emit(&format!("{sz} = ptrtoint ptr {szp} to i64"));
             let total = self.fresh_tmp();
             self.emit(&format!("{total} = mul i64 {sz}, {n}"));
-            // malloc は i32 引数で宣言する（prelude の `extern fn malloc(n: i32)` と一致。
-            // x86-64 では i32 引数が rdi へゼロ拡張されるため size_t と互換）。総量を i32 へ
-            // 切り詰めて呼ぶ（このトイ言語の確保サイズでは十分）。
-            let total32 = self.fresh_tmp();
-            self.emit(&format!("{total32} = trunc i64 {total} to i32"));
+            // malloc は i64 引数（prelude の `extern fn malloc(n: i64): RawPtr`、ADR-0012）。
             let buf = self.fresh_tmp();
-            self.emit(&format!("{buf} = call ptr @malloc(i32 {total32})"));
+            self.emit(&format!("{buf} = call ptr @malloc(i64 {total})"));
             for (i, e) in elems.iter().enumerate() {
                 let (v, _) = self.gen_value(e, &elem_ty)?;
                 let p = self.fresh_tmp();
                 self.emit(&format!("{p} = getelementptr {ellty}, ptr {buf}, i64 {i}"));
                 self.emit(&format!("store {ellty} {v}, ptr {p}"));
             }
-            // %Vec { buf, n, n } を組み立てる。
+            // %Vec { buf, len, cap, alloc } を組み立てる。alloc = null（グローバル直呼び）。
             let v0 = self.fresh_tmp();
             self.emit(&format!("{v0} = insertvalue %Vec undef, ptr {buf}, 0"));
             let v1 = self.fresh_tmp();
             self.emit(&format!("{v1} = insertvalue %Vec {v0}, i64 {n}, 1"));
             let v2 = self.fresh_tmp();
             self.emit(&format!("{v2} = insertvalue %Vec {v1}, i64 {n}, 2"));
-            Ok(v2)
+            let v3 = self.fresh_tmp();
+            self.emit(&format!("{v3} = insertvalue %Vec {v2}, ptr null, 3"));
+            Ok(v3)
         } else {
             // スタックに [N x T] を確保し各要素を格納、先頭アドレスで fat pointer を組む。
             let back = self.fresh_tmp();

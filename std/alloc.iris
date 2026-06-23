@@ -1,0 +1,21 @@
+// ADR-0012: メモリ確保の抽象層。`use std.alloc` または `use std.alloc.*` で取り込む。
+// `Allocator` トレイトと libc malloc/free を薄くラップした `LibcAlloc` を提供する。
+// Vec が保持する `alloc` フィールド（null = グローバル直呼び）の将来の差し込み先。
+
+// メモリ確保・解放の共通インターフェース。
+pub trait Allocator {
+    fn alloc(size: i64): RawPtr
+    fn free(p: RawPtr, size: i64): void
+}
+
+// libc の `malloc`/`free` を委譲する既定実装。状態を持たない空の struct。
+pub type LibcAlloc = struct {}
+
+impl Allocator for LibcAlloc {
+    fn alloc(size: i64): RawPtr {
+        return malloc(size)
+    }
+    fn free(p: RawPtr, size: i64): void {
+        free(p)
+    }
+}

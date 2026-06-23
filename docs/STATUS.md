@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（汎用 syscall 原語 `syscall0`〜`syscall6`＝x86-64 Linux inline asm へ展開・`ptr as i64`＝`ptrtoint`。ADR-0011 実装順①。`std/os.iris` の NULL 安全化＝組み込み述語 `is_null` と `open`/`env` の `Option` 戻りラッパ。`as` 型変換＝数値↔数値/`bool`→数値、`RawPtr` 不透明ポインタ＋`std/os.iris`＝FILE I/O・プロセス・環境変数）。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（ADR-0012 実装順③: `Allocator` トレイト＋`LibcAlloc`（`std/alloc.iris`）・`%Vec` を 4 フィールド化（alloc seam）・`malloc` を `i64` 引数・`RawPtr↔string` の `as` 変換追加）。
 
 ## パイプライン
 
@@ -226,15 +226,15 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（汎用 sys
 - **配列 `T[]` / 動的配列 `Vec<T>`**: 使用時のみ名前付き型を宣言する。固定長配列は fat pointer
   `%Array = type { ptr, i64 }`（データポインタ＋長さ）。配列リテラルは `alloca [N x T]` をスタックに
   確保し各要素を `store`、先頭アドレスと長さ `N` を `insertvalue` で組む。動的配列は
-  `%Vec = type { ptr, i64, i64 }`（ポインタ＋長さ＋容量）。配列リテラルから `malloc`（`sizeof(T)` は
-  `getelementptr T, null, 1` → `ptrtoint` で算出）でバッファを確保し要素をコピー、`len=cap=N`。
+  `%Vec = type { ptr, i64, i64, ptr }`（データポインタ＋長さ＋容量＋**アロケータポインタ**（ADR-0012 seam。null = グローバル直呼び））。配列リテラルから `malloc`（`sizeof(T)` は
+  `getelementptr T, null, 1` → `ptrtoint` で算出）でバッファを確保し要素をコピー、`len=cap=N`、`alloc=null`。
   要素型は opaque ポインタ越しに命令側で扱うため、型宣言は要素型に依らず単一（`%Array`/`%Vec`）。
   `for x in coll` はデータポインタと長さを `extractvalue` で取り出し、`0..len` のインデックスループへ
   落とす（`getelementptr` で要素アドレス→`load`→`x` のスロットへ `store`。`continue`/`break` はラベル
   スタックで解決）。**索引 `coll[i]`** はデータポインタを `extractvalue 0` で取り出し `getelementptr` +
   `load` で要素を読む（要素型は typeck の `expr_types` から、添字はネイティブ整数型のまま GEP 添字に使う）。
-  malloc は `extern fn malloc(n: i32)`（prelude）として宣言し、`Vec` リテラルの確保もこれに合わせて i32
-  引数で呼ぶ（x86-64 では i32 引数が rdi へゼロ拡張され size_t 互換。確保サイズは i32 へ trunc）。
+  malloc は `extern fn malloc(n: i64): RawPtr`（prelude）として宣言し（ADR-0012、libc の `size_t` と一致）、
+  `Vec` リテラルの確保も `i64` 引数で呼ぶ。
   **所有権ベースの解放（Drop/free）**: ヒープ所有する `Vec<T>` ローカルを**スコープ末で `free` する**（`declare void @free(ptr)`）。
   各 Vec ローカルに**ドロップフラグ**（`i1` の alloca、entry で `false` 初期化・`let` 格納後に `true`）を持たせ、
   値が move された地点（値渡し引数・`return`・別束縛・struct フィールドへの格納＝裸の Vec 識別子の消費）で `false` に戻す。
@@ -262,7 +262,7 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-23（汎用 sys
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
-- **`as` 型変換**: `expr as Type` を数値↔数値・`bool`→数値で実装済み（`gen_cast`。`trunc`/`sext`/`zext`／`sitofp`/`uitofp`／`fptosi`/`fptoui`／`fptrunc`/`fpext`、LLVM 表現が同一なら無変換）。**ポインタ裏付けの型（`RawPtr`/`string`）→ `i64` は `ptrtoint`**（ADR-0011、syscall 引数用。`i64`＝ポインタ幅のみ許可）。
+- **`as` 型変換**: `expr as Type` を数値↔数値・`bool`→数値で実装済み（`gen_cast`。`trunc`/`sext`/`zext`／`sitofp`/`uitofp`／`fptosi`/`fptoui`／`fptrunc`/`fpext`、LLVM 表現が同一なら無変換）。**ポインタ裏付けの型（`RawPtr`/`string`）→ `i64` は `ptrtoint`**（ADR-0011、syscall 引数用。`i64`＝ポインタ幅のみ許可）。**`RawPtr` ↔ `string` 変換**（ADR-0012、`malloc(n): RawPtr` の戻り値を文字列バッファとして使う等。LLVM 上はいずれも `ptr` で no-op）。
 - **汎用 syscall 原語（ADR-0011 実装順①）**: 組み込みの `syscall0`〜`syscall6`（番号＋N 引数、すべて `i64`、戻り `i64`）を `is_null` と同じく名前で特別扱いし、codegen が x86-64 Linux 規約の **inline asm**（`call i64 asm sideeffect "syscall", "={rax},{rax},{rdi},...,~{rcx},~{r11},~{memory}"`）へ展開する（`declare` を出さない）。resolve（`PRELUDE`）→ typeck（`syscall_arity` で個数・i64 引数検査）→ codegen に配線。`tests/codegen.rs` で `write(2)`／`exit(2)` を libc を介さず実走検証（write は stdout へ "hi"、exit は終了コード 7）。**実装順②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）も完了**: `exit` は `syscall1(60, code as i64)`、`write(fd, buf, len)` は `syscall3(1, fd as i64, buf as i64, len)` を iris で記述し、libc の `exit`/`puts`/`fputs` を介さず `define` ＋ inline asm へ展開する（`runs_os_exit`／`runs_os_write_to_stdout`）。**残り**: 実装順③（残りの os ラッパ＝`fopen`/`fputs`/`fgets`/`getenv` 等の syscall 移行）は未着手
 - 未対応（今後）: 文字列補間・スライス（長さ `s.len()`・索引 `s[i]`→`u8`・連結 `a.concat(b)` は実装済み）（`!` エラー伝播・ジェネリック **enum**（集約ペイロード）＝ADR-0010・ジェネリック**関数**・ジェネリック **struct 型**の単相化・`as` 型変換はいずれも実装済み）。なお整数/小数リテラルからジェネリック struct を構築すると型パラメータは既定（`i32`/`f64`）に確定し、`Pair<i64>` 等の非既定幅の明示注釈は構築式へ伝播しない（型エラーになる。enum の `refine_construction` と同種の制約）
 
@@ -372,7 +372,9 @@ libc 依存を生成物から外していく中間目標。設計は確定（Acc
   常に `Vec<T>`（ADR-0003 を満たす）。`Vec` の `malloc`/`free` 直呼びを「グローバルアロケータ呼び出し」
   へ一段抽象化することが、libc→`MmapAlloc`（mmap ベース）差替の seam になる。
 - **実装順**: ✅① `syscall` 原語 ＋ `ptr as i64`（実装済み）→ ✅② `exit`/`write` を syscall 版にして「libc 無しで
-  1 本動く」実証（実装済み）→ ③ `Allocator` トレイト ＋ `LibcAlloc` ＋ Vec ヘッダ拡張（挙動は現状同一の seam）
+  1 本動く」実証（実装済み）→ ✅③ `Allocator` トレイト ＋ `LibcAlloc`（`std/alloc.iris`）＋ Vec ヘッダ拡張（`%Vec`
+  が `{ptr,i64,i64,ptr}`・4 番目 alloc フィールドは null で初期化・malloc を `i64` 引数へ移行・`RawPtr↔string` の
+  `as` 変換を追加。実装済み）
   → ④ `MmapAlloc` でグローバル差替（libc malloc 消滅）→ ⑤ `-nostdlib` ＋ 自前 `_start`。
 
 ## 仕様未確定のため独自に決めた点（要確認）
@@ -392,7 +394,7 @@ libc 依存を生成物から外していく中間目標。設計は確定（Acc
 - **`as` 型変換の構文・範囲**: spec に型変換の記述が無いため Rust に倣い `expr as Type` を採用。`as` を予約語化し、優先順位は二項演算子より強く・単項/後置より弱い（`a + b as T` = `a + (b as T)`、`-x as T` = `(-x) as T`）。左結合で `x as A as B` も可。変換は **数値↔数値・`bool`→数値・ポインタ（`RawPtr`/`string`）→`i64`** に限定（参照・enum/struct・別名・`i64`以外への ptr 変換は未対応）。`bool`→整数は符号なし拡張（`zext`、0/1）。浮動小数→整数はゼロ方向丸め（`fptosi`/`fptoui`）。ポインタ→整数は `ptrtoint`（ADR-0011）。
 - **syscall 原語の形・引数型**（ADR-0011）: 引数個数別の組み込み関数 `syscall0`〜`syscall6`（第1引数＝syscall 番号、続く N 個＝引数）を採用。**全引数を `i64` に固定**（整数リテラルは適合、`i32` 値等は `as i64` を要求）。戻り値も `i64`。番号・ABI 知識はコンパイラに焼かず、ラッパ（`write`/`exit` 等）と番号付けは std 側（実装順②以降）。`i64` 固定は inline asm のレジスタ制約をポインタ幅へ素直に対応させるための暫定で、spec に規定が無いため要確認。
 - **NULL 判定は述語 `is_null` に集約**: ポインタ NULL の検出に `null` リテラル＋ポインタ比較ではなく、組み込み述語 `is_null(p): bool` を採用した（spec に NULL 規定が無いため暫定）。生ポインタを言語表層へ出さない self-contained 志向に沿い、FFI の NULL は std ラッパ（`open`/`env`）が `Option` に変換して隠す。`null` リテラル・ポインタ算術・任意ポインタ比較は導入していない。
-- **`malloc` の引数幅**: prelude では `extern fn malloc(n: i32)` と宣言し、`Vec` リテラルの確保も i32 引数で呼ぶ（`as` 変換が無く concat の長さが i32 のため）。x86-64 では i32 引数が rdi へゼロ拡張されるため libc の `size_t`（i64）と ABI 互換。他ターゲットへ移す際は要再検討。
+- **`malloc` の引数幅**: prelude では `extern fn malloc(n: i64): RawPtr` と宣言し（ADR-0012 実装順③で `i32`→`i64` に移行済み）、`Vec` リテラルの確保も `i64` 引数で呼ぶ。libc の `size_t`（i64）と直接一致する。`concat` 内で `strlen` が返す `i32` は `as i64` で変換し、`malloc` の戻り値（`RawPtr`）は `as string` で文字列バッファとして使う（`RawPtr↔string` の `as` 変換も同時に実装）。
 - **Drop/free の第一スライス範囲**: 解放対象は **`Vec<T>` ローカルのみ**（`string` は ADR で Copy・leak 許容、`Box` は codegen 未整備のため対象外）。条件付き move は **動的 drop flag**（Rust 準拠）で解決し、**解放位置はスコープ末＝関数末**（最後の使用での即時解放や、ループ本体・ネストブロック単位の早期解放は未実装）。move 検出は codegen が「裸の Vec 識別子の値消費」を消費地点ごとに記録する方式（所有権チェッカ flow.rs は不変＝use-after-move は従来どおり静的に拒否し、drop flag は解放責務の追跡のみ）。`free` は libc を直接 `declare`（prelude には出さない）。健全（二重解放・use-after-free 無し）だが、ループ内 Vec・Vec 引数・struct フィールドの Vec は現状リークを許容する。
 
 ## ビルド・実行
