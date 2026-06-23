@@ -349,6 +349,28 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 - コード生成の拡張（文字列のスライス・補間、I/O 拡充）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
 - 並行処理 — `concurrency.md` 未設計
 
+### self-contained ランタイム（計画・ADR-0011 / ADR-0012）
+
+libc 依存を生成物から外していく中間目標。設計は確定（Accepted）・実装は未着手。
+詳細は [ADR-0011](adr/0011-syscall-primitive-for-libc-independence.md)（syscall 原語）/
+[ADR-0012](adr/0012-global-allocator-with-override.md)（アロケータ）を参照。
+
+- **汎用 syscall 原語（ADR-0011）**: コンパイラは「syscall 命令の出し方」だけを知る組み込み原語
+  （`syscall0`〜`syscall6` 想定）を持ち、codegen が x86-64 Linux 規約の **inline asm** へ展開する
+  （`declare` を出さない）。番号付けと `read`/`write`/`open`/`exit` 等のラッパは `std/os.iris` 側で
+  iris として書く（`RawPtr`/`is_null` と同じ「最小原語はコンパイラ・命名は std」路線）。前提として
+  **`ptr as i64`**（`RawPtr`/`string`→整数）を `as` に追加する。**外れるのは libc 依存であって clang
+  ではない**（アセンブル/リンクには引き続き clang が要る。x86-64 Linux 固定）。
+- **グローバル既定アロケータ＋オーバーライド（ADR-0012）**: `Allocator` トレイト（`alloc`/`free`/
+  将来 `realloc`）を std に置き、既定はグローバル単一アロケータ（静的・直呼び・ゼロコスト）。
+  カスタムアロケータは**型引数 `Vec<T, A>` にせず**、`Vec` ヘッダに既定付き実行時フィールド
+  `alloc`（`{ ptr, len, cap, alloc }`、`alloc == 0` ⇒ グローバル直呼び）を持たせて差し込む。公開型は
+  常に `Vec<T>`（ADR-0003 を満たす）。`Vec` の `malloc`/`free` 直呼びを「グローバルアロケータ呼び出し」
+  へ一段抽象化することが、libc→`MmapAlloc`（mmap ベース）差替の seam になる。
+- **実装順**: ① `syscall` 原語 ＋ `ptr as i64` → ② `exit`/`write` を syscall 版にして「libc 無しで
+  1 本動く」実証 → ③ `Allocator` トレイト ＋ `LibcAlloc` ＋ Vec ヘッダ拡張（挙動は現状同一の seam）
+  → ④ `MmapAlloc` でグローバル差替（libc malloc 消滅）→ ⑤ `-nostdlib` ＋ 自前 `_start`。
+
 ## 仕様未確定のため独自に決めた点（要確認）
 
 実装を進めるための暫定判断。本実装前にユーザー確認のうえ `docs/spec` を更新する。
