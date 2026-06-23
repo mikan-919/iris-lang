@@ -900,3 +900,53 @@ fn runs_os_env_some_and_none() {
     let _ = std::fs::remove_file(&ll);
     let _ = std::fs::remove_file(&exe);
 }
+
+#[test]
+fn emits_syscall_as_inline_asm() {
+    // 汎用 syscall 原語（ADR-0011）は x86-64 Linux の inline asm へ展開され、`declare` を出さない。
+    // 番号は rax、引数は rdi/rsi/rdx... へ、clobber は rcx/r11/memory。
+    let ir = emit("fn main(): i32 {\n    syscall1(60, 0)\n    return 0\n}");
+    assert!(
+        ir.contains("call i64 asm sideeffect \"syscall\""),
+        "syscall は inline asm へ展開されるはず\n{ir}"
+    );
+    assert!(ir.contains("={rax},{rax},{rdi}"), "番号=rax・引数=rdi の制約を出すはず\n{ir}");
+    assert!(ir.contains("~{rcx},~{r11},~{memory}"), "clobber を出すはず\n{ir}");
+    assert!(!ir.contains("declare") || !ir.contains("@syscall1"), "syscall の declare は出さないはず\n{ir}");
+}
+
+#[test]
+fn emits_ptr_as_i64_as_ptrtoint() {
+    // ポインタ裏付けの型（string/RawPtr）→ i64 は ptrtoint（ADR-0011、syscall 引数用）。
+    let ir = emit("fn main(): i32 {\n    let s: string = \"x\"\n    syscall1(0, s as i64)\n    return 0\n}");
+    assert!(ir.contains("ptrtoint ptr"), "string as i64 は ptrtoint になるはず\n{ir}");
+}
+
+#[test]
+fn runs_syscall_exit() {
+    // syscall1(60, code) = Linux の exit(2)。libc の exit を介さずプロセスを終了する。
+    let src = "fn main(): i32 {\n    syscall1(60, 7)\n    return 0\n}";
+    if let Some(code) = run_exit_code(src, "syscall_exit") {
+        assert_eq!(code, 7);
+    }
+}
+
+#[test]
+fn runs_syscall_write_to_stdout() {
+    // syscall3(1, 1, buf, len) = Linux の write(2)。libc の puts を介さず stdout に書く。
+    if !clang_available() {
+        return;
+    }
+    let src = "fn main(): i32 {\n    let msg: string = \"hi\"\n    syscall3(1, 1, msg as i64, 2)\n    return 0\n}";
+    let ir = emit(src);
+    let dir = std::env::temp_dir();
+    let ll = dir.join("iris_cg_syscall_write.ll");
+    let exe = dir.join("iris_cg_syscall_write.bin");
+    std::fs::write(&ll, ir).unwrap();
+    let ok = Command::new("clang").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
+    assert!(ok.status.success(), "clang 失敗:\n{}", String::from_utf8_lossy(&ok.stderr));
+    let out = Command::new(&exe).output().expect("実行");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi");
+    let _ = std::fs::remove_file(&ll);
+    let _ = std::fs::remove_file(&exe);
+}

@@ -833,11 +833,14 @@ impl<'a> Checker<'a> {
         // 参照は暗黙にデリファレンスして指す先の値を変換する。
         let src_inner = src.peel_refs();
         let ok = (src_inner.is_numeric() || src_inner.is_bool()) && dst.is_numeric();
-        if !ok {
+        // ポインタ裏付けの型（`RawPtr`/`string`）→ `i64`（`ptrtoint`）。syscall 引数で
+        // ポインタを整数として渡すために使う（ADR-0011）。
+        let ptr_to_int = self.is_rawptr_like(src_inner) && dst == Ty::named("i64");
+        if !ok && !ptr_to_int {
             self.error(
                 span,
                 format!(
-                    "`{}` から `{}` への `as` 変換は未対応です（数値間・`bool`→数値のみ）",
+                    "`{}` から `{}` への `as` 変換は未対応です（数値間・`bool`→数値・ポインタ→`i64`のみ）",
                     src.describe(),
                     dst.describe()
                 ),
@@ -1239,6 +1242,35 @@ impl<'a> Checker<'a> {
                         );
                     }
                     return Ty::named("bool");
+                }
+                // 汎用 syscall 原語 `syscallN`（ADR-0011）: 番号＋N 個の引数（すべて i64）を
+                // 取り、i64 を返す。codegen が x86-64 Linux の inline asm へ展開する。
+                if let Some(arity) = syscall_arity(name) {
+                    let expected = arity + 1; // 番号 + N 引数
+                    if args.len() != expected {
+                        self.error(
+                            call_span,
+                            format!(
+                                "`{name}` の引数は {expected} 個（番号＋{arity} 引数）ですが {} 個渡されました",
+                                args.len()
+                            ),
+                        );
+                    } else {
+                        let i64t = Ty::named("i64");
+                        for (i, a) in args.iter().enumerate() {
+                            let at = &arg_tys[i];
+                            if !matches!(at, Ty::Error) && !self.assignable(&i64t, at) {
+                                self.error(
+                                    a.span,
+                                    format!(
+                                        "`{name}` の引数は `i64` でなければなりません（`{}`）。`as i64` で変換してください",
+                                        at.describe()
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    return Ty::named("i64");
                 }
                 if let Some((enum_name, tag, payload_ty, generics)) = self.variant_owners.get(name).cloned() {
                     // ジェネリック enum はペイロード引数から型パラメータを推論する。
@@ -2290,6 +2322,14 @@ fn lower_type_def(t: &TypeDef) -> TyDef {
 
 /// プレリュードの Option/Result コンストラクタ名を (enum名, タグ, ペイロード有無) に対応づける。
 /// codegen のバリアント構築記録に使う。タグは codegen の `StructReg.enum_layouts` と一致させる。
+/// `syscallN`（N=0..6）なら syscall 引数の個数 N を返す（ADR-0011）。
+/// 組み込みの汎用 syscall 原語の判定に typeck / codegen で共用する。
+pub(crate) fn syscall_arity(name: &str) -> Option<usize> {
+    name.strip_prefix("syscall")
+        .and_then(|n| n.parse::<usize>().ok())
+        .filter(|&n| n <= 6)
+}
+
 fn prelude_variant(name: &str) -> Option<(&'static str, usize, bool)> {
     match name {
         "None" => Some(("Option", 0, false)),

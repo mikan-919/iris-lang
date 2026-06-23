@@ -34,6 +34,7 @@ use crate::ast::{
 };
 use crate::sema::resolve::{DefId, Resolution};
 use crate::sema::ty::Ty;
+use crate::sema::typeck::syscall_arity;
 use crate::span::Span;
 
 /// コード生成エラー。
@@ -2133,6 +2134,13 @@ impl<'a> FnCodegen<'a> {
         if src_ll == dst_ll {
             return Ok(v);
         }
+        // ポインタ（`RawPtr`/`string`）→ 整数。`ptrtoint`（ADR-0011、syscall 引数用）。
+        // num_kind/int_width は "ptr" を扱えないため、数値変換の分岐より先に処理する。
+        if src_ll == "ptr" && !is_float_ll(&dst_ll) {
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = ptrtoint ptr {v} to {dst_ll}"));
+            return Ok(r);
+        }
         let src_kind = num_kind(&src_ty);
         let dst_kind = num_kind(dst_ty);
         let r = self.fresh_tmp();
@@ -2709,6 +2717,29 @@ impl<'a> FnCodegen<'a> {
             }
             let r = self.fresh_tmp();
             self.emit(&format!("{r} = icmp eq ptr {v}, null"));
+            return Ok(r);
+        }
+        // 汎用 syscall 原語 `syscallN`（ADR-0011）: x86-64 Linux の規約に従う inline asm へ
+        // 展開する。番号を rax、引数を rdi/rsi/rdx/r10/r8/r9 へ置き、`syscall` 命令を吐く。
+        // clobber は rcx/r11/memory。`declare` は出さない。
+        if let Some(arity) = syscall_arity(name) {
+            let i64t = Ty::named("i64");
+            let arg_regs = ["rdi", "rsi", "rdx", "r10", "r8", "r9"];
+            // 番号（rax は入力かつ出力）。
+            let (numv, _) = self.gen_value(&args[0], &i64t)?;
+            let mut operands = vec![format!("i64 {numv}")];
+            let mut constraints = String::from("={rax},{rax}");
+            for k in 0..arity {
+                let (v, _) = self.gen_value(&args[k + 1], &i64t)?;
+                operands.push(format!("i64 {v}"));
+                constraints.push_str(&format!(",{{{}}}", arg_regs[k]));
+            }
+            constraints.push_str(",~{rcx},~{r11},~{memory}");
+            let r = self.fresh_tmp();
+            self.emit(&format!(
+                "{r} = call i64 asm sideeffect \"syscall\", \"{constraints}\" ({})",
+                operands.join(", ")
+            ));
             return Ok(r);
         }
         // 関数のシグネチャから引数型・戻り値型を引く。

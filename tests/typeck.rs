@@ -378,3 +378,38 @@ fn rejects_is_null_on_non_pointer() {
     let errs = typecheck("fn f(): bool {\n    is_null(5)\n}").unwrap_err();
     assert!(errs.iter().any(|m| m.contains("is_null")), "got: {errs:?}");
 }
+
+#[test]
+fn accepts_ptr_as_i64() {
+    // ポインタ裏付けの型（RawPtr/string）→ i64 の `as` 変換（ADR-0011、syscall 引数用）。
+    typecheck("fn f(p: RawPtr): i64 {\n    let s: string = \"x\"\n    let a: i64 = s as i64\n    p as i64\n}")
+        .expect("string/RawPtr → i64 の `as` は通るはず");
+}
+
+#[test]
+fn rejects_ptr_as_i32() {
+    // ポインタ→整数は i64（ポインタ幅）のみ許可。i32 への変換は拒否する。
+    let errs = typecheck("fn f(): i32 {\n    let s: string = \"x\"\n    s as i32\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("`as` 変換は未対応")), "got: {errs:?}");
+}
+
+#[test]
+fn accepts_syscall_with_i64_args() {
+    // syscallN は番号＋N 引数（すべて i64）を取り i64 を返す（ADR-0011）。
+    typecheck("fn f(): i64 {\n    syscall1(60, 0)\n    syscall3(1, 1 as i64, 2 as i64, 3)\n}")
+        .expect("i64 引数の syscall は通るはず");
+}
+
+#[test]
+fn rejects_syscall_wrong_arity() {
+    // syscall1 は番号＋1 引数＝計 2 個。個数違いは拒否する。
+    let errs = typecheck("fn f(): i64 {\n    syscall1(60)\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("syscall1")), "got: {errs:?}");
+}
+
+#[test]
+fn rejects_syscall_non_i64_arg() {
+    // syscall 引数は i64 でなければならない（i32 値は `as i64` が必要）。
+    let errs = typecheck("fn f(n: i32): i64 {\n    syscall1(60, n)\n}").unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("`i64`")), "got: {errs:?}");
+}

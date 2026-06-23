@@ -28,8 +28,12 @@ pub enum DefKind {
 }
 
 /// プレリュードとして常に利用できる組み込みの値名。
-/// Result/Option のコンストラクタ。型定義の実装後に整理する。
-const PRELUDE: &[&str] = &["Ok", "Err", "Some", "None", "is_null"];
+/// Result/Option のコンストラクタ・組み込み述語 `is_null`・汎用 syscall 原語
+/// `syscall0`〜`syscall6`（ADR-0011）。型定義の実装後に整理する。
+const PRELUDE: &[&str] = &[
+    "Ok", "Err", "Some", "None", "is_null", //
+    "syscall0", "syscall1", "syscall2", "syscall3", "syscall4", "syscall5", "syscall6",
+];
 
 /// 名前の定義 1 件。
 #[derive(Debug, Clone)]
