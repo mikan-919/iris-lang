@@ -830,6 +830,10 @@ impl<'a> Checker<'a> {
         if matches!(src, Ty::Error) || matches!(dst, Ty::Error) {
             return dst;
         }
+        // 参照 → i64: 参照のアドレスそのものを整数として取り出す（ptrtoint）。
+        // syscall 引数にスタック変数のアドレスを渡す場面（putchar 等）で使う。
+        // peel_refs の前に判定する（peel 後は Ref でなくなる）。
+        let ref_to_int = matches!(&src, Ty::Ref { .. }) && dst == Ty::named("i64");
         // 参照は暗黙にデリファレンスして指す先の値を変換する。
         let src_inner = src.peel_refs();
         let ok = (src_inner.is_numeric() || src_inner.is_bool()) && dst.is_numeric();
@@ -842,11 +846,11 @@ impl<'a> Checker<'a> {
         // ポインタ同士の変換（`RawPtr` ↔ `string`）。LLVM 上はいずれも `ptr` で表現され
         // 変換は no-op。malloc の戻り値を文字列バッファとして使う場面等で必要。
         let ptr_to_ptr = self.is_rawptr_like(src_inner) && self.is_rawptr_like(&dst);
-        if !ok && !ptr_to_int && !int_to_ptr && !ptr_to_ptr {
+        if !ok && !ref_to_int && !ptr_to_int && !int_to_ptr && !ptr_to_ptr {
             self.error(
                 span,
                 format!(
-                    "`{}` から `{}` への `as` 変換は未対応です（数値間・`bool`→数値・`i64`↔ポインタ・ポインタ間のみ）",
+                    "`{}` から `{}` への `as` 変換は未対応です（数値間・`bool`→数値・`i64`↔ポインタ・参照→`i64`・ポインタ間のみ）",
                     src.describe(),
                     dst.describe()
                 ),
@@ -1449,6 +1453,43 @@ impl<'a> Checker<'a> {
             }
             return Ty::Infer;
         };
+
+        // Vec 組み込みメソッド（ジェネリック型なので通常の method_defs には登録されない）。
+        if ty_name == "Vec" && ty_args.len() == 1 {
+            let elem_ty = ty_args[0].clone();
+            match method {
+                "len" => {
+                    if !args.is_empty() {
+                        self.error(span, "`Vec.len` は引数を取りません".to_string());
+                    }
+                    return Ty::named("i64");
+                }
+                "push" => {
+                    if args.len() != 1 {
+                        self.error(
+                            span,
+                            format!(
+                                "`Vec.push` には要素を 1 個渡してください（{} 個渡されました）",
+                                args.len()
+                            ),
+                        );
+                        return Ty::unit();
+                    }
+                    if !self.assignable(&elem_ty, &arg_tys[0]) {
+                        self.error(
+                            span,
+                            format!(
+                                "`Vec.push` に `{}` を渡しましたが、この Vec の要素型は `{}` です",
+                                arg_tys[0].describe(),
+                                elem_ty.describe()
+                            ),
+                        );
+                    }
+                    return Ty::unit();
+                }
+                _ => {}
+            }
+        }
 
         // 提供元を集める。label は曖昧時の表示と `#` 修飾子の一致に使う。
         let recv = Ty::Named { name: ty_name.clone(), args: ty_args };

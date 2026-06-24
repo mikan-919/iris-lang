@@ -1,12 +1,21 @@
 // 最小の標準ライブラリ（iris 自身で記述）。
-// 各プログラムの先頭に自動で前置される。I/O は C の putchar / puts を extern で借りる。
+// 各プログラムの先頭に自動で前置される。
 // 現状のコード生成は i32 / bool / string（NUL 終端）に対応する範囲で書く。
 
-// C の putchar（1 文字出力）。返り値は書き込んだ文字。
-extern fn putchar(c: i32): i32
+// 1 文字（i32 の LSB）を stdout へ書き出す。write syscall（nr=1, fd=1, buf=&c, len=1）。
+// x86-64 リトルエンディアンでは &c の指すバイトが LSB = ASCII 値（libc 不要）。
+fn putchar(c: i32): i32 {
+    syscall3(1, 1 as i64, &c as i64, 1)
+    return c
+}
 
-// C の puts（NUL 終端文字列を出力し、末尾に改行を付ける）。返り値は非負なら成功。
-extern fn puts(s: string): i32
+// NUL 終端文字列を stdout へ書き出し、末尾に改行を付ける。write syscall（nr=1, fd=1）。
+fn puts(s: string): i32 {
+    let n = strlen(s) as i64
+    syscall3(1, 1 as i64, s as i64, n)
+    syscall3(1, 1 as i64, "\n" as i64, 1)
+    return n as i32
+}
 
 // C の strcmp（NUL 終端文字列を比較。等しければ 0）。match の文字列パターン比較に使う。
 extern fn strcmp(a: string, b: string): i32

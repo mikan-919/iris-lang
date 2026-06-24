@@ -1,64 +1,184 @@
-## Hello World コンパイル時の関数呼び出しグラフ
+# Hello World の経路追跡
 
-`examples/hello.iris` をコンパイルする際の実行パス。未定義・未呼び出しの関数は省略。
+```iris
+fn main() {
+    puts("hello")
+}
+```
 
-```mermaid
-callGraph
-    main["main()\nデフォルト動作: AST表示"]
-    dump_ast["dump_ast()\nASTを標準出力へ表示"]
-    compile["compile()\n全パイプラインを直列実行"]
-    analyze["analyze()\n解析パイプラインの起点\n(全段を呼び出し)]
+このプログラムが実行ファイルになるまでに通過する関数と生成されるデータを段ごとに示す。
 
-    lexer["lexer::lex()\nnom 8 + nom_locate\nトークン列を生成"]
-    parser["parser::parse()\nnom による構文解析\nASTを生成"]
+---
 
-    resolve["sema::resolve()\nスコープ構築・使用→定義対応"]
-    typeck["sema::typeck::check()\n式に型を付与・互換性検査"]
+## 1. ソース入力（`main.rs::build()`）
 
-    own_check["sema::ownership::check()\n所有権三層検査"]
-    check_cycles["typegraph::check_cycles()\n型レベルの所有グラフ＋\n循環検出(DFS)"]
-    flow_check["flow::check_functions()\n全関数の値レベルの\nムーブ/借用グラフ検査"]
-    borrows_check["borrows::check_borrows()\n&mut排他/&複数可の\n借用競合検査"]
+| 項目 | 内容 |
+|---|---|
+| 入力データ | ファイルパス `hello.iris` |
+| 出力データ | `src: String`（ファイル内容）|
+| 通過関数 | `std::fs::read_to_string()` |
+| 生成されるもの | `"fn main() {\n    puts(\"hello\")\n}"` |
 
-    emit["codegen::emit_module()\nLLVM IRテキスト生成\nのオーケストレーター"]
-    struct_reg["StructReg::build()\nstructレイアウト・enum\nレイアウト・別名を収集"]
-    emit_fn["FnCodegen::emit_function()\n関数1つ分のLLVM IRを\n生成"]
-    gen_stmt["FnCodegen::gen_stmt()\n文をLLVM IRに\n変換"]
-    gen_expr["FnCodegen::gen_expr()\n式をLLVM IRに\n変換"]
+---
 
-    llvm_ty["llvm_ty()\n内部型TyをLLVM型へ\n変換"]
-    subst_ty["subst_ty()\n型パラメータを具体型へ\n置換(単相化)"]
-    mono_symbol["mono_symbol()\nジェネリックの単相化\n記号を生成"]
+## 2. プレリュード前置（`lib.rs::analyze()`）
 
-    flow_run["Flow::run_function()\n関数1つ分の所有権\nフロー解析"]
-    flow_walk["Flow::walk_stmts/exprs()\nASTを再帰走査し\nムーブ/借用を検査"]
+| 項目 | 内容 |
+|---|---|
+| 入力データ | `src: &str` |
+| 出力データ | `combined: String` |
+| 通過関数 | `analyze()` 先頭で `format!("{PRELUDE}\n{src}")` |
+| 生成されるもの | `extern fn puts(s: string): i32\n…fn main() { puts("hello") }` |
 
-    main --> dump_ast
-    dump_ast --> compile
-    compile --> analyze
+`PRELUDE` は `std/prelude.iris` のインライン文字列（`include_str!` で埋め込み）。
 
-    analyze --> lexer
-    analyze --> parser
-    analyze --> resolve
-    analyze --> typeck
-    analyze --> own_check
-    analyze --> emit
+---
 
-    own_check --> check_cycles
-    own_check --> flow_check
-    own_check --> borrows_check
+## 3. 字句解析（`lexer::lex()`）
 
-    emit --> struct_reg
-    emit --> emit_fn
+| 項目 | 内容 |
+|---|---|
+| 入力データ | `combined_src: &str` |
+| 出力データ | `Vec<Token>` |
+| 通過関数 | `lex()` → `skip_trivia()` → `next_token()` の繰り返し |
+| 生成されるもの | `[Ident("extern"), Kw("fn"), Ident("puts"), …, Ident("main"), LBrace, Ident("puts"), LParen, Str("hello"), RParen, Newline, RBrace, Eof]` |
 
-    emit_fn --> gen_stmt
-    emit_fn --> gen_expr
-    gen_stmt --> gen_expr
+`"hello"` は `TokenKind::Str` として span 付きでトークン化される。
 
-    gen_expr --> llvm_ty
-    gen_expr --> subst_ty
-    gen_expr --> mono_symbol
+---
 
-    flow_check --> flow_run
-    flow_run --> flow_walk
+## 4. 構文解析（`parser::parse()`）
+
+| 項目 | 内容 |
+|---|---|
+| 入力データ | `&[Token]` |
+| 出力データ | `Program { items: Vec<Item> }` |
+| 通過関数 | `parse()` → `parse_item()` × N → `parse_function()` → `parse_block()` → `parse_stmt()` → `parse_expr()` |
+| 生成されるもの | `Program { items: [Function(extern puts), …, Function(main)] }` |
+
+`puts("hello")` は `Stmt::Expr(Expr { kind: ExprKind::Call { callee: Ident("puts"), args: [Str("hello")] } })` になる。
+
+---
+
+## 5. モジュール読み込み（`lib.rs::analyze()`）
+
+`use` 宣言がないため `ModuleLoader` は何もしない。`prepend_items` は空。
+
+---
+
+## 6. 名前解決（`sema::resolve()`）
+
+| 項目 | 内容 |
+|---|---|
+| 入力データ | `&Program`, `module_namespaces: HashMap` |
+| 出力データ | `Resolution` |
+| 通過関数 | `resolve()` → `Resolver` がトップレベル関数名を収集 → `main` の本体を走査 |
+| 生成されるもの | `Resolution { defs: [Def { name:"puts", kind:Function }, Def { name:"main", kind:Function }], uses: { span_of("puts" in call) → DefId(0) } }` |
+
+`puts` の callee span が `uses` で `DefId(0)` （puts の定義）に結びつく。
+
+---
+
+## 7. 型検査（`sema::check()`）
+
+| 項目 | 内容 |
+|---|---|
+| 入力データ | `&Program`, `&Resolution` |
+| 出力データ | `TypeInfo` |
+| 通過関数 | `check()` → `check_function(&main)` → `check_block()` → `check_stmt()` → `check_expr()` → `infer_expr()` → `infer_call()` |
+| 生成されるもの | `TypeInfo { expr_types: { span_of_call → Ty::Named("i32"), span_of_str → Ty::Named("string"), … } }` |
+
+`puts` は `extern fn puts(s: string): i32` なので、
+`infer_call()` が `check_func_call("puts", …)` を呼び引数 `string` を確認。
+戻り値型 `i32` を call 式の span に記録する。
+
+---
+
+## 8. 所有権検査（`sema::check_ownership()`）
+
+| 項目 | 内容 |
+|---|---|
+| 入力データ | `&Program`, `&Resolution`, `&TypeInfo` |
+| 出力データ | `()` |
+| 通過関数 | `check_ownership()` → `check_cycles()` → `check_functions()` → `check_borrows()` |
+| 生成されるもの | エラーなし（`string` リテラルはムーブなし、型定義の循環もなし） |
+
+`"hello"` は文字列リテラルであり `Copy` 扱い。ムーブも借用も発生しない。
+
+---
+
+## 9. コード生成（`codegen::emit_module()`）
+
+| 項目 | 内容 |
+|---|---|
+| 入力データ | `&Program`, `&Resolution`, `&TypeInfo` |
+| 出力データ | `String`（LLVM IR テキスト） |
+| 通過関数 | `emit_module()` → `StructReg::build()` → `emit_function(&main)` → `gen_stmt()` → `gen_expr()` → `gen_call()` |
+
+### 生成される LLVM IR の概要
+
+```llvm
+; 文字列グローバル
+@.str.0 = private unnamed_addr constant [6 x i8] c"hello\00"
+
+; extern 宣言（prelude から）
+declare i32 @puts(ptr)
+
+; @_start エントリポイント（iris が自前生成）
+define void @_start() {
+entry:
+  call void @main()
+  ; exit syscall
+}
+
+; main 関数
+define void @main() {
+entry:
+  %t0 = call i32 @puts(ptr @.str.0)
+  ret void
+}
+```
+
+`gen_expr()` が `ExprKind::Str("hello")` を受け取り `strings.intern("hello")` を呼んで
+`@.str.0` というグローバル記号を返す。`gen_call()` が `call i32 @puts(ptr @.str.0)` を emit する。
+
+---
+
+## 10. clang リンク（`main.rs::build()`）
+
+| 項目 | 内容 |
+|---|---|
+| 入力データ | IR テキスト（`String`） |
+| 出力データ | 実行ファイル（ELF バイナリ） |
+| 通過関数 | `std::fs::write(&ll, &ir)` → `Command::new("clang").arg("-O0").arg("-nostartfiles").arg(&ll).arg("-o").arg(&exe)` |
+| 生成されるもの | `./hello`（実行可能 ELF） |
+
+```
+$ ./hello
+hello
+```
+
+`-nostartfiles` で CRT を除外し、iris が自前生成した `@_start` がエントリポイントになる。
+
+---
+
+## 全体サマリ
+
+```
+hello.iris (ソース)
+  ↓ analyze(): プレリュード前置
+  ↓ lexer::lex()
+Vec<Token>（"hello" → TokenKind::Str）
+  ↓ parser::parse()
+Program（Stmt::Expr(Call{ callee:puts, args:[Str("hello")] })）
+  ↓ sema::resolve()
+Resolution（puts の使用 → extern fn puts の定義）
+  ↓ sema::check()
+TypeInfo（call 式 → Ty::i32、"hello" → Ty::string）
+  ↓ sema::check_ownership()
+() エラーなし
+  ↓ codegen::emit_module()
+LLVM IR テキスト（@.str.0 + declare puts + define main）
+  ↓ clang -O0 -nostartfiles
+ELF 実行ファイル
 ```

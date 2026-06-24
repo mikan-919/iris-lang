@@ -25,7 +25,16 @@ pub struct LexError {
 
 /// ソース文字列をトークン列に変換する。末尾には必ず `Eof` を付与する。
 pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
-    let mut input = LSpan::new(src);
+    lex_at(src, 0)
+}
+
+/// `base_offset` を先頭オフセットとしてトークン列に変換する。
+///
+/// モジュールソースを combined ソースと異なるオフセット空間で解析することで、
+/// span の衝突（`types: HashMap<Span, Ty>` のコリジョン）を防ぐ。
+pub fn lex_at(src: &str, base_offset: usize) -> Result<Vec<Token>, LexError> {
+    // SAFETY: base_offset は byte 単位の正しいオフセット。fragment は有効な UTF-8。
+    let mut input = unsafe { LSpan::new_from_raw_offset(base_offset, 1, src, ()) };
     let mut tokens = Vec::new();
 
     loop {
@@ -50,7 +59,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
         }
     }
 
-    let eof_span = Span::new(src.len(), 0);
+    let eof_span = Span::new(base_offset + src.len(), 0);
     tokens.push(Token::new(TokenKind::Eof, eof_span));
     Ok(tokens)
 }

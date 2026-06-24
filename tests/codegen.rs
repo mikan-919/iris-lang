@@ -75,8 +75,9 @@ fn emits_string_literal_as_global() {
     // 文字列リテラルは NUL 終端のグローバル定数になり、値は `ptr` として返る。
     let ir = emit("fn greet(): string {\n    return \"hi\"\n}");
     assert!(ir.contains("define ptr @greet()"));
-    assert!(ir.contains(r#"@.str.0 = private unnamed_addr constant [3 x i8] c"hi\00""#));
-    assert!(ir.contains("ret ptr @.str.0"));
+    // prelude の puts が "\n" で @.str.0 を使うため、"hi" は @.str.1 になる。
+    assert!(ir.contains(r#"[3 x i8] c"hi\00""#));
+    assert!(ir.contains("ret ptr @.str."));
 }
 
 #[test]
@@ -723,6 +724,75 @@ fn runs_index_with_variable_subscript() {
     }
 }
 
+// ---- Vec.len() / Vec.push() --------------------------------------------------
+
+#[test]
+fn runs_vec_len() {
+    // Vec<T>.len() は len フィールド（i64）を返す。
+    let src = "fn main(): i32 {\n    let v: Vec<i32> = [10, 20, 30]\n    return v.len() as i32\n}";
+    if let Some(code) = run_exit_code(src, "vec_len") {
+        assert_eq!(code, 3);
+    }
+}
+
+#[test]
+fn runs_vec_len_empty() {
+    // 空 Vec の len は 0。
+    let src = "fn main(): i32 {\n    let v: Vec<i32> = []\n    return v.len() as i32\n}";
+    if let Some(code) = run_exit_code(src, "vec_len_empty") {
+        assert_eq!(code, 0);
+    }
+}
+
+#[test]
+fn runs_vec_push_basic() {
+    // push で要素を追加し、添字でアクセスする。
+    let src = "\
+fn main(): i32 {\n\
+    let mut v: Vec<i32> = []\n\
+    v.push(11)\n\
+    v.push(22)\n\
+    v.push(33)\n\
+    return v[0] + v[1] + v[2]\n\
+}";
+    if let Some(code) = run_exit_code(src, "vec_push_basic") {
+        assert_eq!(code, 66);
+    }
+}
+
+#[test]
+fn runs_vec_push_many() {
+    // push を繰り返して容量拡張（再確保）が起きても正しい値になる。
+    let src = "\
+fn main(): i32 {\n\
+    let mut v: Vec<i32> = []\n\
+    let mut i = 0\n\
+    while i < 10 {\n\
+        v.push(i)\n\
+        i = i + 1\n\
+    }\n\
+    return v[9]\n\
+}";
+    if let Some(code) = run_exit_code(src, "vec_push_many") {
+        assert_eq!(code, 9);
+    }
+}
+
+#[test]
+fn runs_vec_push_then_len() {
+    // push 後に len が正しく増える。
+    let src = "\
+fn main(): i32 {\n\
+    let mut v: Vec<i32> = [1, 2]\n\
+    v.push(3)\n\
+    v.push(4)\n\
+    return v.len() as i32\n\
+}";
+    if let Some(code) = run_exit_code(src, "vec_push_then_len") {
+        assert_eq!(code, 4);
+    }
+}
+
 // ---- 所有権ベースの解放（Vec のドロップ） ----------------------------------
 
 #[test]
@@ -955,11 +1025,13 @@ fn runs_syscall_write_to_stdout() {
 
 #[test]
 fn emits_start_entrypoint_for_main() {
-    // ADR-0012 ⑤: fn main があるとき @_start と libc exit() 宣言が生成される。
+    // ADR-0011/0012 ⑤: fn main があるとき @_start が生成され、syscall 60 で exit する。
+    // libc exit() の代わりにインライン syscall asm を使う（libc 非依存）。
     let ir = emit("fn main(): i32 { return 0 }");
     assert!(ir.contains("define void @_start() noreturn"), "@_start が生成されるはず\n{ir}");
-    assert!(ir.contains("declare void @exit(i32) noreturn"), "libc exit の declare が生成されるはず\n{ir}");
-    assert!(ir.contains("call void @exit(i32 %ret)"), "@main の戻り値を exit に渡すはず\n{ir}");
+    assert!(!ir.contains("declare void @exit(i32)"), "libc exit の declare は出ないはず\n{ir}");
+    assert!(ir.contains("sideeffect \"syscall\""), "インライン syscall が生成されるはず\n{ir}");
+    assert!(ir.contains("i64 60"), "exit syscall 番号 60 が含まれるはず\n{ir}");
     // main を持たないモジュールには @_start は出ない。
     let ir2 = emit("fn f(x: i32): i32 { return x }");
     assert!(!ir2.contains("@_start"), "main なしモジュールには @_start が出ないはず\n{ir2}");

@@ -773,40 +773,57 @@ pub fn emit_module(
 
     // `fn main` がある場合、OS エントリポイント `@_start` を生成する（ADR-0012 ⑤）。
     // `-nostartfiles` でリンクするため crt0.o は含まれず、`_start` は自前で提供する。
-    // libc の `exit()` を呼ぶことで stdio バッファをフラッシュしてから終了する
-    // （prelude の puts/putchar はバッファリングされているため、raw syscall 60 では消える）。
-    // I/O が全て write syscall に移行したら raw syscall へ切り替え可能。
+    // puts/putchar が write syscall（unbuffered）になったため、stdio フラッシュが不要になり
+    // raw exit syscall 60 で安全に終了できる（ADR-0011 実装順③）。
     if let Some(main_fn) = func_table.get("main") {
         let main_ret_ll = main_fn
             .ret
             .as_ref()
             .and_then(|t| llvm_ty(&Ty::from_ast(t), &structs).ok())
             .unwrap_or_else(|| "void".to_string());
-        // `exit` が既に iris 側で定義されている（std.os 等）場合は declare を出さない。
-        // 未定義の場合は libc の `exit()` を declare して呼ぶ（stdio バッファをフラッシュ）。
-        let exit_decl = if func_table.contains_key("exit") {
-            String::new()
-        } else {
-            "declare void @exit(i32) noreturn\n".to_string()
-        };
-        let start_body = if main_ret_ll == "i32" {
+        // exit syscall 60 の inline asm（libc exit と違い stdio バッファに依存しない）。
+        let exit_syscall_asm =
+            "call i64 asm sideeffect \"syscall\", \
+             \"={rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 %ec)";
+        let start_body = if func_table.contains_key("exit") {
+            // iris 側に `exit` が定義済み（std.os 等）: そちらへ委譲する。
+            if main_ret_ll == "i32" {
+                format!(
+                    "define void @_start() noreturn {{\n\
+                     entry:\n\
+                     \x20 %ret = call i32 @main()\n\
+                     \x20 call void @exit(i32 %ret)\n\
+                     \x20 unreachable\n\
+                     }}"
+                )
+            } else {
+                format!(
+                    "define void @_start() noreturn {{\n\
+                     entry:\n\
+                     \x20 call void @main()\n\
+                     \x20 call void @exit(i32 0)\n\
+                     \x20 unreachable\n\
+                     }}"
+                )
+            }
+        } else if main_ret_ll == "i32" {
+            // iris `exit` 未定義: exit syscall 60 を直接 inline asm で呼ぶ。
             format!(
-                "{exit_decl}\
-                 define void @_start() noreturn {{\n\
+                "define void @_start() noreturn {{\n\
                  entry:\n\
                  \x20 %ret = call i32 @main()\n\
-                 \x20 call void @exit(i32 %ret)\n\
+                 \x20 %ec = sext i32 %ret to i64\n\
+                 \x20 {exit_syscall_asm}\n\
                  \x20 unreachable\n\
                  }}"
             )
         } else {
-            // void / その他: 終了コード 0 で抜ける。
             format!(
-                "{exit_decl}\
-                 define void @_start() noreturn {{\n\
+                "define void @_start() noreturn {{\n\
                  entry:\n\
                  \x20 call void @main()\n\
-                 \x20 call void @exit(i32 0)\n\
+                 \x20 %ec = add i64 0, 0\n\
+                 \x20 {exit_syscall_asm}\n\
                  \x20 unreachable\n\
                  }}"
             )
@@ -2194,8 +2211,17 @@ impl<'a> FnCodegen<'a> {
     /// LLVM 表現に応じて適切な変換命令を選ぶ（数値↔数値・`bool`→数値のみ。typeck が
     /// 検証済み）。LLVM 表現が同一（`i32`→`u32` 等、符号は型に出ない）なら無変換。
     fn gen_cast(&mut self, inner: &Expr, dst_ty: &Ty, span: Span) -> Result<String, CodegenError> {
+        // 参照 → i64: アドレスを整数として取り出す（ptrtoint）。
+        // gen_value に Ref 型を渡すと deref しないため、alloca のポインタがそのまま得られる。
+        let orig_src_ty = self.iris_ty(inner).clone();
+        if matches!(&orig_src_ty, Ty::Ref { .. }) && dst_ty == &Ty::named("i64") {
+            let (v, _) = self.gen_value(inner, &orig_src_ty)?;
+            let r = self.fresh_tmp();
+            self.emit(&format!("{r} = ptrtoint ptr {v} to i64"));
+            return Ok(r);
+        }
         // 参照は暗黙にデリファレンスして指す先の値を変換する。
-        let src_ty = self.iris_ty(inner).peel_refs().clone();
+        let src_ty = orig_src_ty.peel_refs().clone();
         let (v, src_ll) = self.gen_value(inner, &src_ty)?;
         let dst_ll = llvm_ty(dst_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
         if src_ll == dst_ll {
@@ -2323,22 +2349,28 @@ impl<'a> FnCodegen<'a> {
         let n = elems.len();
 
         if is_vec {
-            // sizeof(T) = ptrtoint (getelementptr T, null, 1)。要素数を掛けて確保サイズを算出。
-            let szp = self.fresh_tmp();
-            self.emit(&format!("{szp} = getelementptr {ellty}, ptr null, i64 1"));
-            let sz = self.fresh_tmp();
-            self.emit(&format!("{sz} = ptrtoint ptr {szp} to i64"));
-            let total = self.fresh_tmp();
-            self.emit(&format!("{total} = mul i64 {sz}, {n}"));
-            // `@__iris_alloc` で mmap ベースに確保する（ADR-0012 ④ 静的差替）。
-            let buf = self.fresh_tmp();
-            self.emit(&format!("{buf} = call ptr @__iris_alloc(i64 {total})"));
-            for (i, e) in elems.iter().enumerate() {
-                let (v, _) = self.gen_value(e, &elem_ty)?;
-                let p = self.fresh_tmp();
-                self.emit(&format!("{p} = getelementptr {ellty}, ptr {buf}, i64 {i}"));
-                self.emit(&format!("store {ellty} {v}, ptr {p}"));
-            }
+            // 空リテラル `[]` は alloc しない（mmap 0 は EINVAL）。push 時に初回確保する。
+            let buf = if n == 0 {
+                "null".to_string()
+            } else {
+                // sizeof(T) = ptrtoint (getelementptr T, null, 1)。要素数を掛けて確保サイズを算出。
+                let szp = self.fresh_tmp();
+                self.emit(&format!("{szp} = getelementptr {ellty}, ptr null, i64 1"));
+                let sz = self.fresh_tmp();
+                self.emit(&format!("{sz} = ptrtoint ptr {szp} to i64"));
+                let total = self.fresh_tmp();
+                self.emit(&format!("{total} = mul i64 {sz}, {n}"));
+                // `@__iris_alloc` で mmap ベースに確保する（ADR-0012 ④ 静的差替）。
+                let b = self.fresh_tmp();
+                self.emit(&format!("{b} = call ptr @__iris_alloc(i64 {total})"));
+                for (i, e) in elems.iter().enumerate() {
+                    let (v, _) = self.gen_value(e, &elem_ty)?;
+                    let p = self.fresh_tmp();
+                    self.emit(&format!("{p} = getelementptr {ellty}, ptr {b}, i64 {i}"));
+                    self.emit(&format!("store {ellty} {v}, ptr {p}"));
+                }
+                b
+            };
             // %Vec { buf, len, cap, alloc } を組み立てる。alloc = null（グローバル直呼び）。
             let v0 = self.fresh_tmp();
             self.emit(&format!("{v0} = insertvalue %Vec undef, ptr {buf}, 0"));
@@ -2878,6 +2910,16 @@ impl<'a> FnCodegen<'a> {
         span: Span,
     ) -> Result<String, CodegenError> {
         let recv_ty = self.raw_ty(object).defaulted();
+
+        // Vec 組み込みメソッド（Vec<T> はジェネリックで struct_name_of が None を返す）。
+        if let Some(elem_ty) = vec_elem_ty(&recv_ty) {
+            match method {
+                "len" => return self.gen_vec_len(object, span),
+                "push" => return self.gen_vec_push(object, args, span, &elem_ty),
+                _ => {}
+            }
+        }
+
         let ty_name = struct_name_of(&recv_ty)
             .ok_or_else(|| CodegenError::new(span, "メソッド呼び出しの受け手が型を持ちません"))?;
 
@@ -2962,6 +3004,115 @@ impl<'a> FnCodegen<'a> {
                 Ok(slot)
             }
         }
+    }
+
+    /// `v.len()` — Vec の len フィールド（index 1）を読んで返す。
+    fn gen_vec_len(&mut self, object: &Expr, _span: Span) -> Result<String, CodegenError> {
+        let recv_ty = self.raw_ty(object).defaulted();
+        let ptr = self.self_pointer(object, &recv_ty)?;
+        let len_fptr = self.fresh_tmp();
+        self.emit(&format!("{len_fptr} = getelementptr %Vec, ptr {ptr}, i64 0, i32 1"));
+        let r = self.fresh_tmp();
+        self.emit(&format!("{r} = load i64, ptr {len_fptr}"));
+        Ok(r)
+    }
+
+    /// `v.push(item)` — Vec に要素を末尾追加する。容量不足なら 2 倍に再確保し
+    /// 古いバッファを `@__iris_free` で解放したあと `@__iris_alloc` で新規確保する。
+    fn gen_vec_push(
+        &mut self,
+        object: &Expr,
+        args: &[Expr],
+        span: Span,
+        elem_ty: &Ty,
+    ) -> Result<String, CodegenError> {
+        if args.len() != 1 {
+            return Err(CodegenError::new(span, "`Vec.push` には要素を 1 個渡してください"));
+        }
+        let elem_ty = elem_ty.clone().defaulted();
+        let ellty = llvm_ty(&elem_ty, self.structs).map_err(|m| CodegenError::new(span, m))?;
+
+        // &mut self ポインタ（Vec 構造体の alloca アドレス）。
+        let recv_ty = self.raw_ty(object).defaulted();
+        let vec_ptr = self.self_pointer(object, &recv_ty)?;
+
+        // Vec のフィールドポインタ（alloca は安定アドレスなので全ブロックで再利用できる）。
+        let data_fptr = self.fresh_tmp();
+        self.emit(&format!("{data_fptr} = getelementptr %Vec, ptr {vec_ptr}, i64 0, i32 0"));
+        let len_fptr = self.fresh_tmp();
+        self.emit(&format!("{len_fptr} = getelementptr %Vec, ptr {vec_ptr}, i64 0, i32 1"));
+        let cap_fptr = self.fresh_tmp();
+        self.emit(&format!("{cap_fptr} = getelementptr %Vec, ptr {vec_ptr}, i64 0, i32 2"));
+
+        let cur_len = self.fresh_tmp();
+        self.emit(&format!("{cur_len} = load i64, ptr {len_fptr}"));
+        let cur_cap = self.fresh_tmp();
+        self.emit(&format!("{cur_cap} = load i64, ptr {cap_fptr}"));
+
+        // sizeof(T) を null GEP trick で算出する。
+        let szp = self.fresh_tmp();
+        self.emit(&format!("{szp} = getelementptr {ellty}, ptr null, i64 1"));
+        let sz = self.fresh_tmp();
+        self.emit(&format!("{sz} = ptrtoint ptr {szp} to i64"));
+
+        // if cur_len == cur_cap → grow block
+        let need_grow = self.fresh_tmp();
+        self.emit(&format!("{need_grow} = icmp eq i64 {cur_len}, {cur_cap}"));
+        let grow_l = self.fresh_label("vec.push.grow");
+        let copy_l = self.fresh_label("vec.push.copy");
+        let skip_copy_l = self.fresh_label("vec.push.skip_copy");
+        let write_l = self.fresh_label("vec.push.write");
+        self.emit(&format!("br i1 {need_grow}, label %{grow_l}, label %{write_l}"));
+
+        // grow: 新しい容量 = max(cur_cap * 2, 4)。既存バッファがあれば memcpy + free。
+        self.emit(&format!("{grow_l}:"));
+        let doubled = self.fresh_tmp();
+        self.emit(&format!("{doubled} = mul i64 {cur_cap}, 2"));
+        let is_zero = self.fresh_tmp();
+        self.emit(&format!("{is_zero} = icmp eq i64 {cur_cap}, 0"));
+        let new_cap = self.fresh_tmp();
+        self.emit(&format!("{new_cap} = select i1 {is_zero}, i64 4, i64 {doubled}"));
+        let new_size = self.fresh_tmp();
+        self.emit(&format!("{new_size} = mul i64 {new_cap}, {sz}"));
+        let new_buf = self.fresh_tmp();
+        self.emit(&format!("{new_buf} = call ptr @__iris_alloc(i64 {new_size})"));
+        let has_old = self.fresh_tmp();
+        self.emit(&format!("{has_old} = icmp ugt i64 {cur_cap}, 0"));
+        self.emit(&format!("br i1 {has_old}, label %{copy_l}, label %{skip_copy_l}"));
+
+        // copy_old: 旧バッファの内容を新バッファへ memcpy し、旧を free する。
+        self.emit(&format!("{copy_l}:"));
+        let old_data = self.fresh_tmp();
+        self.emit(&format!("{old_data} = load ptr, ptr {data_fptr}"));
+        let old_size = self.fresh_tmp();
+        self.emit(&format!("{old_size} = mul i64 {cur_cap}, {sz}"));
+        self.emit(&format!(
+            "call void @llvm.memcpy.p0.p0.i64(ptr {new_buf}, ptr {old_data}, i64 {old_size}, i1 false)"
+        ));
+        self.emit(&format!("call void @__iris_free(ptr {old_data}, i64 {old_size})"));
+        self.emit(&format!("br label %{skip_copy_l}"));
+
+        // skip_copy: Vec の data/cap を更新する。
+        self.emit(&format!("{skip_copy_l}:"));
+        self.emit(&format!("store ptr {new_buf}, ptr {data_fptr}"));
+        self.emit(&format!("store i64 {new_cap}, ptr {cap_fptr}"));
+        self.emit(&format!("br label %{write_l}"));
+
+        // write: 要素を data[cur_len] に格納し len を +1 する。
+        self.emit(&format!("{write_l}:"));
+        let data = self.fresh_tmp();
+        self.emit(&format!("{data} = load ptr, ptr {data_fptr}"));
+        let len_now = self.fresh_tmp();
+        self.emit(&format!("{len_now} = load i64, ptr {len_fptr}"));
+        let elem_ptr = self.fresh_tmp();
+        self.emit(&format!("{elem_ptr} = getelementptr {ellty}, ptr {data}, i64 {len_now}"));
+        let (item_val, item_llty) = self.gen_value(&args[0], &elem_ty)?;
+        self.emit(&format!("store {item_llty} {item_val}, ptr {elem_ptr}"));
+        let new_len = self.fresh_tmp();
+        self.emit(&format!("{new_len} = add i64 {len_now}, 1"));
+        self.emit(&format!("store i64 {new_len}, ptr {len_fptr}"));
+
+        Ok(String::new())
     }
 
     /// 三項（および短絡論理）を基本ブロックで生成する。
@@ -3331,6 +3482,14 @@ fn llvm_ty(ty: &Ty, reg: &StructReg) -> Result<String, String> {
 fn struct_name_of(ty: &Ty) -> Option<String> {
     match ty.peel_refs() {
         Ty::Named { name, args } if args.is_empty() => Some(name.clone()),
+        _ => None,
+    }
+}
+
+/// `Vec<T>` または `&Vec<T>` / `&mut Vec<T>` から要素型 `T` を取り出す。
+fn vec_elem_ty(ty: &Ty) -> Option<Ty> {
+    match ty.peel_refs() {
+        Ty::Named { name, args } if name == "Vec" && args.len() == 1 => Some(args[0].clone()),
         _ => None,
     }
 }

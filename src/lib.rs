@@ -65,7 +65,7 @@ fn analyze(
     let (prepend_items, module_namespaces, mod_errors) = if use_decls.is_empty() {
         (Vec::new(), HashMap::new(), Vec::new())
     } else {
-        let mut loader = module::ModuleLoader::new(base_dir);
+        let mut loader = module::ModuleLoader::new(base_dir, combined.len());
         loader.process_use_decls(&use_decls)
     };
 

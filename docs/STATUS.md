@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-24（ADR-0012 実装順⑤: `-nostartfiles` ＋ 自前 `@_start` 生成）。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-24（ADR-0011 実装順③: `puts`/`putchar` を write syscall へ移行・モジュール span 衝突バグ修正）。
 
 ## パイプライン
 
@@ -242,7 +242,8 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-24（ADR-0012 �
   （`size` = `cap * sizeof(T)` を実行時に計算し munmap に渡す。ドロップフラグに要素 LLVM 型を紐付けて管理）。
   **条件分岐の move も正確に追える**（Rust の動的 drop flag 相当。片方の分岐だけで move された値は実行時にフラグで解放可否が決まる）。
   借用 `&v`・添字 `v[i]`・`for x in v` は move でなく別経路で評価されるためフラグを落とさない（借用後も解放される）。
-  **未対応**: `push`/`len`・スライス・非 Copy 要素。Drop の**スコープ粒度は関数末のみ**（ループ本体・ネストブロック単位の早期解放は未実装＝
+  **実装済み**: `len()`（len フィールドを i64 で返す）・`push(item)`（容量不足時は 2 倍再確保＋旧バッファ `@__iris_free`）。空リテラル `[]` は alloc しない（data=null、push 時に初回確保）。
+  **未対応**: `pop`/スライス・非 Copy 要素。Drop の**スコープ粒度は関数末のみ**（ループ本体・ネストブロック単位の早期解放は未実装＝
   ループ内で確保した Vec は反復ごとに解放されず関数末まで生存＝健全だが反復分リーク）。Vec **引数**（値渡しで受け取った Vec）は
   callee で解放しない（＝リーク。健全）。struct フィールドの Vec の再帰 Drop も未実装（move 元のフラグは落とすので二重解放は無いが struct は解放されない）
 - **enum**: 非ジェネリック・スカラペイロードのジェネリックは `%EnumName = type { i8, i64 }`（i8 = タグ、i64 = ペイロードの記憶域）。**集約ペイロードのジェネリック enum（`Option<Point>` 等）は per-instantiation の `%Enum.Args = type { i8, <記憶域> }`**（ADR-0010）。`StructReg.enum_layouts`（ビルトイン Option/Result ＋ ユーザ enum、generics 付き）が enum レイアウトの唯一の真実源で、`enum_tag`/`enum_payload_of`/`enum_is_aggregate`/`enum_storage_ty` を提供。`llvm_ty` は enum 名を、スカラなら `%Name`・集約なら `%Name.Args`（`mono_symbol`）へ写す。`gen_enum_construction`/`gen_match` は集約なら typed store/load、スカラなら i64 キャストを使う
@@ -263,19 +264,18 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-24（ADR-0012 �
 - CLI: `iris --emit-llvm <file>`（IR表示）/ `iris build [--release] [-o OUT] <file>`（実行ファイル生成）/ `iris run <file>`（即実行）
 - **二段ビルド**: 既定 -O0（開発・高速）、`--release` で -O2。最適化の重さがビルド時間を支配するため、開発は -O0 既定にして速くしている（800関数で約9倍差）
 - `extern fn` は `declare` を出力し、`clang` が libc をリンク（`putchar` 等が使える）
-- **`as` 型変換**: `expr as Type` を数値↔数値・`bool`→数値で実装済み（`gen_cast`。`trunc`/`sext`/`zext`／`sitofp`/`uitofp`／`fptosi`/`fptoui`／`fptrunc`/`fpext`、LLVM 表現が同一なら無変換）。**ポインタ裏付けの型（`RawPtr`/`string`）→ `i64` は `ptrtoint`**（ADR-0011、syscall 引数用。`i64`＝ポインタ幅のみ許可）。**`RawPtr` ↔ `string` 変換**（ADR-0012、`malloc(n): RawPtr` の戻り値を文字列バッファとして使う等。LLVM 上はいずれも `ptr` で no-op）。
-- **汎用 syscall 原語（ADR-0011 実装順①）**: 組み込みの `syscall0`〜`syscall6`（番号＋N 引数、すべて `i64`、戻り `i64`）を `is_null` と同じく名前で特別扱いし、codegen が x86-64 Linux 規約の **inline asm**（`call i64 asm sideeffect "syscall", "={rax},{rax},{rdi},...,~{rcx},~{r11},~{memory}"`）へ展開する（`declare` を出さない）。resolve（`PRELUDE`）→ typeck（`syscall_arity` で個数・i64 引数検査）→ codegen に配線。`tests/codegen.rs` で `write(2)`／`exit(2)` を libc を介さず実走検証（write は stdout へ "hi"、exit は終了コード 7）。**実装順②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）も完了**: `exit` は `syscall1(60, code as i64)`、`write(fd, buf, len)` は `syscall3(1, fd as i64, buf as i64, len)` を iris で記述し、libc の `exit`/`puts`/`fputs` を介さず `define` ＋ inline asm へ展開する（`runs_os_exit`／`runs_os_write_to_stdout`）。**残り**: 実装順③（残りの os ラッパ＝`fopen`/`fputs`/`fgets`/`getenv` 等の syscall 移行）は未着手
+- **`as` 型変換**: `expr as Type` を数値↔数値・`bool`→数値で実装済み（`gen_cast`。`trunc`/`sext`/`zext`／`sitofp`/`uitofp`／`fptosi`/`fptoui`／`fptrunc`/`fpext`、LLVM 表現が同一なら無変換）。**ポインタ裏付けの型（`RawPtr`/`string`）→ `i64` は `ptrtoint`**（ADR-0011、syscall 引数用。`i64`＝ポインタ幅のみ許可）。**`&T as i64`（参照→`i64`）も `ptrtoint`**（ADR-0011 実装順③。`putchar` の `&c as i64` 用。暗黙デリファレンスを挟まずアドレスを取り出す）。**`RawPtr` ↔ `string` 変換**（ADR-0012、`malloc(n): RawPtr` の戻り値を文字列バッファとして使う等。LLVM 上はいずれも `ptr` で no-op）。
+- **汎用 syscall 原語（ADR-0011 実装順①）**: 組み込みの `syscall0`〜`syscall6`（番号＋N 引数、すべて `i64`、戻り `i64`）を `is_null` と同じく名前で特別扱いし、codegen が x86-64 Linux 規約の **inline asm**（`call i64 asm sideeffect "syscall", "={rax},{rax},{rdi},...,~{rcx},~{r11},~{memory}"`）へ展開する（`declare` を出さない）。resolve（`PRELUDE`）→ typeck（`syscall_arity` で個数・i64 引数検査）→ codegen に配線。`tests/codegen.rs` で `write(2)`／`exit(2)` を libc を介さず実走検証（write は stdout へ "hi"、exit は終了コード 7）。**実装順②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）も完了**: `exit` は `syscall1(60, code as i64)`、`write(fd, buf, len)` は `syscall3(1, fd as i64, buf as i64, len)` を iris で記述し、libc の `exit`/`puts`/`fputs` を介さず `define` ＋ inline asm へ展開する（`runs_os_exit`／`runs_os_write_to_stdout`）。**実装順③（ADR-0011）`puts`/`putchar` を write syscall 版へ移行完了**: prelude の `extern fn putchar`/`extern fn puts` を iris 実装へ置換（`syscall3(1, 1 as i64, &c as i64, 1)` 等）。残り: `fopen`/`fputs`/`fgets`/`getenv` 等の syscall 移行は未着手
 - 未対応（今後）: 文字列補間・スライス（長さ `s.len()`・索引 `s[i]`→`u8`・連結 `a.concat(b)` は実装済み）（`!` エラー伝播・ジェネリック **enum**（集約ペイロード）＝ADR-0010・ジェネリック**関数**・ジェネリック **struct 型**の単相化・`as` 型変換はいずれも実装済み）。なお整数/小数リテラルからジェネリック struct を構築すると型パラメータは既定（`i32`/`f64`）に確定し、`Pair<i64>` 等の非既定幅の明示注釈は構築式へ伝播しない（型エラーになる。enum の `refine_construction` と同種の制約）
 
 ### 標準ライブラリ（最小・iris 自身で記述）
 
-`std/prelude.iris`。`extern fn putchar` を借りて I/O を実現し、**iris 自身**で書いた最小の
-ライブラリ。コンパイル時に各プログラムの先頭へ自動で前置される（単一の文字列として
-連結し span を一意に保つ）。
+`std/prelude.iris`。**iris 自身**で書いた最小のライブラリ。コンパイル時に各プログラムの先頭へ自動で前置される（単一の文字列として連結し span を一意に保つ）。
 
-- 提供: `putchar` / `puts` / `strcmp` / `strlen` / `malloc` / `strcpy` / `strcat`（extern）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`、`trait Iterator<T> { fn next(&mut self): Option<T> }`（`for x in iter` が要求する標準トレイト・ADR-0007）、`impl string { fn len(&self): i32, fn concat(&self, other: string): string }`（libc を借りた文字列操作）
-- `puts` は NUL 終端文字列を出力し末尾に改行を付ける（文字列リテラルの出力に使える）
-- `strcmp` は libc から借りる文字列比較。`match` の文字列リテラルパターンの codegen が呼び出す（未使用でも `declare` のみ出力され無害）
+- 提供（iris 実装）: `putchar`（write syscall・libc 不要）/ `puts`（write syscall・libc 不要）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`、`trait Iterator<T> { fn next(&mut self): Option<T> }`（ADR-0007）、`impl string { fn len(&self): i32, fn concat(&self, other: string): string }`
+- 提供（extern）: `strcmp` / `strlen` / `malloc` / `free` / `strcpy` / `strcat`（libc を借りる文字列・メモリ操作）
+- `putchar`/`puts` は ADR-0011 実装順③で libc から write syscall 版（`syscall3(1, fd, buf, len)`）へ移行済み
+- `strcmp` は `match` の文字列リテラルパターン比較用（未使用でも `declare` のみ出力され無害）
 - 現状のコード生成に合わせ `i32` / `bool` / `string` の範囲で記述
 - これにより `main(): i32` から実際に数値・真偽値を標準出力へ表示し、`clang` でビルドして実行できる
 
@@ -339,7 +339,8 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 - ジェネリック **enum**（`Option`/`Result`/ユーザ定義）: スカラ／参照／`string`＝ptr ペイロードは i64 共通レイアウト、**struct 等の集約ペイロードは per-instantiation レイアウトで実装済み**（ADR-0010、`Option<Point>`・`Wrap<Point>` 等が縦断・clang 実行）。**残り**: 複数異種ペイロードの過小整列（記憶域＝最大サイズ型のため最大整列とは限らない）、ジェネリック関数の単相化の内側でのみ現れる集約インスタンスの型宣言収集（ADR-0010「Consequences」参照）
 - ジェネリックな **struct 型**定義のコード生成（`type Pair<T>`/`type Box<T>` の per-instantiation 単相化）は**実装済み**（enum・関数のジェネリクスと合わせ、`tests/codegen.rs` で縦断・clang 実行）。**残り**: 整数/小数リテラル構築での非既定幅の型引数の文脈伝播、ジェネリック関数の内側でのみ現れるインスタンスの型宣言収集（ADR-0010 と同種）
 - **`use`・モジュール解決（実装済み）**: `use a.b.*`（glob）・`use a.b { x, y }`（選択）・`use a.b`（Plain）+ `a.b.x(...)` モジュールパス呼び出し。ドット区切り＝ファイルパス区切り（`use foo.bar` → `foo/bar.iris`）。`std` は `CARGO_MANIFEST_DIR/std/` または実行ファイル隣から解決。pub 可視性（モジュールから pub アイテムのみ提供）。**残り**: `use` の選択インポートによる名前制限（現状 Named は Glob と同じ動作）、モジュール自身の相互 use、可視性のモジュール間強制（main 側 pub/private の制限）。
-- **文字列操作（実装済み）**: 長さ `s.len()`（libc `strlen`）・添字 `s[i]`（i 番目のバイト→`u8`）・連結 `a.concat(b)`（`malloc`+`strcpy`+`strcat`、ヒープ結果はリーク許容）を `impl string`＋libc extern で縦断実装。**汎用添字 `expr[i]`** は固定長配列 `T[]`・`Vec<T>` にも対応（要素型を返す）。**残り**: 文字列補間・スライス・`push`/再代入索引・非 Copy 要素の索引
+- **文字列操作（実装済み）**: 長さ `s.len()`（libc `strlen`）・添字 `s[i]`（i 番目のバイト→`u8`）・連結 `a.concat(b)`（`malloc`+`strcpy`+`strcat`、ヒープ結果はリーク許容）を `impl string`＋libc extern で縦断実装。**汎用添字 `expr[i]`** は固定長配列 `T[]`・`Vec<T>` にも対応（要素型を返す）。**残り**: 文字列補間・スライス・非 Copy 要素の索引
+- **`Vec.len()` / `Vec.push()`（実装済み）**: コンパイラ組み込みメソッドとして縦断実装（typeck + codegen）。`len()` は len フィールドを `i64` で返す。`push(item)` は末尾追加で容量不足時は 2 倍再確保（`@__iris_alloc` + memcpy + `@__iris_free`）。空 Vec リテラル `[]` は alloc しない（data=null、push 時に初回確保）。**残り**: `pop`・スライス・非 Copy 要素の push
 - 文字列補間（バッククォート `` `...{expr}...` ``）
 - **`as` 型変換（実装済み）**: `expr as Type` を字句解析（`as` キーワード）〜構文解析（二項より強く・単項/後置より弱い優先順位、左結合で連鎖可）〜型検査（数値↔数値・`bool`→数値・**`i64`→ポインタ**のみ許可。それ以外は拒否）〜所有権（被変換値の読み。参照は auto-deref）〜codegen（`trunc`/`sext`/`zext`／`sitofp`/`uitofp`／`fptosi`/`fptoui`／`fptrunc`/`fpext`。LLVM 表現が同一なら無変換）まで縦断実装。これにより `s[i] as i32`（`u8`→`i32`）・`mmap() as RawPtr`（`i64`→`RawPtr`、`inttoptr`）等が書けるようになった。**残り**: 参照・`string`・enum/struct との変換、別名（`type Meters = f64`）への変換、リテラルの後方確定との連携
 - ブロックコメント
@@ -354,15 +355,16 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 ### self-contained ランタイム（計画・ADR-0011 / ADR-0012）
 
 libc 依存を生成物から外していく中間目標。設計は確定（Accepted）。**実装順①（syscall 原語＋
-`ptr as i64`）・②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）は実装済み**、③以降は未着手。
+`ptr as i64`）・②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）・③（`puts`/`putchar` を write syscall 版へ移行）は実装済み**、④以降（残りの os ラッパ・`fopen`/`getenv` 等）は未着手。
 詳細は [ADR-0011](adr/0011-syscall-primitive-for-libc-independence.md)（syscall 原語）/
 [ADR-0012](adr/0012-global-allocator-with-override.md)（アロケータ）を参照。
 
 - **汎用 syscall 原語（ADR-0011・実装済み）**: コンパイラは「syscall 命令の出し方」だけを知る組み込み原語
   `syscall0`〜`syscall6`（番号＋N 引数・すべて `i64`・戻り `i64`）を持ち、codegen が x86-64 Linux 規約の
   **inline asm** へ展開する（`declare` を出さない）。番号付けと `read`/`write`/`open`/`exit` 等のラッパは
-  `std/os.iris` 側で iris として書く。**`exit`（番号 60）/`write`（番号 1）は移行済み**（実装順②）、
-  残りの os ラッパ（`fopen`/`getenv` 等）は実装順③で移行予定。`RawPtr`/`is_null` と同じ「最小原語は
+  `std/os.iris` 側で iris として書く。**`exit`（番号 60）/`write`（番号 1）は移行済み**（実装順②）。
+  **`puts`/`putchar` も write syscall 版へ移行済み**（実装順③。prelude に iris 実装を追加し extern fn を除去）。
+  残りの os ラッパ（`fopen`/`getenv` 等）は将来の実装順④で移行予定。`RawPtr`/`is_null` と同じ「最小原語は
   コンパイラ・命名は std」路線。前提の **`ptr as i64`**（`RawPtr`/`string`→`i64`、`ptrtoint`）も `as` に
   追加済み。**外れるのは libc 依存であって clang ではない**（アセンブル/リンクには引き続き clang が要る。
   x86-64 Linux 固定）。`write`/`exit` の実走で回帰を張った（`tests/codegen.rs`）。
@@ -374,13 +376,13 @@ libc 依存を生成物から外していく中間目標。設計は確定（Acc
   静的差替・mmap/munmap syscall 経由）を呼ぶ。`malloc` は Vec から切り離され string.concat 等の
   libc 依存コードでのみ呼ばれる。
 - **実装順**: ✅① `syscall` 原語 ＋ `ptr as i64`（実装済み）→ ✅② `exit`/`write` を syscall 版にして「libc 無しで
-  1 本動く」実証（実装済み）→ ✅③ `Allocator` トレイト ＋ `LibcAlloc`（`std/alloc.iris`）＋ Vec ヘッダ拡張（`%Vec`
+  1 本動く」実証（実装済み）→ ✅③（ADR-0012） `Allocator` トレイト ＋ `LibcAlloc`（`std/alloc.iris`）＋ Vec ヘッダ拡張（`%Vec`
   が `{ptr,i64,i64,ptr}`・4 番目 alloc フィールドは null で初期化・malloc を `i64` 引数へ移行・`RawPtr↔string` の
   `as` 変換を追加。実装済み）
   → ✅④ `MmapAlloc` でグローバル差替（libc malloc 消滅。実装済み）→ ✅⑤ `-nostartfiles` ＋ 自前 `_start`
-  （`fn main` があるとき codegen が `@_start` を生成。libc の `exit()` を呼んで stdio をフラッシュ後終了。
-  std.os の iris `exit` が定義済みの場合はそちらを呼ぶ。将来 puts/putchar を write syscall に移行したら
-  raw syscall 60 に切り替え可能。実装済み）。
+  （`fn main` があるとき codegen が `@_start` を生成。iris `exit` が定義済みの場合はそちらを呼び、未定義の場合は
+  インライン syscall 60 で直接終了。実装済み）→ ✅③（ADR-0011）`puts`/`putchar` を write syscall 版へ移行
+  （`&T as i64` キャスト追加・prelude で iris 実装に置換。libc puts/putchar 依存を除去。実装済み）。
 
 ## 仕様未確定のため独自に決めた点（要確認）
 

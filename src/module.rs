@@ -46,17 +46,24 @@ pub struct ModuleLoader {
     base_dir: Option<PathBuf>,
     /// std/ ディレクトリのパス。
     std_dir: PathBuf,
+    /// モジュール span の開始オフセット（combined ソースとの衝突を防ぐ）。
+    /// 各モジュールはこのオフセットを起点に span を割り当て、ロード後に次モジュール用へ更新する。
+    next_span_base: usize,
 }
 
 impl ModuleLoader {
     /// 新しいモジュールローダーを作る。
     ///
     /// `base_dir`: ユーザーモジュールの解決基準ディレクトリ（コンパイル対象ファイルの親）。
-    pub fn new(base_dir: Option<&Path>) -> Self {
+    /// `combined_len`: combined ソース（PRELUDE + user_src）の長さ。モジュール span の
+    ///   先頭を combined ソースの外側へ押し出すことで `types: HashMap<Span, Ty>` の
+    ///   キー衝突を防ぐ。
+    pub fn new(base_dir: Option<&Path>, combined_len: usize) -> Self {
         ModuleLoader {
             modules: HashMap::new(),
             base_dir: base_dir.map(|p| p.to_path_buf()),
             std_dir: find_std_dir(),
+            next_span_base: combined_len + 1,
         }
     }
 
@@ -73,7 +80,10 @@ impl ModuleLoader {
                 file_path.display()
             ))
         })?;
-        let loaded = compile_module_source(&source, path)?;
+        let base = self.next_span_base;
+        // 次モジュール用のベースを十分離す（同一セッション内の複数モジュールが衝突しないよう）。
+        self.next_span_base += source.len() + 1;
+        let loaded = compile_module_source(&source, path, base)?;
         self.modules.insert(path.to_vec(), loaded);
         Ok(&self.modules[path])
     }
@@ -178,8 +188,8 @@ fn find_std_dir() -> PathBuf {
 }
 
 /// モジュールソースを字句解析・構文解析し、pub アイテムを抽出する。
-fn compile_module_source(source: &str, path: &[String]) -> Result<LoadedModule, ModuleError> {
-    let tokens = lexer::lex(source).map_err(|e| {
+fn compile_module_source(source: &str, path: &[String], base_offset: usize) -> Result<LoadedModule, ModuleError> {
+    let tokens = lexer::lex_at(source, base_offset).map_err(|e| {
         ModuleError::new(format!(
             "モジュール `{}` の字句解析エラー (offset {}): {}",
             path.join("."),
