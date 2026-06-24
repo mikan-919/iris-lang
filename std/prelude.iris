@@ -22,8 +22,10 @@ extern fn strcmp(a: string, b: string): i32
 
 // C の文字列操作を借りる。strlen は長さ、malloc はバッファ確保、strcpy/strcat は連結に使う。
 extern fn strlen(s: string): i32
+extern fn strncmp(a: string, b: string, n: i64): i32
 extern fn malloc(n: i64): RawPtr
 extern fn free(p: RawPtr): void
+extern fn memset(ptr: RawPtr, val: i32, n: i64): RawPtr
 extern fn strcpy(dst: string, src: string): string
 extern fn strcat(dst: string, src: string): string
 

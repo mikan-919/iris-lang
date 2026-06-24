@@ -220,8 +220,9 @@ fn extract_pub_items(source: &str, program: Program) -> Result<LoadedModule, Mod
             Item::Function(f) => {
                 if f.is_pub || f.is_extern {
                     pub_fn_names.push(f.name.clone());
-                    items.push(item);
                 }
+                // pub でない関数も、pub 関数から呼ばれる可能性があるため全て含める。
+                items.push(item);
             }
             Item::TypeDef(t) => {
                 if t.is_pub {

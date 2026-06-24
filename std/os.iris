@@ -1,58 +1,121 @@
-// OS との最小インターフェース。libc の stdio・プロセス・環境変数を extern で借りる。
+// OS との最小インターフェース。ファイル I/O・プロセス・環境変数を Linux syscall で実装する。
 // prelude と違い自動前置されない。`use std.os.*` などで明示的に取り込んで使う。
 //
-// 現状の codegen 対応範囲（i32 / string / RawPtr）で記述する。失敗を表す NULL
-// ハンドルは組み込み述語 `is_null(p)` で判定し、安全な API では `Option` に包んで返す。
-// 利用側は生の `extern fn`（fopen/getenv）より `open` / `env` を使うことを推奨する。
+// ADR-0011 実装順④: fopen/fclose/fputs/fgets/getenv を libc から syscall 版へ移行。
+// File 型はファイル記述子（i64）。open/close/read/write は syscall 0-3 を使う。
+// getenv は /proc/self/environ を open して線形スキャンする。
 
-// 不透明な FILE ハンドル（libc の `FILE*`）。中身は触らずポインタとして持ち回す。
-// `RawPtr` は free/drop を持たない Copy なポインタ型（FFI 用のコンパイラ組み込み）。
-pub type File = RawPtr
+// ファイル記述子（open syscall が返す整数）。
+// i64 の別名であり Copy 型（整数なので所有権追跡の対象外）。
+pub type File = i64
 
-// ファイルを開く（生）。`mode` は libc fopen と同じ（"r" / "w" / "a" / "rb" 等）。
-// 失敗時は NULL ハンドルを返す。NULL 安全な `open` の利用を推奨する。
-pub extern fn fopen(path: string, mode: string): File
+// open フラグ定数（Linux x86-64）。
+// O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=64(0100o), O_TRUNC=512(01000o)
+// 例: open(path, 577) で書き込み＋新規作成＋切り詰め（O_WRONLY|O_CREAT|O_TRUNC=577）。
 
-// ファイルを開く（安全版）。成功なら `Some(File)`、失敗（NULL）なら `None`。
-pub fn open(path: string, mode: string): Option<File> {
-    let h = fopen(path, mode)
-    if is_null(h) {
+// ファイルを開く。成功なら Some(fd)、失敗（ENOENT 等）なら None。
+// flags: O_RDONLY=0 / O_WRONLY=1 / O_RDWR=2 / O_CREAT=64 / O_TRUNC=512 等の組み合わせ。
+// 新規作成時の mode は 0666（umask で制限）を設定する。
+pub fn open(path: string, flags: i32): Option<File> {
+    let fd = syscall3(2, path as i64, flags as i64, 438)
+    if fd < 0 {
         return None
     }
-    Some(h)
+    Some(fd as File)
 }
 
-// 開いているファイルを閉じる。成功で 0。
-pub extern fn fclose(f: File): i32
+// ファイルを閉じる。
+pub fn close(fd: File): void {
+    syscall1(3, fd as i64)
+}
 
-// NUL 終端文字列 `s` を `f` へ書き出す。非負なら成功。
-pub extern fn fputs(s: string, f: File): i32
+// fd から最大 len バイトを buf へ読み込む。読んだバイト数（負ならエラー、0 は EOF）を返す。
+// buf は malloc 等で確保した書き込み可能なバッファ。
+pub fn read(fd: File, buf: string, len: i64): i64 {
+    syscall3(0, fd as i64, buf as i64, len)
+}
 
-// `f` から最大 `n - 1` バイトを `buf` へ読み込み NUL 終端する。改行も読み込む。
-// EOF・エラー時は NULL を返す（成功時は `buf` を返す）。`buf` は呼び出し側が
-// `malloc(n)` 等で確保した書き込み可能なバッファを渡す。
-pub extern fn fgets(buf: string, n: i32, f: File): string
+// fd へ buf の先頭 len バイトを書き出す。書き込んだバイト数（負ならエラー）を返す。
+// stdout は fd=1、stderr は fd=2。libc を介さず write(2) syscall（番号 1）を呼ぶ。
+pub fn write(fd: File, buf: string, len: i64): i64 {
+    syscall3(1, fd as i64, buf as i64, len)
+}
 
-// プロセスを終了コード `code` で終了する（戻らない）。Linux の exit(2)（番号 60）を
-// 汎用 syscall 原語 `syscall1` で直接呼び、libc の `exit` を介さない（ADR-0011 実装順②）。
+// fd から 1 バイトずつ読み、改行（\n）または EOF/エラーまでを buf へ格納し NUL 終端する。
+// buf は malloc 等で確保した書き込み可能なバッファ。max は buf の容量（NUL を含む）。
+// 返り値: 読んだバイト数（改行を含む）。0 = EOF。
+pub fn read_line(fd: File, buf: string, max: i32): i32 {
+    let mut i = 0
+    while i < max - 1 {
+        let char_ptr = (buf as i64 + i as i64) as RawPtr as string
+        let n = read(fd, char_ptr, 1)
+        if n <= 0 {
+            break
+        }
+        if char_ptr[0] as i32 == 10 {
+            i = i + 1
+            break
+        }
+        i = i + 1
+    }
+    let end_ptr = (buf as i64 + i as i64) as RawPtr
+    memset(end_ptr, 0, 1)
+    return i
+}
+
+// プロセスを終了コード code で終了する（戻らない）。
+// Linux の exit(2)（番号 60）を syscall1 で直接呼ぶ（ADR-0011 実装順②）。
 pub fn exit(code: i32): void {
     syscall1(60, code as i64)
 }
 
-// `fd` へ `buf` の先頭 `len` バイトを書き出し、書き込んだバイト数（負ならエラー）を返す。
-// Linux の write(2)（番号 1）を `syscall3` で直接呼ぶ。stdout は `fd = 1`、stderr は `fd = 2`。
-// libc の `puts`/`fputs` を介さずに出力できる（ADR-0011 実装順②）。
-pub fn write(fd: i32, buf: string, len: i64): i64 {
-    syscall3(1, fd as i64, buf as i64, len)
+// getenv の内部実装。fd で /proc/self/environ を読み込み name= エントリを探す。
+// 見つかれば値の先頭ポインタ、見つからなければ "" を返す。
+fn getenv_scan(fd: File, name: string): string {
+    let buf = malloc(65536) as string
+    let total = read(fd, buf, 65536)
+    close(fd)
+    if total <= 0 {
+        return ""
+    }
+    let namelen = strlen(name)
+    let mut i = 0
+    let mut found: string = ""
+    let mut ok = false
+    while i < total as i32 {
+        let entry_ptr = (buf as i64 + i as i64) as RawPtr as string
+        if strncmp(entry_ptr, name, namelen as i64) == 0 {
+            if entry_ptr[namelen] as i32 == 61 {
+                found = (buf as i64 + (i + namelen + 1) as i64) as RawPtr as string
+                ok = true
+                break
+            }
+        }
+        while i < total as i32 && buf[i] as i32 != 0 {
+            i = i + 1
+        }
+        i = i + 1
+    }
+    if ok {
+        return found
+    }
+    return ""
 }
 
-// 環境変数 `name` の値を返す（生）。未設定なら NULL。NULL 安全な `env` の利用を推奨する。
-pub extern fn getenv(name: string): string
+// 環境変数 name の値を返す（生）。未設定なら空文字列 "" を返す。
+// /proc/self/environ を open して線形スキャンする（ADR-0011 実装順④）。
+// 利用側は None 安全な env() の使用を推奨する。
+pub fn getenv(name: string): string {
+    match open("/proc/self/environ", 0) {
+        None -> ""
+        Some(fd) -> getenv_scan(fd, name)
+    }
+}
 
-// 環境変数 `name` の値を返す（安全版）。設定済みなら `Some(value)`、未設定なら `None`。
+// 環境変数 name の値を返す（安全版）。設定済みなら Some(value)、未設定なら None。
 pub fn env(name: string): Option<string> {
     let v = getenv(name)
-    if is_null(v) {
+    if v[0] as i32 == 0 {
         return None
     }
     Some(v)

@@ -662,7 +662,9 @@ fn parse_param(input: Tokens) -> PResult<Param> {
 
 // ---- 型 -----------------------------------------------------------------
 
-fn parse_type(input: Tokens) -> PResult<Type> {
+/// 型を解析する。`allow_bounds` が真のとき `A + B` 形式の匿名トレイト境界も受け入れる。
+/// `as` キャスト位置では `+` が加算演算子と曖昧になるため `allow_bounds=false` で呼ぶ。
+fn parse_type_r(input: Tokens, allow_bounds: bool) -> PResult<Type> {
     let (mut input, mut ty) = parse_type_base(input)?;
     // 配列サフィックス `[]`
     while input.peek() == &TokenKind::LBracket {
@@ -676,8 +678,9 @@ fn parse_type(input: Tokens) -> PResult<Type> {
         };
         input = rest;
     }
-    // 匿名トレイト境界 `A + B`（ADR-0006、主に引数位置）。`+` は型構文に他用途が無いため曖昧なし。
-    if input.peek() == &TokenKind::Plus {
+    // 匿名トレイト境界 `A + B`（ADR-0006、主に引数位置）。
+    // キャスト位置（allow_bounds=false）では `+` を加算演算子として残す。
+    if allow_bounds && input.peek() == &TokenKind::Plus {
         let first = named_to_trait_ref(ty)?;
         let start = first.span;
         let mut bounds = vec![first];
@@ -694,6 +697,10 @@ fn parse_type(input: Tokens) -> PResult<Type> {
         };
     }
     Ok((input, ty))
+}
+
+fn parse_type(input: Tokens) -> PResult<Type> {
+    parse_type_r(input, true)
 }
 
 /// `Type::Named` をトレイト参照へ変換する（匿名境界 `A + B` の各項用）。
@@ -1127,7 +1134,8 @@ fn parse_multiplicative(input: Tokens, no_struct: bool) -> PResult<Expr> {
 fn parse_cast(input: Tokens, no_struct: bool) -> PResult<Expr> {
     let (mut input, mut expr) = parse_unary(input, no_struct)?;
     while input.peek() == &TokenKind::As {
-        let (rest, ty) = parse_type(input.take_from(1))?;
+        // キャスト位置では `+` を加算演算子として残す（allow_bounds=false）。
+        let (rest, ty) = parse_type_r(input.take_from(1), false)?;
         let span = expr.span.merge(ty.span());
         expr = Expr {
             kind: ExprKind::Cast {

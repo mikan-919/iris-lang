@@ -889,17 +889,49 @@ fn runs_string_byte_cast() {
 }
 
 #[test]
-fn emits_rawptr_extern_as_pointer() {
-    // std.os の File（= RawPtr）は LLVM では opaque ポインタ。extern も ptr で宣言される。
-    let ir = emit("use std.os.*\nfn main(): i32 {\n    let f = fopen(\"x\", \"r\")\n    return fclose(f)\n}");
-    assert!(ir.contains("declare ptr @fopen(ptr, ptr)"));
-    assert!(ir.contains("declare i32 @fclose(ptr)"));
+fn emits_open_close_as_iris_functions() {
+    // ADR-0011 ④: File = i64（fd）。open/close は extern でなく iris 実装（define を出す）。
+    let ir = emit(
+        "use std.os.*\nfn main(): i32 {\n    match open(\"/tmp/x\", 0) {\n        Some(f) -> 1\n        None -> 0\n    }\n}",
+    );
+    // open は iris 関数（define を含む）。fopen の declare は出ない。
+    assert!(ir.contains("define") && ir.contains("@open("), "open は iris 関数のはず\n{ir}");
+    assert!(!ir.contains("@fopen"), "fopen の declare は出ないはず\n{ir}");
+    // open は syscall 2（open(2)）を呼ぶ。
+    assert!(ir.contains("i64 2"), "open syscall 番号 2 が含まれるはず\n{ir}");
 }
 
 #[test]
 fn runs_os_file_roundtrip() {
     // ファイルへ書き込み → 読み戻し、先頭バイトを i32 へ変換して返す（'Z' = 90）。
-    let src = "use std.os.*\nfn main(): i32 {\n    let path = \"/tmp/iris_os_roundtrip.txt\"\n    let w = fopen(path, \"w\")\n    let r1 = fputs(\"Zebra\\n\", w)\n    let c1 = fclose(w)\n    let f = fopen(path, \"r\")\n    let buf = malloc(64) as string\n    let line = fgets(buf, 64, f)\n    let c2 = fclose(f)\n    return buf[0] as i32\n}";
+    // open(path, 577) = O_WRONLY|O_CREAT|O_TRUNC で新規作成。read_line で読み戻し。
+    // match アームは単一式のため、複数文を要するロジックは補助関数に抽出する。
+    let src = concat!(
+        "use std.os.*\n",
+        "fn do_write(fd: File): i32 {\n",
+        "    write(fd, \"Zebra\\n\", 6)\n",
+        "    close(fd)\n",
+        "    return 0\n",
+        "}\n",
+        "fn do_read(fd: File, buf: string): i32 {\n",
+        "    read_line(fd, buf, 64)\n",
+        "    close(fd)\n",
+        "    return buf[0] as i32\n",
+        "}\n",
+        "fn main(): i32 {\n",
+        "    let path = \"/tmp/iris_os_roundtrip.txt\"\n",
+        "    let wr = match open(path, 577) {\n",
+        "        None -> -1\n",
+        "        Some(wfd) -> do_write(wfd)\n",
+        "    }\n",
+        "    if wr < 0 { return wr }\n",
+        "    let buf = malloc(64) as string\n",
+        "    match open(path, 0) {\n",
+        "        None -> -2\n",
+        "        Some(rfd) -> do_read(rfd, buf)\n",
+        "    }\n",
+        "}\n",
+    );
     if let Some(code) = run_exit_code(src, "os_roundtrip") {
         assert_eq!(code, 90);
     }
@@ -917,8 +949,9 @@ fn runs_os_exit() {
 #[test]
 fn emits_is_null_as_icmp() {
     // 組み込み述語 is_null(p) は NULL ポインタとの icmp に落ちる。
+    // malloc の戻り値（RawPtr）で検証する。
     let ir = emit(
-        "use std.os.*\nfn main(): i32 {\n    let f = fopen(\"x\", \"r\")\n    return is_null(f) ? 1 : 0\n}",
+        "fn main(): i32 {\n    let p = malloc(8)\n    return is_null(p) ? 1 : 0\n}",
     );
     assert!(ir.contains("icmp eq ptr"), "is_null は icmp eq ptr ..., null を出すはず\n{ir}");
     assert!(ir.contains(", null"));
@@ -927,7 +960,16 @@ fn emits_is_null_as_icmp() {
 #[test]
 fn runs_os_open_none_for_missing_file() {
     // 存在しないファイルを open すると None。match None 経路で 7 を返す。
-    let src = "use std.os.*\nfn main(): i32 {\n    match open(\"/nonexistent/iris/xyz\", \"r\") {\n        Some(f) -> fclose(f) + 1\n        None -> 7\n    }\n}";
+    // ADR-0011 ④: open は flags（整数）を受け取る。O_RDONLY = 0。
+    let src = concat!(
+        "use std.os.*\n",
+        "fn main(): i32 {\n",
+        "    match open(\"/nonexistent/iris/xyz\", 0) {\n",
+        "        Some(f) -> 1\n",
+        "        None -> 7\n",
+        "    }\n",
+        "}\n",
+    );
     if let Some(code) = run_exit_code(src, "os_open_none") {
         assert_eq!(code, 7);
     }
@@ -935,11 +977,19 @@ fn runs_os_open_none_for_missing_file() {
 
 #[test]
 fn runs_os_open_some_for_existing_file() {
-    // 実在ファイルを open すると Some(File)。Some 経路で fclose(0)+1 = 1 を返す。
+    // 実在ファイルを open すると Some(File)。Some 経路で close して 1 を返す。
     let path = std::env::temp_dir().join("iris_os_open_some.txt");
     std::fs::write(&path, "x").unwrap();
     let src = format!(
-        "use std.os.*\nfn main(): i32 {{\n    match open(\"{}\", \"r\") {{\n        Some(f) -> fclose(f) + 1\n        None -> 0\n    }}\n}}",
+        concat!(
+            "use std.os.*\n",
+            "fn main(): i32 {{\n",
+            "    match open(\"{}\", 0) {{\n",
+            "        Some(f) -> 1\n",
+            "        None -> 0\n",
+            "    }}\n",
+            "}}\n",
+        ),
         path.display()
     );
     if let Some(code) = run_exit_code(&src, "os_open_some") {

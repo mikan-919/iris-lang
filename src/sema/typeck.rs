@@ -833,16 +833,21 @@ impl<'a> Checker<'a> {
         // 参照 → i64: 参照のアドレスそのものを整数として取り出す（ptrtoint）。
         // syscall 引数にスタック変数のアドレスを渡す場面（putchar 等）で使う。
         // peel_refs の前に判定する（peel 後は Ref でなくなる）。
-        let ref_to_int = matches!(&src, Ty::Ref { .. }) && dst == Ty::named("i64");
+        // i64 の別名（`type File = i64` 等）へのキャストも許す。
+        let ref_to_int = matches!(&src, Ty::Ref { .. }) && self.resolves_to_i64(&dst);
         // 参照は暗黙にデリファレンスして指す先の値を変換する。
         let src_inner = src.peel_refs();
-        let ok = (src_inner.is_numeric() || src_inner.is_bool()) && dst.is_numeric();
+        // 数値間変換: 別名（`type File = i64` 等）も integer_like/float_like で判定する。
+        let ok = (self.is_integer_like(src_inner)
+            || self.is_float_like(src_inner)
+            || src_inner.is_bool())
+            && (self.is_integer_like(&dst) || self.is_float_like(&dst));
         // ポインタ裏付けの型（`RawPtr`/`string`）→ `i64`（`ptrtoint`）。syscall 引数で
-        // ポインタを整数として渡すために使う（ADR-0011）。
-        let ptr_to_int = self.is_rawptr_like(src_inner) && dst == Ty::named("i64");
+        // ポインタを整数として渡すために使う（ADR-0011）。i64 の別名も許す。
+        let ptr_to_int = self.is_rawptr_like(src_inner) && self.resolves_to_i64(&dst);
         // `i64` → ポインタ（`RawPtr`/`string`）。`inttoptr`。mmap 等の syscall 戻り値（i64）を
-        // RawPtr に変換するために使う（ADR-0012 MmapAlloc）。
-        let int_to_ptr = src_inner == &Ty::named("i64") && self.is_rawptr_like(&dst);
+        // RawPtr に変換するために使う（ADR-0012 MmapAlloc）。i64 の別名も許す。
+        let int_to_ptr = self.resolves_to_i64(src_inner) && self.is_rawptr_like(&dst);
         // ポインタ同士の変換（`RawPtr` ↔ `string`）。LLVM 上はいずれも `ptr` で表現され
         // 変換は no-op。malloc の戻り値を文字列バッファとして使う場面等で必要。
         let ptr_to_ptr = self.is_rawptr_like(src_inner) && self.is_rawptr_like(&dst);
@@ -2142,6 +2147,19 @@ impl<'a> Checker<'a> {
                 name == "RawPtr"
                     || name == "string"
                     || self.alias_target(name).is_some_and(|t| self.is_rawptr_like(t))
+            }
+            _ => false,
+        }
+    }
+
+    /// `i64` またはその別名（`type File = i64` 等）か。ptr ↔ i64 変換の変換先/元の判定に使う。
+    fn resolves_to_i64(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Named { name, args } if args.is_empty() => {
+                name == "i64"
+                    || self
+                        .alias_target(name)
+                        .is_some_and(|t| self.resolves_to_i64(t))
             }
             _ => false,
         }

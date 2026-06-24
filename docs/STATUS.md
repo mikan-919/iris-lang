@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-24（ADR-0011 実装順③: `puts`/`putchar` を write syscall へ移行・モジュール span 衝突バグ修正）。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-24（ADR-0011 実装順④: `fopen`/`fclose`/`fputs`/`fgets`/`getenv` を syscall 版へ移行・`File = i64`（fd）へ変更・パーサー `as T +` 曖昧性バグ修正）。
 
 ## パイプライン
 
@@ -286,17 +286,18 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 
 - **不透明 C ポインタ型 `RawPtr`**: FFI 用のコンパイラ組み込みプリミティブ。LLVM では opaque ポインタ（`ptr`）で表現し、
   `string` と同様に free/drop を持たない **Copy** 型・所有グラフの辺を作らない。typeck（`BUILTIN_TYPES`・両 `is_copy`）と
-  codegen（`llvm_ty` → `ptr`）に最小限で配線。std/os は `pub type File = RawPtr` と名前付けして使う（コンパイラは stdio を知らない）
-- 生の extern（いずれも libc を `extern` で借りる）: `type File = RawPtr`、`fopen(path, mode): File` / `fclose(f): i32` /
-  `fputs(s, f): i32` / `fgets(buf, n, f): string`（`buf` は `malloc` 確保の書き込み可能バッファ）、`exit(code): void`、`getenv(name): string`
-- **NULL 安全な高水準 API（実装済み）**: `open(path, mode): Option<File>` / `env(name): Option<string>`。失敗（NULL）を `None`、
-  成功を `Some(...)` に包んで返すため、利用側は `match` で安全に分岐でき生 NULL を見ない。生の `fopen`/`getenv` より推奨
+  codegen（`llvm_ty` → `ptr`）に最小限で配線
+- **`pub type File = i64`（ADR-0011 ④ 実装済み）**: `File` はファイル記述子（fd）の別名。`RawPtr`（FILE\*）から変更。
+  `i64` の別名なので Copy・所有グラフの辺を作らない。typeck の `infer_cast` を別名解決対応（`resolves_to_i64` 追加）
+- **syscall ベースの OS API（ADR-0011 ④ 実装済み）**: `fopen`/`fclose`/`fputs`/`fgets`/`getenv`（libc）を除去し、
+  iris 実装へ全面移行。`open(path, flags): Option<File>`（syscall 2）・`close(fd)`（syscall 3）・
+  `read(fd, buf, len): i64`（syscall 0）・`write(fd, buf, len): i64`（syscall 1）・`read_line(fd, buf, max): i32`・
+  `exit(code: i32)`・`getenv(name): string`（`/proc/self/environ` を open して線形スキャン）・`env(name): Option<string>`
+- `prelude.iris` に `strncmp`/`memset` extern 追加（getenv_scan の NUL 終端・プレフィックス比較に使用）
 - **組み込み述語 `is_null(p): bool`**: ポインタ裏付けの型（`RawPtr`/`string`、別名含む）が NULL かを返すコンパイラ組み込み。
-  resolve（`PRELUDE`）→ typeck（`is_rawptr_like` で引数検査・`bool` 返り）→ codegen（`icmp eq ptr %p, null`）に配線。
-  上記 `open`/`env` ラッパの土台。`null` リテラル構文は導入していない（NULL 判定はこの述語に集約）
-- 書き込み→読み戻しのファイル往復、`open` の Some/None 両経路、`exit` による終了コード、`env` の設定/未設定を `clang` 実行で検証（`tests/codegen.rs`、`tests/typeck.rs`）
-- **残り**: `fputs`/`fgets` 失敗（負値・NULL）の `Option`/`Result` 化、`stdout`/`stderr` グローバル（FILE\*）の参照、
-  `fprintf` 等の可変長引数、`File` の自動 `fclose`（Drop）は未対応
+  resolve（`PRELUDE`）→ typeck（`is_rawptr_like` で引数検査・`bool` 返り）→ codegen（`icmp eq ptr %p, null`）に配線
+- 書き込み→読み戻しのファイル往復、`open` の Some/None 両経路、`exit`、`env` の設定/未設定を検証（`tests/codegen.rs`）
+- **残り**: `File` の自動 `close`（Drop）・`stderr` への直接書き込み・可変長引数（`fprintf` 等）は未対応
 
 ### トレイトシステム（実装済み・ADR-0004〜0009）
 
@@ -354,8 +355,7 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 
 ### self-contained ランタイム（計画・ADR-0011 / ADR-0012）
 
-libc 依存を生成物から外していく中間目標。設計は確定（Accepted）。**実装順①（syscall 原語＋
-`ptr as i64`）・②（`std/os.iris` の `exit`/`write` を syscall 版へ移行）・③（`puts`/`putchar` を write syscall 版へ移行）は実装済み**、④以降（残りの os ラッパ・`fopen`/`getenv` 等）は未着手。
+libc 依存を生成物から外していく中間目標。設計は確定（Accepted）。**実装順①〜④はすべて実装済み**。
 詳細は [ADR-0011](adr/0011-syscall-primitive-for-libc-independence.md)（syscall 原語）/
 [ADR-0012](adr/0012-global-allocator-with-override.md)（アロケータ）を参照。
 
@@ -363,8 +363,9 @@ libc 依存を生成物から外していく中間目標。設計は確定（Acc
   `syscall0`〜`syscall6`（番号＋N 引数・すべて `i64`・戻り `i64`）を持ち、codegen が x86-64 Linux 規約の
   **inline asm** へ展開する（`declare` を出さない）。番号付けと `read`/`write`/`open`/`exit` 等のラッパは
   `std/os.iris` 側で iris として書く。**`exit`（番号 60）/`write`（番号 1）は移行済み**（実装順②）。
-  **`puts`/`putchar` も write syscall 版へ移行済み**（実装順③。prelude に iris 実装を追加し extern fn を除去）。
-  残りの os ラッパ（`fopen`/`getenv` 等）は将来の実装順④で移行予定。`RawPtr`/`is_null` と同じ「最小原語は
+  **`puts`/`putchar` も write syscall 版へ移行済み**（実装順③）。**`fopen`/`fclose`/`fputs`/`fgets`/`getenv` を
+  syscall 版へ移行済み**（実装順④。`File = i64` fd へ変更・`open`/`close`/`read`/`write`/`read_line`/`getenv` を
+  iris で実装・`/proc/self/environ` スキャン版 `getenv`）。`RawPtr`/`is_null` と同じ「最小原語は
   コンパイラ・命名は std」路線。前提の **`ptr as i64`**（`RawPtr`/`string`→`i64`、`ptrtoint`）も `as` に
   追加済み。**外れるのは libc 依存であって clang ではない**（アセンブル/リンクには引き続き clang が要る。
   x86-64 Linux 固定）。`write`/`exit` の実走で回帰を張った（`tests/codegen.rs`）。
@@ -380,9 +381,10 @@ libc 依存を生成物から外していく中間目標。設計は確定（Acc
   が `{ptr,i64,i64,ptr}`・4 番目 alloc フィールドは null で初期化・malloc を `i64` 引数へ移行・`RawPtr↔string` の
   `as` 変換を追加。実装済み）
   → ✅④ `MmapAlloc` でグローバル差替（libc malloc 消滅。実装済み）→ ✅⑤ `-nostartfiles` ＋ 自前 `_start`
-  （`fn main` があるとき codegen が `@_start` を生成。iris `exit` が定義済みの場合はそちらを呼び、未定義の場合は
-  インライン syscall 60 で直接終了。実装済み）→ ✅③（ADR-0011）`puts`/`putchar` を write syscall 版へ移行
-  （`&T as i64` キャスト追加・prelude で iris 実装に置換。libc puts/putchar 依存を除去。実装済み）。
+  （実装済み）→ ✅③（ADR-0011）`puts`/`putchar` を write syscall 版へ移行（実装済み）
+  → ✅④（ADR-0011）`fopen`/`fclose`/`fputs`/`fgets`/`getenv` を syscall 版へ移行・`File = i64`（fd）化
+  （`open`/`close`/`read`/`write`/`read_line`/`getenv`/`env` を iris 実装。`/proc/self/environ` スキャン。
+  typeck の `infer_cast` を別名解決対応。パーサー `as T + expr` 曖昧性バグ修正。実装済み）。
 
 ## 仕様未確定のため独自に決めた点（要確認）
 
