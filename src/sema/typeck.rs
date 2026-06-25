@@ -2177,6 +2177,9 @@ impl<'a> Checker<'a> {
                     // 型パラメータを値型から推論し、置換後の期待型と照合する。
                     unify(fty, &vty, &gset, &mut subst_map);
                     let expected = subst(fty, &subst_map);
+                    // 配列リテラル（特に空 `[]`）の要素型をフィールド注釈から確定する。
+                    // これをしないと `[]` が `ArrayLit(Infer)` のまま codegen へ漏れる。
+                    self.finalize_array_lit(&fi.value, &expected);
                     if !self.assignable(&expected, &vty) {
                         self.error(
                             fi.value.span,

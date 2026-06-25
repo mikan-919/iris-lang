@@ -745,6 +745,16 @@ fn runs_vec_len_empty() {
 }
 
 #[test]
+fn runs_struct_field_empty_vec() {
+    // 空リテラル `[]` の要素型を struct フィールド注釈（Vec<i32>）から確定する（plan 008）。
+    // 確定しないと `[]` が `ArrayLit(_)` のまま codegen へ漏れて落ちる。
+    let src = "type Stack = struct {\n    data: Vec<i32>\n    top: i32\n}\n\nfn main(): i32 {\n    let s = Stack { data: [], top: 0 }\n    return s.data.len() as i32 + s.top\n}";
+    if let Some(code) = run_exit_code(src, "struct_field_empty_vec") {
+        assert_eq!(code, 0);
+    }
+}
+
+#[test]
 fn runs_vec_push_basic() {
     // push で要素を追加し、添字でアクセスする。
     let src = "\
