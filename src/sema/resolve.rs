@@ -331,12 +331,16 @@ impl Resolver {
                 for arm in arms {
                     // アームの本体は独立したスコープ。パターンの束縛変数を登録する。
                     self.push_scope();
-                    if let Pattern::Variant {
-                        binding: Some((bname, bspan)),
-                        ..
-                    } = &arm.pattern
-                    {
-                        self.declare(bname, DefKind::Local, *bspan, false, true);
+                    match &arm.pattern {
+                        Pattern::Variant { binding: (bname, bspan), .. } => {
+                            self.declare(bname, DefKind::Local, *bspan, false, true);
+                        }
+                        // 素の識別子パターン — バリアント名か束縛変数かは typeck で判定するが、
+                        // 束縛変数として参照できるよう常に Local として登録しておく。
+                        Pattern::Bind { name, span } => {
+                            self.declare(name, DefKind::Local, *span, false, true);
+                        }
+                        _ => {}
                     }
                     // ガードはアームスコープ内で解決する（束縛変数を参照できる）。
                     if let Some(g) = &arm.guard {

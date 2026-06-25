@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-25（stderr 書き込み・stdout/stderr グローバル参照: `eputs`/`eputchar`・`stdin()`/`stdout()`/`stderr()` を `std/os.iris` へ追加）。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-25（`match` 識別子束縛パターン `x ->` 実装: scrutinee 全体を変数に束縛・バリアント名との自動判別）。
 
 ## パイプライン
 
@@ -335,7 +335,7 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 ### 未実装
 
 - ループ `for`: **整数範囲 `for x in lo..hi` / `lo..=hi`**・**一般イテレータ `for x in iter`（`Iterator<T>` 経由・ADR-0007）**・**配列 `T[]` / 動的配列 `Vec<T>` の直接反復 `for x in coll`** は実装済み（いずれも縦断・clang 実行）。**残り**: 非 Copy 要素の反復（要素のムーブ/借用の所有権設計）、複数 `Iterator` 実装の同居を解く `for x#T in iter` 修飾構文、浮動小数範囲
-- `match` の拡張: リテラル（整数・浮動小数・bool・**文字列**）・**範囲 `1..10` / `1..=10`**・**ガード `if cond`**・ワイルドカード `_`・enum バリアント束縛・enum タグ比較による if-else 連鎖は実装済み。**残り**: 範囲の浮動小数境界の網羅性、識別子束縛パターン（`x ->` で scrutinee 全体を束縛）、ネストパターン、`|`（or パターン）、exhaustiveness 検査
+- `match` の拡張: リテラル（整数・浮動小数・bool・**文字列**）・**範囲 `1..10` / `1..=10`**・**ガード `if cond`**・ワイルドカード `_`・enum バリアント束縛・enum タグ比較による if-else 連鎖・**識別子束縛パターン `x ->` （scrutinee 全体を束縛。`variant_owners` で自動判別）** は実装済み。**残り**: 範囲の浮動小数境界の網羅性、ネストパターン、`|`（or パターン）、exhaustiveness 検査
 - ラムダ `(x): T -> expr`、関数型シグネチャ
 - 一般の型合成 `A + B`（ADR-0001。引数位置の匿名トレイト境界としては実装済み）
 - ジェネリック **enum**（`Option`/`Result`/ユーザ定義）: スカラ／参照／`string`＝ptr ペイロードは i64 共通レイアウト、**struct 等の集約ペイロードは per-instantiation レイアウトで実装済み**（ADR-0010、`Option<Point>`・`Wrap<Point>` 等が縦断・clang 実行）。**残り**: 複数異種ペイロードの過小整列（記憶域＝最大サイズ型のため最大整列とは限らない）、ジェネリック関数の単相化の内側でのみ現れる集約インスタンスの型宣言収集（ADR-0010「Consequences」参照）

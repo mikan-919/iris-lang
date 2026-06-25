@@ -1454,11 +1454,11 @@ fn parse_pattern(input: Tokens) -> PResult<Pattern> {
                 Pattern::Lit { value: LitPat::Str(s), span },
             ))
         }
-        // `VariantName` または `VariantName(binding)`
+        // `Name(binding)` または素の識別子パターン。
         TokenKind::Ident(name) => {
             let name = name.clone();
             let rest = input.take_from(1);
-            // `Name(binding)` — ペイロードの束縛。
+            // `Name(binding)` — ペイロード束縛付きバリアント。
             if rest.peek() == &TokenKind::LParen {
                 let (rest, _) = eat(rest, &TokenKind::LParen, "`(`")?;
                 let (rest, (bname, bspan)) = ident(rest)?;
@@ -1468,15 +1468,13 @@ fn parse_pattern(input: Tokens) -> PResult<Pattern> {
                     rest,
                     Pattern::Variant {
                         name,
-                        binding: Some((bname, bspan)),
+                        binding: (bname, bspan),
                         span: full_span,
                     },
                 ))
             } else {
-                Ok((
-                    rest,
-                    Pattern::Variant { name, binding: None, span },
-                ))
+                // 素の識別子 — バリアント名か束縛変数かは typeck で判定。
+                Ok((rest, Pattern::Bind { name, span }))
             }
         }
         _ => Err(nom::Err::Error(ParseErr::expected(

@@ -2552,8 +2552,8 @@ impl<'a> FnCodegen<'a> {
                     self.emit(&format!("{and} = and i1 {ge}, {lt}"));
                     Some(and)
                 }
-                Pattern::Variant { name, binding, .. } => {
-                    // enum タグとの比較。
+                Pattern::Variant { name, .. } => {
+                    // ペイロード束縛付きバリアント — enum タグとの比較。
                     let ename = enum_name.as_deref().ok_or_else(|| {
                         CodegenError::new(span, "バリアントパターンを非 enum 型に使っています")
                     })?;
@@ -2565,6 +2565,23 @@ impl<'a> FnCodegen<'a> {
                     self.emit(&format!("{cmp} = icmp eq i8 {tv}, {tag}"));
                     Some(cmp)
                 }
+                Pattern::Bind { name, .. } => {
+                    // 素の識別子パターン。enum タグが見つかればバリアント一致、なければ無条件一致。
+                    if let (Some(ename), Some(tv)) = (enum_name.as_deref(), tag_val.as_deref()) {
+                        if let Some(tag) = self.structs.enum_tag(ename, name) {
+                            let cmp = self.fresh_tmp();
+                            self.emit(&format!("{cmp} = icmp eq i8 {tv}, {tag}"));
+                            Some(cmp)
+                        } else {
+                            self.emit(&format!("br label %{arm_l}"));
+                            None
+                        }
+                    } else {
+                        // 識別子束縛パターン: ワイルドカード同様に無条件分岐。
+                        self.emit(&format!("br label %{arm_l}"));
+                        None
+                    }
+                }
             };
 
             if let Some(c) = cond {
@@ -2575,7 +2592,7 @@ impl<'a> FnCodegen<'a> {
             self.terminated = false;
 
             // バリアントパターンのペイロード束縛を設定する。
-            if let Pattern::Variant { name, binding: Some((bname, bspan)), .. } = &arm.pattern {
+            if let Pattern::Variant { name, binding: (bname, bspan), .. } = &arm.pattern {
                 let ename = enum_name.as_deref().unwrap();
                 // scrutinee の型引数でペイロード型を単相化する（Option<i32> なら T→i32）。
                 let concrete_args = match &scrut_ty {
@@ -2608,6 +2625,32 @@ impl<'a> FnCodegen<'a> {
                         self.emit(&format!("{slot} = alloca {pllty}"));
                         self.emit(&format!("store {pllty} {typed}, ptr {slot}"));
                         self.locals.insert(id, (slot, pllty));
+                    }
+                }
+            }
+
+            // 識別子束縛パターン: scrutinee 値を束縛変数スロットへ格納する。
+            if let Pattern::Bind { name, span: pat_span } = &arm.pattern {
+                let is_variant = enum_name.as_deref()
+                    .and_then(|en| self.structs.enum_tag(en, name))
+                    .is_some();
+                if !is_variant {
+                    if let Some(&id) = self.def_spans.get(pat_span) {
+                        let bind_ty = self.types.get(pat_span).cloned().unwrap_or(scrut_ty.clone());
+                        let bllty = llvm_ty(&bind_ty, self.structs)
+                            .map_err(|m| CodegenError::new(span, m))?;
+                        let slot = format!("%{name}.slot{id}");
+                        self.emit(&format!("{slot} = alloca {bllty}"));
+                        // enum の場合 scrut_val はポインタなので load してから格納する。
+                        let val = if enum_llty.is_some() {
+                            let v = self.fresh_tmp();
+                            self.emit(&format!("{v} = load {bllty}, ptr {scrut_val}"));
+                            v
+                        } else {
+                            scrut_val.clone()
+                        };
+                        self.emit(&format!("store {bllty} {val}, ptr {slot}"));
+                        self.locals.insert(id, (slot, bllty));
                     }
                 }
             }

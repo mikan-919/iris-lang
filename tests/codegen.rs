@@ -1210,3 +1210,40 @@ fn runs_os_stdout_stderr_fd_functions() {
     let _ = std::fs::remove_file(&ll);
     let _ = std::fs::remove_file(&exe);
 }
+
+#[test]
+fn match_ident_bind_scalar() {
+    // `match n { x -> x + 1 }` — 非 enum、識別子束縛パターン。
+    let src = "fn main(): i32 { let n = 41 \n match n { x -> x + 1 } }";
+    assert_eq!(run_exit_code(src, "bind_scalar"), Some(42));
+}
+
+#[test]
+fn match_ident_bind_catchall_in_enum() {
+    // enum match で最後アームを識別子パターンで受ける。
+    let src = concat!(
+        "fn main(): i32 {\n",
+        "    let opt: Option<i32> = None\n",
+        "    match opt {\n",
+        "        Some(x) -> x\n",
+        "        other -> 7\n",
+        "    }\n",
+        "}"
+    );
+    assert_eq!(run_exit_code(src, "bind_catchall"), Some(7));
+}
+
+#[test]
+fn match_variant_no_payload_still_works() {
+    // `None` はバリアント名として扱われ続けること。
+    let src = concat!(
+        "fn main(): i32 {\n",
+        "    let opt: Option<i32> = Some(5)\n",
+        "    match opt {\n",
+        "        None -> 0\n",
+        "        Some(x) -> x\n",
+        "    }\n",
+        "}"
+    );
+    assert_eq!(run_exit_code(src, "bind_variant_none"), Some(5));
+}

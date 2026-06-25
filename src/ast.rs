@@ -339,11 +339,16 @@ pub enum Pattern {
         inclusive: bool,
         span: Span,
     },
-    /// `VariantName` または `VariantName(binding)`
+    /// `VariantName(binding)` — ペイロード束縛付きバリアント。
     Variant {
         name: String,
-        /// ペイロードを束縛する変数名と宣言 span。ペイロードなしのバリアントでは `None`。
-        binding: Option<(String, Span)>,
+        /// ペイロードを束縛する変数名と宣言 span。
+        binding: (String, Span),
+        span: Span,
+    },
+    /// `SomeName` — 素の識別子パターン。typeck でバリアント名か束縛変数かを判定する。
+    Bind {
+        name: String,
         span: Span,
     },
 }
@@ -354,7 +359,8 @@ impl Pattern {
             Pattern::Wildcard { span }
             | Pattern::Lit { span, .. }
             | Pattern::Range { span, .. }
-            | Pattern::Variant { span, .. } => *span,
+            | Pattern::Variant { span, .. }
+            | Pattern::Bind { span, .. } => *span,
         }
     }
 }

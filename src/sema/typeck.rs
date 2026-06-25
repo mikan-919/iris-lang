@@ -1061,7 +1061,7 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                Pattern::Variant { name, binding, span: pat_span } => {
+                Pattern::Variant { name, binding: (_bname, bspan), span: pat_span } => {
                     if let Some(ref evs) = enum_variants {
                         // バリアントが enum に存在するか確認。
                         let found = evs.iter().find(|(vn, _)| vn == name);
@@ -1078,28 +1078,43 @@ impl<'a> Checker<'a> {
                             }
                             Some((_, payload_ty)) => {
                                 // 束縛 x の型を登録。
-                                if let Some((bname, bspan)) = binding {
-                                    let bty = payload_ty.clone().unwrap_or(Ty::Infer);
-                                    if let Some(&id) = self.def_spans.get(bspan) {
-                                        self.def_types[id] = bty;
-                                    }
-                                } else if payload_ty.is_some() {
-                                    self.error(
-                                        *pat_span,
-                                        format!(
-                                            "バリアント `{name}` はペイロードを持ちます（`{name}(binding)` と書いてください）"
-                                        ),
-                                    );
+                                let bty = payload_ty.clone().unwrap_or(Ty::Infer);
+                                if let Some(&id) = self.def_spans.get(bspan) {
+                                    self.def_types[id] = bty;
                                 }
                             }
                         }
                     } else {
-                        // 非 enum に対するバリアントパターン（OK の場合も Infer 扱い）。
-                        // 束縛があれば Infer 型として登録する。
-                        if let Some((_, bspan)) = binding {
-                            if let Some(&id) = self.def_spans.get(bspan) {
-                                self.def_types[id] = Ty::Infer;
+                        // 非 enum への Name(x) パターン。束縛を Infer 型として登録する。
+                        if let Some(&id) = self.def_spans.get(bspan) {
+                            self.def_types[id] = Ty::Infer;
+                        }
+                    }
+                }
+                Pattern::Bind { name, span: pat_span } => {
+                    // 素の識別子パターン。variant_owners に存在すればバリアント名、
+                    // そうでなければ scrutinee 全体を束縛する変数パターン。
+                    let is_variant = if let Some(ref evs) = enum_variants {
+                        evs.iter().any(|(vn, _)| vn == name)
+                    } else {
+                        self.variant_owners.contains_key(name.as_str())
+                    };
+                    if is_variant {
+                        // バリアント名として扱う（ペイロードなし前提）。
+                        if let Some(ref evs) = enum_variants {
+                            if let Some((_, Some(_))) = evs.iter().find(|(vn, _)| vn == name) {
+                                self.error(
+                                    *pat_span,
+                                    format!(
+                                        "バリアント `{name}` はペイロードを持ちます（`{name}(binding)` と書いてください）"
+                                    ),
+                                );
                             }
+                        }
+                    } else {
+                        // 識別子束縛パターン: scrutinee の型を変数に付与する。
+                        if let Some(&id) = self.def_spans.get(pat_span) {
+                            self.def_types[id] = scrut_ty.clone();
                         }
                     }
                 }
