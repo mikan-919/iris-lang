@@ -1202,8 +1202,7 @@ impl<'a> Checker<'a> {
             }
         }
 
-        // exhaustiveness 検査（enum 型のみ）。
-        // ガード付きアームは「条件が常に真」と証明できないので網羅証明に使わない。
+        // exhaustiveness 検査。ガード付きアームは catch-all 証明に使わない。
         if let Some(ref evs) = enum_variants {
             let mut exhaustive = false;
             let mut covered: HashSet<String> = HashSet::new();
@@ -1278,6 +1277,57 @@ impl<'a> Checker<'a> {
                         ),
                     );
                 }
+            }
+        } else if scrut_ty == Ty::named("bool") {
+            // bool: true/false 両方を literal で覆うか、catch-all で網羅。
+            let mut covered_true = false;
+            let mut covered_false = false;
+            let mut has_catchall = false;
+            'bool_outer: for arm in arms {
+                let skip_guard = arm.guard.is_some();
+                let pats: &[Pattern] = match &arm.pattern {
+                    Pattern::Or { patterns, .. } => patterns,
+                    p => std::slice::from_ref(p),
+                };
+                for pat in pats {
+                    match pat {
+                        Pattern::Wildcard { .. } | Pattern::Bind { .. } if !skip_guard => {
+                            has_catchall = true;
+                            break 'bool_outer;
+                        }
+                        Pattern::Lit { value: LitPat::Bool(b), .. } if !skip_guard => {
+                            if *b { covered_true = true; } else { covered_false = true; }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !has_catchall && !(covered_true && covered_false) {
+                let mut missing = vec![];
+                if !covered_true { missing.push("`true`"); }
+                if !covered_false { missing.push("`false`"); }
+                self.error(
+                    span,
+                    format!(
+                        "match が網羅的ではありません: {} が未処理です",
+                        missing.join(", ")
+                    ),
+                );
+            }
+        } else if scrut_ty.is_numeric() {
+            // 数値型は値域が無限なので catch-all（`_` または識別子束縛）が必須。
+            let has_catchall = arms.iter().any(|arm| {
+                arm.guard.is_none()
+                    && matches!(&arm.pattern, Pattern::Wildcard { .. } | Pattern::Bind { .. })
+            });
+            if !has_catchall {
+                self.error(
+                    span,
+                    format!(
+                        "match が網羅的ではありません: 数値型 `{}` は値域が無限のため `_` または識別子束縛が必要です",
+                        scrut_ty.describe()
+                    ),
+                );
             }
         }
 

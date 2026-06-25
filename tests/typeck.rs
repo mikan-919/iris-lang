@@ -449,3 +449,48 @@ fn accepts_exhaustive_enum_match_with_or_pattern() {
     let src = "fn f(x: Option<i32>): i32 {\n    match x {\n        Some(v) -> v\n        None | _ -> 0\n    }\n}";
     typecheck(src).expect("網羅的なはず");
 }
+
+#[test]
+fn rejects_non_exhaustive_bool_match_missing_false() {
+    let src = "fn f(b: bool): i32 {\n    match b {\n        true -> 1\n    }\n}";
+    let errs = typecheck(src).unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("網羅") || m.contains("`false`")), "got: {errs:?}");
+}
+
+#[test]
+fn rejects_non_exhaustive_bool_match_missing_true() {
+    let src = "fn f(b: bool): i32 {\n    match b {\n        false -> 0\n    }\n}";
+    let errs = typecheck(src).unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("網羅") || m.contains("`true`")), "got: {errs:?}");
+}
+
+#[test]
+fn accepts_exhaustive_bool_match_both_literals() {
+    let src = "fn f(b: bool): i32 {\n    match b {\n        true -> 1\n        false -> 0\n    }\n}";
+    typecheck(src).expect("true/false 両方で網羅");
+}
+
+#[test]
+fn accepts_exhaustive_bool_match_with_wildcard() {
+    let src = "fn f(b: bool): i32 {\n    match b {\n        true -> 1\n        _ -> 0\n    }\n}";
+    typecheck(src).expect("ワイルドカードで網羅");
+}
+
+#[test]
+fn rejects_non_exhaustive_numeric_match_no_catchall() {
+    let src = "fn f(n: i32): i32 {\n    match n {\n        0 -> 0\n        1 -> 1\n    }\n}";
+    let errs = typecheck(src).unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("網羅") || m.contains("値域")), "got: {errs:?}");
+}
+
+#[test]
+fn accepts_exhaustive_numeric_match_with_wildcard() {
+    let src = "fn f(n: i32): i32 {\n    match n {\n        0 -> 0\n        _ -> 1\n    }\n}";
+    typecheck(src).expect("ワイルドカードで網羅");
+}
+
+#[test]
+fn accepts_exhaustive_numeric_match_with_bind() {
+    let src = "fn f(n: i32): i32 {\n    match n {\n        0 -> 0\n        rest -> rest\n    }\n}";
+    typecheck(src).expect("識別子束縛で網羅");
+}
