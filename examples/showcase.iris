@@ -1,0 +1,169 @@
+// showcase.iris — RPN（逆ポーランド記法）電卓
+//
+// 仕様:
+//   ソース内のリテラル式 "3 4 + 5 *" を評価し、結果を main の終了コードで返す。
+//   "3 4 + 5 *" = (3 + 4) * 5 = 35。
+//
+// 踏む機能:
+//   1. string — s[i]（→ u8）、s.len()、as i32 変換
+//   2. Vec<i32> + struct — スタックの実装（push / 添字アクセス）
+//   3. enum（Token）+ match — Num 束縛・ガード・catch-all
+//   4. impl（Stack の固有メソッド push / pop）
+//   5. ! エラー伝播 — digit_token が byte_to_digit の Option<i32> を ! で連鎖
+//   6. for x in lo..hi — 文字列を 1 バイト単位でスキャン
+//
+// 終了コードの期待値: 35
+//
+// 注記（match アームは単一式のみ）:
+//   複数文を要するアーム本体は補助関数に抽出する（STATUS.md 記載の既知制約）。
+
+// ---- トークン型 -------------------------------------------------------
+
+type Token = enum {
+    Num(i32)
+    Add
+    Sub
+    Mul
+}
+
+// ---- スタック（Vec<i32> + 長さカウンタ） ------------------------------
+//
+// Vec.pop は未実装のため push 済み要素を添字で読み取り、
+// top カウンタを手動で管理する。
+
+type Stack = struct {
+    data: Vec<i32>
+    top: i32
+}
+
+impl Stack {
+    // スタックに値を積む。
+    fn push(&mut self, v: i32) {
+        self.data.push(v)
+        self.top = self.top + 1
+    }
+
+    // スタックから値を取り出す（top を減らして要素を返す）。
+    fn pop(&mut self): i32 {
+        self.top = self.top - 1
+        return self.data[self.top]
+    }
+}
+
+// ---- 演算ヘルパ（match アームが単一式のため補助関数に切り出す）-------
+
+fn do_add(st: &mut Stack): i32 {
+    let r = st.pop()
+    let l = st.pop()
+    st.push(l + r)
+    return 0
+}
+
+fn do_sub(st: &mut Stack): i32 {
+    let r = st.pop()
+    let l = st.pop()
+    st.push(l - r)
+    return 0
+}
+
+fn do_mul(st: &mut Stack): i32 {
+    let r = st.pop()
+    let l = st.pop()
+    st.push(l * r)
+    return 0
+}
+
+fn do_push(st: &mut Stack, d: i32): i32 {
+    st.push(d)
+    return 0
+}
+
+// ---- 1 バイトの数字解析 -----------------------------------------------
+//
+// バイト b が ASCII 数字（48..=57）なら Some(digit)、そうでなければ None。
+
+fn byte_to_digit(b: u8): Option<i32> {
+    let n = b as i32
+    if n >= 48 && n <= 57 {
+        return Some(n - 48)
+    }
+    return None
+}
+
+// ---- 数字バイトを Num トークンに変換する（! 伝播のデモ）--------------
+//
+// byte_to_digit の Option<i32> を ! で伝播し、Num トークンに包んで返す。
+// b が数字でなければ None が伝播して None を返す。
+
+fn digit_token(b: u8): Option<Token> {
+    let d = byte_to_digit(b)!
+    return Some(Num(d))
+}
+
+// ---- 1 バイトのトークン解析 -------------------------------------------
+//
+// 数字は Num(d)、'+' は Add、'-' は Sub、'*' は Mul に変換する。
+// スペースや不明文字は None を返す（eval 側でスキップ）。
+
+fn parse_token(b: u8): Option<Token> {
+    let c = b as i32
+    if c >= 48 && c <= 57 {
+        return digit_token(b)
+    }
+    if c == 43 {
+        return Some(Add)
+    }
+    if c == 45 {
+        return Some(Sub)
+    }
+    if c == 42 {
+        return Some(Mul)
+    }
+    return None
+}
+
+// ---- トークンをスタックに適用する -------------------------------------
+//
+// match 式でバリアントを識別する。各アームは補助関数への単一呼び出し。
+
+fn apply(st: &mut Stack, t: Token): i32 {
+    match t {
+        Num(d) -> do_push(st, d)
+        Add -> do_add(st)
+        Sub -> do_sub(st)
+        Mul -> do_mul(st)
+    }
+}
+
+// ---- RPN 評価 ---------------------------------------------------------
+//
+// 各バイトを for ループで走査し、Some(token) のときだけ apply を呼ぶ。
+// 成功時はスタック頂上を Some で返す。
+
+fn eval(expr: string): Option<i32> {
+    let mut st = Stack { data: [], top: 0 }
+    let n = expr.len()
+    for i in 0..n {
+        let b = expr[i]
+        let tok = parse_token(b)
+        match tok {
+            Some(t) -> apply(&mut st, t)
+            _ -> 0
+        }
+    }
+    if st.top > 0 {
+        return Some(st.data[st.top - 1])
+    }
+    return None
+}
+
+// ---- エントリポイント -------------------------------------------------
+
+fn main(): i32 {
+    let expr = "3 4 + 5 *"
+    let result = eval(expr)
+    match result {
+        Some(v) -> v
+        None -> 0
+    }
+}
