@@ -20,7 +20,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    BinaryOp, Block, Else, Expr, ExprKind, Function, Item, Program, SelfKind, Stmt, UnaryOp,
+    BinaryOp, Block, Else, Expr, ExprKind, Function, Item, Pattern, Program, SelfKind, Stmt,
+    UnaryOp,
 };
 use crate::sema::resolve::{DefId, DefKind, Resolution};
 use crate::sema::ty::{FLOAT_TYPES, INT_TYPES, Ty};
@@ -353,6 +354,16 @@ impl Flow<'_> {
                     .iter()
                     .map(|arm| {
                         let mut arm_st = st.clone();
+                        // パターン束縛はこのアームで新たに束縛し直されるので、（ループの先行パスで付いた）
+                        // 古いムーブ状態をクリアする。ループ変数のリセット（上の For 参照）と同じ理屈。
+                        let mut binds = Vec::new();
+                        Self::pattern_binding_spans(&arm.pattern, &mut binds);
+                        for span in binds {
+                            if let Some(&id) = self.def_spans.get(&span) {
+                                arm_st.moved.remove(&id);
+                                arm_st.dangling.remove(&id);
+                            }
+                        }
                         // ガードは本体より先に評価される（条件＝読み取り）。
                         if let Some(g) = &arm.guard {
                             self.visit_operand(g, &mut arm_st);
@@ -516,6 +527,21 @@ impl Flow<'_> {
         self.res.uses.get(&callee.span).is_some_and(|&id| {
             matches!(self.res.defs[id].kind, DefKind::Function | DefKind::Builtin)
         })
+    }
+
+    /// パターンが束縛する変数の宣言 span を集める（Variant のペイロード・素の Bind・
+    /// Or の各選択肢）。バリアント名だけの Bind は def_spans に載らないので無害。
+    fn pattern_binding_spans(pat: &Pattern, out: &mut Vec<Span>) {
+        match pat {
+            Pattern::Variant { binding, .. } => out.push(binding.1),
+            Pattern::Bind { span, .. } => out.push(*span),
+            Pattern::Or { patterns, .. } => {
+                for p in patterns {
+                    Self::pattern_binding_spans(p, out);
+                }
+            }
+            Pattern::Wildcard { .. } | Pattern::Lit { .. } | Pattern::Range { .. } => {}
+        }
     }
 
     /// 束縛が参照型か。

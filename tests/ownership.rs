@@ -101,3 +101,11 @@ fn example_hello_passes_ownership() {
     let src = include_str!("../examples/hello.iris");
     ownck(src).expect("サンプルは所有権検査を通る");
 }
+
+#[test]
+fn loop_match_binding_move_is_ok() {
+    // for ループ内の match アーム束縛 `t` を &mut と共にムーブで渡すのは正しい。
+    // probe パスのムーブ状態が次パスへ漏れて偽 use-after-move にならないことの回帰。
+    let src = "type Token = enum {\n    Num(i32)\n    Add\n}\ntype Stack = struct {\n    top: i32\n}\nfn apply(st: &mut Stack, t: Token): i32 {\n    return 0\n}\nfn main(): i32 {\n    let mut st = Stack { top: 0 }\n    for i in 0..3 {\n        let o: Option<Token> = Some(Num(i))\n        match o {\n            Some(t) -> apply(&mut st, t)\n            _ -> 0\n        }\n    }\n    return 0\n}";
+    ownck(src).expect("ループ内 match 束縛のムーブは通るべき");
+}
