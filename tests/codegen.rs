@@ -1161,3 +1161,52 @@ fn runs_os_write_to_stdout() {
     let _ = std::fs::remove_file(&ll);
     let _ = std::fs::remove_file(&exe);
 }
+
+#[test]
+fn runs_os_eputs_to_stderr() {
+    // eputs は fd=2（stderr）へ syscall3(1,...) で書き出す。stdout は空のまま。
+    if !clang_available() {
+        return;
+    }
+    let src = "use std.os.*\nfn main(): i32 {\n    eputs(\"oops\")\n    return 0\n}";
+    let ir = emit(src);
+    let dir = std::env::temp_dir();
+    let ll = dir.join("iris_cg_eputs.ll");
+    let exe = dir.join("iris_cg_eputs.bin");
+    std::fs::write(&ll, &ir).unwrap();
+    let ok = Command::new("clang").arg("-nostartfiles").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
+    assert!(ok.status.success(), "clang 失敗:\n{}", String::from_utf8_lossy(&ok.stderr));
+    let out = Command::new(&exe).output().expect("実行");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "", "stdout は空のはず");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "oops\n");
+    let _ = std::fs::remove_file(&ll);
+    let _ = std::fs::remove_file(&exe);
+}
+
+#[test]
+fn runs_os_stdout_stderr_fd_functions() {
+    // stdout()/stderr() は 1/2 を File 型で返す。戻り値を write の fd 引数に渡せる。
+    if !clang_available() {
+        return;
+    }
+    let src = concat!(
+        "use std.os.*\n",
+        "fn main(): i32 {\n",
+        "    write(stdout(), \"out\", 3)\n",
+        "    write(stderr(), \"err\", 3)\n",
+        "    return 0\n",
+        "}"
+    );
+    let ir = emit(src);
+    let dir = std::env::temp_dir();
+    let ll = dir.join("iris_cg_fd_fns.ll");
+    let exe = dir.join("iris_cg_fd_fns.bin");
+    std::fs::write(&ll, &ir).unwrap();
+    let ok = Command::new("clang").arg("-nostartfiles").arg(&ll).arg("-o").arg(&exe).output().expect("clang 実行");
+    assert!(ok.status.success(), "clang 失敗:\n{}", String::from_utf8_lossy(&ok.stderr));
+    let out = Command::new(&exe).output().expect("実行");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "out");
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "err");
+    let _ = std::fs::remove_file(&ll);
+    let _ = std::fs::remove_file(&exe);
+}

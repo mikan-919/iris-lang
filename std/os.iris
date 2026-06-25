@@ -9,6 +9,11 @@
 // i64 の別名であり Copy 型（整数なので所有権追跡の対象外）。
 pub type File = i64
 
+// 標準ファイル記述子。top-level const は iris で未対応のため関数として提供する。
+pub fn stdin(): File { return 0 }
+pub fn stdout(): File { return 1 }
+pub fn stderr(): File { return 2 }
+
 // open フラグ定数（Linux x86-64）。
 // O_RDONLY=0, O_WRONLY=1, O_RDWR=2, O_CREAT=64(0100o), O_TRUNC=512(01000o)
 // 例: open(path, 577) で書き込み＋新規作成＋切り詰め（O_WRONLY|O_CREAT|O_TRUNC=577）。
@@ -61,6 +66,18 @@ pub fn read_line(fd: File, buf: string, max: i32): i32 {
     let end_ptr = (buf as i64 + i as i64) as RawPtr
     memset(end_ptr, 0, 1)
     return i
+}
+
+// 文字列を stderr へ書き出し末尾に改行を付ける（puts の stderr 版）。
+pub fn eputs(s: string): void {
+    let n = strlen(s) as i64
+    syscall3(1, 2 as i64, s as i64, n)
+    syscall3(1, 2 as i64, "\n" as i64, 1)
+}
+
+// 1 文字（i32 の LSB）を stderr へ書き出す（putchar の stderr 版）。
+pub fn eputchar(c: i32): void {
+    syscall3(1, 2 as i64, &c as i64, 1)
 }
 
 // プロセスを終了コード code で終了する（戻らない）。

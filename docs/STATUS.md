@@ -1,6 +1,6 @@
 # 実装状況
 
-iris-lang コンパイラの実装進捗。最終更新: 2026-06-24（ADR-0011 実装順④: `fopen`/`fclose`/`fputs`/`fgets`/`getenv` を syscall 版へ移行・`File = i64`（fd）へ変更・パーサー `as T +` 曖昧性バグ修正）。
+iris-lang コンパイラの実装進捗。最終更新: 2026-06-25（stderr 書き込み・stdout/stderr グローバル参照: `eputs`/`eputchar`・`stdin()`/`stdout()`/`stderr()` を `std/os.iris` へ追加）。
 
 ## パイプライン
 
@@ -297,7 +297,8 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 - **組み込み述語 `is_null(p): bool`**: ポインタ裏付けの型（`RawPtr`/`string`、別名含む）が NULL かを返すコンパイラ組み込み。
   resolve（`PRELUDE`）→ typeck（`is_rawptr_like` で引数検査・`bool` 返り）→ codegen（`icmp eq ptr %p, null`）に配線
 - 書き込み→読み戻しのファイル往復、`open` の Some/None 両経路、`exit`、`env` の設定/未設定を検証（`tests/codegen.rs`）
-- **残り**: `File` の自動 `close`（Drop）・`stderr` への直接書き込み・可変長引数（`fprintf` 等）は未対応
+- **追加済み**: `eputs(s)` / `eputchar(c)`（stderr 書き込み）・`stdin()` / `stdout()` / `stderr()`（fd 参照関数）
+- **残り**: `File` の自動 `close`（Drop）・可変長引数（`fprintf` 等）は未対応
 
 ### トレイトシステム（実装済み・ADR-0004〜0009）
 
