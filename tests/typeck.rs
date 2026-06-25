@@ -494,3 +494,30 @@ fn accepts_exhaustive_numeric_match_with_bind() {
     let src = "fn f(n: i32): i32 {\n    match n {\n        0 -> 0\n        rest -> rest\n    }\n}";
     typecheck(src).expect("識別子束縛で網羅");
 }
+
+#[test]
+fn rejects_non_exhaustive_string_match() {
+    // 文字列 match に catch-all が無い → 網羅エラー（未初期化読み出しの UB を型検査で塞ぐ）。
+    let src = "fn r(s: string): i32 {\n    let x = match s {\n        \"gold\" -> 3\n        \"silver\" -> 2\n    }\n    return x\n}";
+    let errs = typecheck(src).unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("網羅")), "got: {errs:?}");
+}
+
+#[test]
+fn accepts_exhaustive_string_match_with_wildcard() {
+    let src = "fn r(s: string): i32 {\n    match s {\n        \"gold\" -> 3\n        _ -> 0\n    }\n}";
+    typecheck(src).expect("ワイルドカードで網羅");
+}
+
+#[test]
+fn accepts_exhaustive_string_match_with_bind() {
+    let src = "fn r(s: string): i32 {\n    match s {\n        \"gold\" -> 3\n        rest -> 0\n    }\n}";
+    typecheck(src).expect("識別子束縛で網羅");
+}
+
+#[test]
+fn accepts_exhaustive_numeric_match_with_or_wildcard() {
+    // 副次バグの回帰: `or` に包まれた `_` を catch-all と認識する。
+    let src = "fn f(n: i32): i32 {\n    match n {\n        0 -> 0\n        1 | _ -> 9\n    }\n}";
+    typecheck(src).expect("or 内のワイルドカードで網羅");
+}

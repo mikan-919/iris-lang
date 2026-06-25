@@ -1314,17 +1314,29 @@ impl<'a> Checker<'a> {
                     ),
                 );
             }
-        } else if scrut_ty.is_numeric() {
-            // 数値型は値域が無限なので catch-all（`_` または識別子束縛）が必須。
+        } else if scrut_ty != Ty::Error && scrut_ty != Ty::Infer {
+            // enum / bool 以外（数値・string・char・struct 等）は値域を有限に列挙
+            // できないので、catch-all（`_` またはガード無しの識別子束縛）が必須。
+            // これが無いと codegen が初期化されていない result slot を load する（UB）。
+            // Error / Infer の scrutinee（先行する型エラー由来）には波及エラーを出さない。
             let has_catchall = arms.iter().any(|arm| {
-                arm.guard.is_none()
-                    && matches!(&arm.pattern, Pattern::Wildcard { .. } | Pattern::Bind { .. })
+                if arm.guard.is_some() {
+                    return false;
+                }
+                // `or` パターンは展開して、どれか 1 つが catch-all なら catch-all 扱い。
+                let pats: &[Pattern] = match &arm.pattern {
+                    Pattern::Or { patterns, .. } => patterns,
+                    p => std::slice::from_ref(p),
+                };
+                pats.iter().any(|p| {
+                    matches!(p, Pattern::Wildcard { .. } | Pattern::Bind { .. })
+                })
             });
             if !has_catchall {
                 self.error(
                     span,
                     format!(
-                        "match が網羅的ではありません: 数値型 `{}` は値域が無限のため `_` または識別子束縛が必要です",
+                        "match が網羅的ではありません: 型 `{}` は catch-all（`_` または識別子束縛）が必要です",
                         scrut_ty.describe()
                     ),
                 );
