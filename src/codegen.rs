@@ -2405,6 +2405,122 @@ impl<'a> FnCodegen<'a> {
         }
     }
 
+    /// パターン 1 つの一致条件を計算する。None = 無条件一致（ワイルドカード等）。
+    /// 分岐命令は emit しない。
+    fn pattern_cond(
+        &mut self,
+        pat: &Pattern,
+        scrut_val: &str,
+        scrut_ty: &Ty,
+        scrut_llty: &str,
+        enum_name: Option<&str>,
+        tag_val: Option<&str>,
+        span: Span,
+    ) -> Result<Option<String>, CodegenError> {
+        match pat {
+            Pattern::Wildcard { .. } => Ok(None),
+            Pattern::Lit { value, .. } => {
+                match value {
+                    LitPat::Str(s) => {
+                        let gref = self.strings.borrow_mut().intern(s);
+                        let r = self.fresh_tmp();
+                        self.emit(&format!("{r} = call i32 @strcmp(ptr {scrut_val}, ptr {gref})"));
+                        let cmp = self.fresh_tmp();
+                        self.emit(&format!("{cmp} = icmp eq i32 {r}, 0"));
+                        Ok(Some(cmp))
+                    }
+                    _ => {
+                        let pat_v = match value {
+                            LitPat::Int(n) => n.to_string(),
+                            LitPat::Float(f) => float_const(*f, scrut_llty),
+                            LitPat::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+                            LitPat::Str(_) => unreachable!(),
+                        };
+                        let cmp = self.fresh_tmp();
+                        if scrut_ty.is_float() {
+                            self.emit(&format!("{cmp} = fcmp oeq {scrut_llty} {scrut_val}, {pat_v}"));
+                        } else {
+                            self.emit(&format!("{cmp} = icmp eq {scrut_llty} {scrut_val}, {pat_v}"));
+                        }
+                        Ok(Some(cmp))
+                    }
+                }
+            }
+            Pattern::Range { lo, hi, inclusive, .. } => {
+                let nk = num_kind(scrut_ty);
+                let const_of = |b: &LitPat| match b {
+                    LitPat::Int(n) => n.to_string(),
+                    LitPat::Float(f) => float_const(*f, scrut_llty),
+                    LitPat::Bool(x) => if *x { "1" } else { "0" }.to_string(),
+                    LitPat::Str(_) => "0".to_string(),
+                };
+                let lo_v = const_of(lo);
+                let hi_v = const_of(hi);
+                let ge_pred = match nk {
+                    NumKind::Float => "fcmp oge",
+                    NumKind::UInt => "icmp uge",
+                    NumKind::SInt => "icmp sge",
+                };
+                let hi_pred = match (nk, *inclusive) {
+                    (NumKind::Float, false) => "fcmp olt",
+                    (NumKind::Float, true) => "fcmp ole",
+                    (NumKind::UInt, false) => "icmp ult",
+                    (NumKind::UInt, true) => "icmp ule",
+                    (NumKind::SInt, false) => "icmp slt",
+                    (NumKind::SInt, true) => "icmp sle",
+                };
+                let ge = self.fresh_tmp();
+                self.emit(&format!("{ge} = {ge_pred} {scrut_llty} {scrut_val}, {lo_v}"));
+                let lt = self.fresh_tmp();
+                self.emit(&format!("{lt} = {hi_pred} {scrut_llty} {scrut_val}, {hi_v}"));
+                let and = self.fresh_tmp();
+                self.emit(&format!("{and} = and i1 {ge}, {lt}"));
+                Ok(Some(and))
+            }
+            Pattern::Variant { name, .. } => {
+                let ename = enum_name.ok_or_else(|| {
+                    CodegenError::new(span, "バリアントパターンを非 enum 型に使っています")
+                })?;
+                let tag = self.structs.enum_tag(ename, name).ok_or_else(|| {
+                    CodegenError::new(span, format!("バリアント `{name}` が見つかりません"))
+                })?;
+                let cmp = self.fresh_tmp();
+                let tv = tag_val.unwrap();
+                self.emit(&format!("{cmp} = icmp eq i8 {tv}, {tag}"));
+                Ok(Some(cmp))
+            }
+            Pattern::Bind { name, .. } => {
+                if let (Some(en), Some(tv)) = (enum_name, tag_val) {
+                    if let Some(tag) = self.structs.enum_tag(en, name) {
+                        let cmp = self.fresh_tmp();
+                        self.emit(&format!("{cmp} = icmp eq i8 {tv}, {tag}"));
+                        return Ok(Some(cmp));
+                    }
+                }
+                // 識別子束縛パターン / ワイルドカード扱い: 無条件一致。
+                Ok(None)
+            }
+            Pattern::Or { patterns, .. } => {
+                // 各選択肢の条件を `or i1` で合成する。どれかが None（無条件）なら全体も None。
+                let mut combined: Option<String> = None;
+                for sub in patterns {
+                    let sub_cond = self.pattern_cond(sub, scrut_val, scrut_ty, scrut_llty,
+                                                      enum_name, tag_val, span)?;
+                    match (combined.take(), sub_cond) {
+                        (_, None) => return Ok(None), // 無条件選択肢 → 全体無条件
+                        (None, Some(c)) => combined = Some(c),
+                        (Some(a), Some(b)) => {
+                            let r = self.fresh_tmp();
+                            self.emit(&format!("{r} = or i1 {a}, {b}"));
+                            combined = Some(r);
+                        }
+                    }
+                }
+                Ok(combined)
+            }
+        }
+    }
+
     /// match 式を生成する。結果型が void でなければ alloca+store+load で値を返す。
     fn gen_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> Result<String, CodegenError> {
         // 結果型の LLVM 型を求める（最初の非 void アームから判断）。
@@ -2479,113 +2595,19 @@ impl<'a> FnCodegen<'a> {
                 self.fresh_label("match.check")
             };
 
-            // パターン条件チェック。
-            let cond = match &arm.pattern {
-                Pattern::Wildcard { .. } => {
-                    // ワイルドカードは常に一致。
-                    self.emit(&format!("br label %{arm_l}"));
-                    None
-                }
-                Pattern::Lit { value, .. } => {
-                    match value {
-                        // 文字列は NUL 終端 ptr 同士を strcmp で比較する（一致＝0）。
-                        LitPat::Str(s) => {
-                            let gref = self.strings.borrow_mut().intern(s);
-                            let r = self.fresh_tmp();
-                            self.emit(&format!(
-                                "{r} = call i32 @strcmp(ptr {scrut_val}, ptr {gref})"
-                            ));
-                            let cmp = self.fresh_tmp();
-                            self.emit(&format!("{cmp} = icmp eq i32 {r}, 0"));
-                            Some(cmp)
-                        }
-                        _ => {
-                            let pat_v = match value {
-                                LitPat::Int(n) => n.to_string(),
-                                LitPat::Float(f) => float_const(*f, &scrut_llty),
-                                LitPat::Bool(b) => if *b { "1" } else { "0" }.to_string(),
-                                LitPat::Str(_) => unreachable!(),
-                            };
-                            let cmp = self.fresh_tmp();
-                            if scrut_ty.is_float() {
-                                self.emit(&format!(
-                                    "{cmp} = fcmp oeq {scrut_llty} {scrut_val}, {pat_v}"
-                                ));
-                            } else {
-                                self.emit(&format!(
-                                    "{cmp} = icmp eq {scrut_llty} {scrut_val}, {pat_v}"
-                                ));
-                            }
-                            Some(cmp)
-                        }
-                    }
-                }
-                Pattern::Range { lo, hi, inclusive, .. } => {
-                    // 数値の範囲 `lo..hi` / `lo..=hi`: lo <= x && (x < hi | x <= hi)。
-                    let nk = num_kind(&scrut_ty);
-                    let const_of = |b: &LitPat| match b {
-                        LitPat::Int(n) => n.to_string(),
-                        LitPat::Float(f) => float_const(*f, &scrut_llty),
-                        LitPat::Bool(x) => if *x { "1" } else { "0" }.to_string(),
-                        LitPat::Str(_) => "0".to_string(),
-                    };
-                    let lo_v = const_of(lo);
-                    let hi_v = const_of(hi);
-                    let ge_pred = match nk {
-                        NumKind::Float => "fcmp oge",
-                        NumKind::UInt => "icmp uge",
-                        NumKind::SInt => "icmp sge",
-                    };
-                    let hi_pred = match (nk, *inclusive) {
-                        (NumKind::Float, false) => "fcmp olt",
-                        (NumKind::Float, true) => "fcmp ole",
-                        (NumKind::UInt, false) => "icmp ult",
-                        (NumKind::UInt, true) => "icmp ule",
-                        (NumKind::SInt, false) => "icmp slt",
-                        (NumKind::SInt, true) => "icmp sle",
-                    };
-                    let ge = self.fresh_tmp();
-                    self.emit(&format!("{ge} = {ge_pred} {scrut_llty} {scrut_val}, {lo_v}"));
-                    let lt = self.fresh_tmp();
-                    self.emit(&format!("{lt} = {hi_pred} {scrut_llty} {scrut_val}, {hi_v}"));
-                    let and = self.fresh_tmp();
-                    self.emit(&format!("{and} = and i1 {ge}, {lt}"));
-                    Some(and)
-                }
-                Pattern::Variant { name, .. } => {
-                    // ペイロード束縛付きバリアント — enum タグとの比較。
-                    let ename = enum_name.as_deref().ok_or_else(|| {
-                        CodegenError::new(span, "バリアントパターンを非 enum 型に使っています")
-                    })?;
-                    let tag = self.structs.enum_tag(ename, name).ok_or_else(|| {
-                        CodegenError::new(span, format!("バリアント `{name}` が見つかりません"))
-                    })?;
-                    let cmp = self.fresh_tmp();
-                    let tv = tag_val.as_deref().unwrap();
-                    self.emit(&format!("{cmp} = icmp eq i8 {tv}, {tag}"));
-                    Some(cmp)
-                }
-                Pattern::Bind { name, .. } => {
-                    // 素の識別子パターン。enum タグが見つかればバリアント一致、なければ無条件一致。
-                    if let (Some(ename), Some(tv)) = (enum_name.as_deref(), tag_val.as_deref()) {
-                        if let Some(tag) = self.structs.enum_tag(ename, name) {
-                            let cmp = self.fresh_tmp();
-                            self.emit(&format!("{cmp} = icmp eq i8 {tv}, {tag}"));
-                            Some(cmp)
-                        } else {
-                            self.emit(&format!("br label %{arm_l}"));
-                            None
-                        }
-                    } else {
-                        // 識別子束縛パターン: ワイルドカード同様に無条件分岐。
-                        self.emit(&format!("br label %{arm_l}"));
-                        None
-                    }
-                }
-            };
-
-            if let Some(c) = cond {
-                self.emit(&format!("br i1 {c}, label %{arm_l}, label %{skip_l}"));
+            // パターン条件チェック。None = 無条件一致（ワイルドカード等）。
+            let cond = self.pattern_cond(
+                &arm.pattern,
+                &scrut_val,
+                &scrut_ty,
+                &scrut_llty,
+                enum_name.as_deref(),
+                tag_val.as_deref(),
+                span,
+            )?;
+            match cond {
+                None => self.emit(&format!("br label %{arm_l}")),
+                Some(c) => self.emit(&format!("br i1 {c}, label %{arm_l}, label %{skip_l}")),
             }
 
             self.emit_label(&arm_l);

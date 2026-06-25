@@ -275,6 +275,7 @@ fn lex_symbol(input: LSpan) -> nom::IResult<LSpan, Token> {
         ('!', TokenKind::Bang),
         ('?', TokenKind::Question),
         ('&', TokenKind::Amp),
+        ('|', TokenKind::Pipe),
         ('#', TokenKind::Hash),
     ];
     for (sym, kind) in one_char {

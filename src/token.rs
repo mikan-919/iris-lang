@@ -63,6 +63,7 @@ pub enum TokenKind {
     GtEq,     // >=
     AndAnd,   // &&
     OrOr,     // ||
+    Pipe,     // |  (or パターン)
     Bang,     // !  (エラー伝播の後置演算子)
     Question, // ?  (三項演算子)
     Amp,      // &  (参照)
@@ -129,6 +130,7 @@ impl TokenKind {
             TokenKind::GtEq => "`>=`".into(),
             TokenKind::AndAnd => "`&&`".into(),
             TokenKind::OrOr => "`||`".into(),
+            TokenKind::Pipe => "`|`".into(),
             TokenKind::Bang => "`!`".into(),
             TokenKind::Question => "`?`".into(),
             TokenKind::Amp => "`&`".into(),

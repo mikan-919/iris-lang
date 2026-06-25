@@ -340,6 +340,14 @@ impl Resolver {
                         Pattern::Bind { name, span } => {
                             self.declare(name, DefKind::Local, *span, false, true);
                         }
+                        // or パターン: 各選択肢の Bind を登録（ペイロード束縛は現状禁止なので Variant は無視）。
+                        Pattern::Or { patterns, .. } => {
+                            for sub in patterns {
+                                if let Pattern::Bind { name, span } = sub {
+                                    self.declare(name, DefKind::Local, *span, false, true);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                     // ガードはアームスコープ内で解決する（束縛変数を参照できる）。

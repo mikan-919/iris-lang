@@ -1389,7 +1389,22 @@ fn parse_match(input: Tokens) -> PResult<Expr> {
             _ => {}
         }
         let arm_start = input.first().span;
-        let (rest, pat) = parse_pattern(input)?;
+        let (rest, first_pat) = parse_pattern(input)?;
+        // or パターン: `pat | pat | ...`
+        let (rest, pat) = if rest.peek() == &TokenKind::Pipe {
+            let mut alts = vec![first_pat];
+            let mut r = rest;
+            while r.peek() == &TokenKind::Pipe {
+                r = r.take_from(1); // `|` を消費
+                let (r2, alt) = parse_pattern(r)?;
+                alts.push(alt);
+                r = r2;
+            }
+            let full_span = alts.first().unwrap().span().merge(alts.last().unwrap().span());
+            (r, Pattern::Or { patterns: alts, span: full_span })
+        } else {
+            (rest, first_pat)
+        };
         // ガード `if cond`（省略可）。条件位置では構造体リテラルを禁じる。
         let (rest, guard) = if rest.peek() == &TokenKind::If {
             let (rest, cond) = parse_expr_r(rest.take_from(1), true)?;

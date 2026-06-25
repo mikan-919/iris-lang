@@ -1118,6 +1118,61 @@ impl<'a> Checker<'a> {
                         }
                     }
                 }
+                Pattern::Or { patterns, .. } => {
+                    // or パターン: 各選択肢を scrutinee に対して個別に検証する。
+                    // ペイロード束縛（`Variant(x)`）は現状未サポート。
+                    for sub in patterns {
+                        match sub {
+                            Pattern::Variant { span: spsp, .. } => {
+                                self.error(*spsp, "or パターン内のペイロード束縛は未対応です（`_` を使ってください）".to_string());
+                            }
+                            Pattern::Or { span: spsp, .. } => {
+                                self.error(*spsp, "or パターンはネストできません".to_string());
+                            }
+                            Pattern::Wildcard { .. } => {}
+                            Pattern::Lit { value, span: spsp } => {
+                                let pat_ty = match value {
+                                    LitPat::Int(_) => Ty::IntLit,
+                                    LitPat::Float(_) => Ty::FloatLit,
+                                    LitPat::Bool(_) => Ty::named("bool"),
+                                    LitPat::Str(_) => Ty::named("string"),
+                                };
+                                if !self.assignable(&scrut_ty, &pat_ty) && scrut_ty != Ty::Infer && scrut_ty != Ty::Error {
+                                    self.error(*spsp, format!("パターンの型 `{}` が scrutinee の型 `{}` と一致しません", pat_ty.describe(), scrut_ty.describe()));
+                                }
+                            }
+                            Pattern::Range { lo, hi, span: spsp, .. } => {
+                                let bound_ty = |b: &LitPat| match b {
+                                    LitPat::Int(_) => Ty::IntLit,
+                                    LitPat::Float(_) => Ty::FloatLit,
+                                    _ => Ty::Error,
+                                };
+                                let lo_ty = bound_ty(lo);
+                                let hi_ty = bound_ty(hi);
+                                if lo_ty != hi_ty {
+                                    self.error(*spsp, "範囲パターンの下限と上限は同じ数値型である必要があります".to_string());
+                                } else if !self.assignable(&scrut_ty, &lo_ty) && scrut_ty != Ty::Infer && scrut_ty != Ty::Error {
+                                    self.error(*spsp, format!("範囲パターンの型 `{}` が scrutinee の型 `{}` と一致しません", lo_ty.describe(), scrut_ty.describe()));
+                                }
+                            }
+                            Pattern::Bind { name, span: spsp } => {
+                                // バリアント名か、束縛変数（or 内は不可）か。
+                                let is_variant = if let Some(ref evs) = enum_variants {
+                                    evs.iter().any(|(vn, _)| vn == name)
+                                } else {
+                                    self.variant_owners.contains_key(name.as_str())
+                                };
+                                if !is_variant {
+                                    self.error(*spsp, format!("or パターン内の識別子束縛 `{name}` は未対応です（バリアント名か `_` を使ってください）"));
+                                } else if let Some(ref evs) = enum_variants {
+                                    if let Some((_, Some(_))) = evs.iter().find(|(vn, _)| vn == name) {
+                                        self.error(*spsp, format!("バリアント `{name}` はペイロードを持ちます（`{name}(binding)` と書いてください）"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // ガードは bool でなければならない（束縛変数の型は上で登録済み）。

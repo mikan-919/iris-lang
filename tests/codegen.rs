@@ -1247,3 +1247,41 @@ fn match_variant_no_payload_still_works() {
     );
     assert_eq!(run_exit_code(src, "bind_variant_none"), Some(5));
 }
+
+#[test]
+fn match_or_pattern_literals() {
+    // `1 | 2 | 3` の or パターン。
+    let src = concat!(
+        "fn classify(n: i32): i32 {\n",
+        "    match n {\n",
+        "        1 | 2 | 3 -> 10\n",
+        "        4 | 5 -> 20\n",
+        "        _ -> 0\n",
+        "    }\n",
+        "}\n",
+        "fn main(): i32 {\n",
+        "    classify(2) + classify(4) + classify(9)\n",
+        "}"
+    );
+    // classify(2)=10, classify(4)=20, classify(9)=0 → 30
+    assert_eq!(run_exit_code(src, "or_pat_lit"), Some(30));
+}
+
+#[test]
+fn match_or_pattern_enum_variants() {
+    // enum の複数バリアントを or で束ねる。
+    let src = concat!(
+        "type Color = enum { Red, Green, Blue }\n",
+        "fn is_primary(c: Color): i32 {\n",
+        "    match c {\n",
+        "        Red | Blue -> 1\n",
+        "        Green -> 0\n",
+        "    }\n",
+        "}\n",
+        "fn main(): i32 {\n",
+        "    is_primary(Red) + is_primary(Green) + is_primary(Blue)\n",
+        "}"
+    );
+    // 1 + 0 + 1 = 2
+    assert_eq!(run_exit_code(src, "or_pat_enum"), Some(2));
+}

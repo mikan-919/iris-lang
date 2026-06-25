@@ -351,6 +351,12 @@ pub enum Pattern {
         name: String,
         span: Span,
     },
+    /// `pat | pat | ...` — or パターン。少なくとも 2 つの選択肢を持つ。
+    /// 選択肢内のペイロード束縛（`Variant(x)`）は現状未サポート。
+    Or {
+        patterns: Vec<Pattern>,
+        span: Span,
+    },
 }
 
 impl Pattern {
@@ -360,7 +366,8 @@ impl Pattern {
             | Pattern::Lit { span, .. }
             | Pattern::Range { span, .. }
             | Pattern::Variant { span, .. }
-            | Pattern::Bind { span, .. } => *span,
+            | Pattern::Bind { span, .. }
+            | Pattern::Or { span, .. } => *span,
         }
     }
 }
