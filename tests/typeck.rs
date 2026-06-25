@@ -413,3 +413,39 @@ fn rejects_syscall_non_i64_arg() {
     let errs = typecheck("fn f(n: i32): i64 {\n    syscall1(60, n)\n}").unwrap_err();
     assert!(errs.iter().any(|m| m.contains("`i64`")), "got: {errs:?}");
 }
+
+#[test]
+fn rejects_non_exhaustive_enum_match() {
+    // Option<i32> の Some アームのみ → None が未処理でエラー。
+    let src = "fn f(x: Option<i32>): i32 {\n    match x {\n        Some(v) -> v\n    }\n}";
+    let errs = typecheck(src).unwrap_err();
+    assert!(errs.iter().any(|m| m.contains("網羅") || m.contains("`None`")), "got: {errs:?}");
+}
+
+#[test]
+fn accepts_exhaustive_enum_match_with_wildcard() {
+    // ワイルドカードで網羅。
+    let src = "fn f(x: Option<i32>): i32 {\n    match x {\n        Some(v) -> v\n        _ -> 0\n    }\n}";
+    typecheck(src).expect("網羅的なはず");
+}
+
+#[test]
+fn accepts_exhaustive_enum_match_all_variants() {
+    // 全バリアントを列挙。
+    let src = "fn f(x: Option<i32>): i32 {\n    match x {\n        Some(v) -> v\n        None -> 0\n    }\n}";
+    typecheck(src).expect("網羅的なはず");
+}
+
+#[test]
+fn accepts_exhaustive_enum_match_with_bind() {
+    // 識別子束縛パターン（catch-all）で網羅。
+    let src = "fn f(x: Option<i32>): i32 {\n    match x {\n        Some(v) -> v\n        rest -> 0\n    }\n}";
+    typecheck(src).expect("網羅的なはず");
+}
+
+#[test]
+fn accepts_exhaustive_enum_match_with_or_pattern() {
+    // or パターンで全バリアントを網羅。
+    let src = "fn f(x: Option<i32>): i32 {\n    match x {\n        Some(v) -> v\n        None | _ -> 0\n    }\n}";
+    typecheck(src).expect("網羅的なはず");
+}

@@ -1202,6 +1202,85 @@ impl<'a> Checker<'a> {
             }
         }
 
+        // exhaustiveness 検査（enum 型のみ）。
+        // ガード付きアームは「条件が常に真」と証明できないので網羅証明に使わない。
+        if let Some(ref evs) = enum_variants {
+            let mut exhaustive = false;
+            let mut covered: HashSet<String> = HashSet::new();
+
+            'outer: for arm in arms {
+                let skip_guard = arm.guard.is_some();
+                // ガード付きは個別バリアントのカバーには使える（条件不成立でも次アームへ落ちる）が
+                // catch-all（Wildcard / Bind）としては使えない。
+                match &arm.pattern {
+                    Pattern::Wildcard { .. } if !skip_guard => {
+                        exhaustive = true;
+                        break 'outer;
+                    }
+                    Pattern::Bind { name, .. } if !skip_guard => {
+                        let is_variant = evs.iter().any(|(vn, _)| vn == name);
+                        if !is_variant {
+                            exhaustive = true;
+                            break 'outer;
+                        } else {
+                            covered.insert(name.clone());
+                        }
+                    }
+                    Pattern::Bind { name, .. } => {
+                        // ガード付き Bind でもバリアントなら covered に追加。
+                        let is_variant = evs.iter().any(|(vn, _)| vn == name);
+                        if is_variant {
+                            covered.insert(name.clone());
+                        }
+                    }
+                    Pattern::Variant { name, .. } => {
+                        covered.insert(name.clone());
+                    }
+                    Pattern::Or { patterns, .. } => {
+                        for sub in patterns {
+                            match sub {
+                                Pattern::Wildcard { .. } if !skip_guard => {
+                                    exhaustive = true;
+                                    break 'outer;
+                                }
+                                Pattern::Bind { name, .. } => {
+                                    let is_variant = evs.iter().any(|(vn, _)| vn == name);
+                                    if !is_variant && !skip_guard {
+                                        exhaustive = true;
+                                        break 'outer;
+                                    } else if is_variant {
+                                        covered.insert(name.clone());
+                                    }
+                                }
+                                Pattern::Variant { name, .. } => {
+                                    covered.insert(name.clone());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {} // Lit / Range は網羅証明に使わない
+                }
+            }
+
+            if !exhaustive {
+                let missing: Vec<String> = evs
+                    .iter()
+                    .filter(|(vn, _)| !covered.contains(vn))
+                    .map(|(vn, _)| format!("`{vn}`"))
+                    .collect();
+                if !missing.is_empty() {
+                    self.error(
+                        span,
+                        format!(
+                            "match が網羅的ではありません: バリアント {} が未処理です",
+                            missing.join(", ")
+                        ),
+                    );
+                }
+            }
+        }
+
         if result_ty == Ty::Infer {
             Ty::unit()
         } else {
