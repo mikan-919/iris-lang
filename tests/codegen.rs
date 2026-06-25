@@ -1295,3 +1295,13 @@ fn match_or_pattern_enum_variants() {
     // 1 + 0 + 1 = 2
     assert_eq!(run_exit_code(src, "or_pat_enum"), Some(2));
 }
+
+#[test]
+fn runs_showcase_program() {
+    // examples/showcase.iris が 6 機能カテゴリを合成して 35 を返すことの実走回帰。
+    // （string索引 / Vec<i32>+struct / enum+match / impl / !伝播 / for）
+    let src = include_str!("../examples/showcase.iris");
+    if let Some(code) = run_exit_code(src, "showcase") {
+        assert_eq!(code, 35);
+    }
+}
