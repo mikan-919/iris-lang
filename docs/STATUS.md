@@ -353,6 +353,7 @@ prelude と違い**自動前置されず**、`use std.os`（または `use std.o
 - 借用検査の高度化（NLL 風の精密なライフタイム領域推論・部分ムーブ・ループ）— `compiler.md` の Open Question 領域
 - 型推論の高度化（リテラルの後方からの確定、ジェネリクスの単一化）
 - コード生成の拡張（文字列のスライス・補間、I/O 拡充）、WASM ターゲット、JIT（LLVM ORC/MCJIT — 要 LLVM 導入）
+  — 当面は x86-64 Linux 固定を保留判断として明文化（[ADR-0014](adr/0014-target-x86-64-linux-only-for-now.md)）
 - 並行処理 — `concurrency.md` 未設計
 
 ### self-contained ランタイム（計画・ADR-0011 / ADR-0012）
