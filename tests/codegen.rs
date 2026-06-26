@@ -45,6 +45,39 @@ fn run_exit_code(src: &str, tag: &str) -> Option<i32> {
     run.code()
 }
 
+/// IR を clang -nostartfiles -nostdlib でコンパイルして実行。libc 非依存検証用。clang が無ければ None。
+/// -ffunction-sections + -Wl,--gc-sections でリンカの dead-code 除去を有効にし、
+/// prelude の string.concat（malloc/strcpy/strcat を使う）等の未参照関数を除去する。
+fn run_exit_code_nostdlib(src: &str, tag: &str) -> Option<i32> {
+    if !clang_available() {
+        return None;
+    }
+    let ir = emit(src);
+    let dir = std::env::temp_dir();
+    let ll = dir.join(format!("iris_cg_{tag}.ll"));
+    let exe = dir.join(format!("iris_cg_{tag}.bin"));
+    std::fs::write(&ll, &ir).unwrap();
+    let status = Command::new("clang")
+        .arg("-nostartfiles")
+        .arg("-nostdlib") // libc を一切リンクしない
+        .arg("-ffunction-sections") // 未参照関数を GC で除去できるようセクション分割
+        .arg("-Wl,--gc-sections") // 未参照セクションをリンカ段で除去
+        .arg(&ll)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .expect("clang 実行");
+    assert!(
+        status.status.success(),
+        "clang -nostdlib コンパイル失敗（libc 非依存でない可能性）:\n{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let run = Command::new(&exe).status().expect("実行");
+    let _ = std::fs::remove_file(&ll);
+    let _ = std::fs::remove_file(&exe);
+    run.code()
+}
+
 #[test]
 fn emits_function_and_recursion() {
     let ir = emit("fn fac(n: i32): i32 {\n    if n <= 1 {\n        return 1\n    }\n    return n * fac(n - 1)\n}");
@@ -403,10 +436,11 @@ fn runs_enum_match_wildcard_fallthrough() {
 #[test]
 fn emits_strcmp_for_string_pattern() {
     // 文字列リテラルパターンは strcmp 呼び出しで比較し、結果を 0 と比べる。
+    // strcmp は iris 実装（define）になったため declare ではなく define を確認する。
     let ir = emit(
         "fn r(s: string): i32 {\n    match s {\n        \"hi\" -> 1\n        _ -> 0\n    }\n}",
     );
-    assert!(ir.contains("declare i32 @strcmp(ptr, ptr)"));
+    assert!(ir.contains("define i32 @strcmp(ptr"), "strcmp は iris 定義（define）であるはず\n{ir}");
     assert!(ir.contains("call i32 @strcmp(ptr"));
     assert!(ir.contains("icmp eq i32"));
 }
@@ -1303,5 +1337,26 @@ fn runs_showcase_program() {
     let src = include_str!("../examples/showcase.iris");
     if let Some(code) = run_exit_code(src, "showcase") {
         assert_eq!(code, 35);
+    }
+}
+
+#[test]
+fn runs_without_libc_for_string_readonly_path() {
+    // puts / s.len() / 文字列 match だけなら libc 無し（-nostdlib）でリンク・実走できる。
+    // strlen/strcmp が iris 実装に移行したことで、この経路に libc シンボルが残っていない。
+    // s = "hi"（len=2）、match "hi" -> 7、2 + 7 = 9 を終了コードで確認。
+    let src = concat!(
+        "fn main(): i32 {\n",
+        "    let s = \"hi\"\n",
+        "    let n = s.len()\n",
+        "    let k = match s {\n",
+        "        \"hi\" -> 7\n",
+        "        _ -> 0\n",
+        "    }\n",
+        "    return n + k\n",
+        "}"
+    );
+    if let Some(code) = run_exit_code_nostdlib(src, "nolibc_str") {
+        assert_eq!(code, 9);
     }
 }
