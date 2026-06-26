@@ -17,12 +17,43 @@ fn puts(s: string): i32 {
     return n as i32
 }
 
-// C の strcmp（NUL 終端文字列を比較。等しければ 0）。match の文字列パターン比較に使う。
-extern fn strcmp(a: string, b: string): i32
+// NUL 終端文字列の長さ（バイト数）。libc 非依存の iris 実装。
+fn strlen(s: string): i32 {
+    let mut i = 0
+    while s[i] as i32 != 0 {
+        i = i + 1
+    }
+    return i
+}
 
-// C の文字列操作を借りる。strlen は長さ、malloc はバッファ確保、strcpy/strcat は連結に使う。
-extern fn strlen(s: string): i32
-extern fn strncmp(a: string, b: string, n: i64): i32
+// NUL 終端文字列を辞書順比較。等しければ 0、a<b で負、a>b で正（libc strcmp 互換）。
+// match の文字列パターン比較（codegen:2427 の call @strcmp）はこの定義に解決される。
+fn strcmp(a: string, b: string): i32 {
+    let mut i = 0
+    while a[i] as i32 != 0 {
+        if a[i] as i32 != b[i] as i32 {
+            return a[i] as i32 - b[i] as i32
+        }
+        i = i + 1
+    }
+    return 0 - (b[i] as i32)
+}
+
+// 最大 n バイトまで NUL 終端文字列を辞書順比較（libc strncmp 互換）。
+fn strncmp(a: string, b: string, n: i64): i32 {
+    let limit = n as i32
+    let mut i = 0
+    while i < limit {
+        if a[i] as i32 != b[i] as i32 {
+            return a[i] as i32 - b[i] as i32
+        }
+        if a[i] as i32 == 0 {
+            return 0
+        }
+        i = i + 1
+    }
+    return 0
+}
 extern fn malloc(n: i64): RawPtr
 extern fn free(p: RawPtr): void
 extern fn memset(ptr: RawPtr, val: i32, n: i64): RawPtr

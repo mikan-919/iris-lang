@@ -273,9 +273,10 @@ iris-lang コンパイラの実装進捗。最終更新: 2026-06-25（`match` ex
 `std/prelude.iris`。**iris 自身**で書いた最小のライブラリ。コンパイル時に各プログラムの先頭へ自動で前置される（単一の文字列として連結し span を一意に保つ）。
 
 - 提供（iris 実装）: `putchar`（write syscall・libc 不要）/ `puts`（write syscall・libc 不要）、`put_digit` / `newline` / `print_int` / `println_int` / `println_bool`、`trait Iterator<T> { fn next(&mut self): Option<T> }`（ADR-0007）、`impl string { fn len(&self): i32, fn concat(&self, other: string): string }`
-- 提供（extern）: `strcmp` / `strlen` / `malloc` / `free` / `strcpy` / `strcat`（libc を借りる文字列・メモリ操作）
+- 提供（iris 実装・libc 非依存化済み）: `strlen` / `strcmp` / `strncmp`（バイトループ実装に置換。libc 非依存）
+- 提供（extern・libc 依存が残る）: `malloc` / `free` / `strcpy` / `strcat`（`string.concat` が使用）、`memset`（`os.iris` の `getenv` が使用）。これらは**索引代入 `buf[i] = v` の codegen 未対応**が前提のため iris 化は別プランで行う
 - `putchar`/`puts` は ADR-0011 実装順③で libc から write syscall 版（`syscall3(1, fd, buf, len)`）へ移行済み
-- `strcmp` は `match` の文字列リテラルパターン比較用（未使用でも `declare` のみ出力され無害）
+- `strcmp` は `match` の文字列リテラルパターン比較用（codegen:2427 の `call @strcmp` が iris 定義の `@strcmp` に解決される）
 - 現状のコード生成に合わせ `i32` / `bool` / `string` の範囲で記述
 - これにより `main(): i32` から実際に数値・真偽値を標準出力へ表示し、`clang` でビルドして実行できる
 
@@ -385,7 +386,13 @@ libc 依存を生成物から外していく中間目標。設計は確定（Acc
   （実装済み）→ ✅③（ADR-0011）`puts`/`putchar` を write syscall 版へ移行（実装済み）
   → ✅④（ADR-0011）`fopen`/`fclose`/`fputs`/`fgets`/`getenv` を syscall 版へ移行・`File = i64`（fd）化
   （`open`/`close`/`read`/`write`/`read_line`/`getenv`/`env` を iris 実装。`/proc/self/environ` スキャン。
-  typeck の `infer_cast` を別名解決対応。パーサー `as T + expr` 曖昧性バグ修正。実装済み）。
+  typeck の `infer_cast` を別名解決対応。パーサー `as T + expr` 曖昧性バグ修正。実装済み）
+  → ✅⑤（Plan 005）`strlen`/`strcmp`/`strncmp` を iris バイトループ実装に置換（libc 非依存化）。
+  `puts`/`s.len()`/文字列 `match` の経路が libc 不要になった（`-nostdlib -ffunction-sections -Wl,--gc-sections`
+  でリンク・実走可能。`tests/codegen.rs::runs_without_libc_for_string_readonly_path` で回帰固定）。
+  **残りの libc 依存**（`malloc`/`free`/`strcpy`/`strcat`/`memset`）は**索引代入 `buf[i] = v` の codegen 未対応**が
+  前提のため iris 化は別プランで行う。索引代入が実装されれば `string.concat` と `os.iris getenv` も iris 化でき、
+  libc 完全排除に到達できる。
 
 ## 仕様未確定のため独自に決めた点（要確認）
 
