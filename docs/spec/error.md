@@ -1,22 +1,31 @@
-# Error Handling
+# Error Handling（エラーハンドリング）
 
-## Result型
+iris のエラーは「例外で飛ばす」のではなく、**戻り値として返す**。
+失敗するかもしれない関数は「成功か失敗か」を型で表し、呼び出し側に処理を促す。
+見落としを型が防ぐ仕組み。
 
-エラーは `Result<T, E>` で表現する。
+## Result 型：成功か失敗かを表す
 
-```
+失敗しうる結果は `Result<T, E>` で表す。成功なら `Ok(値)`、失敗なら `Err(エラー)`。
+
+```iris
 fn read(path: string): Result<string, Error> {
-    let content = fs.read(path)!
+    let content = fs.read(path)!   // 失敗ならここで呼び出し元へ Err を返す（後述の !）
     return Ok(content)
 }
 ```
 
-## `!` 演算子
+## `!` 演算子：失敗をそのまま上に返す
 
-`!` は Result/Option の早期リターン演算子。失敗時は呼び出し元に `Err` を伝播する。
+`!` は Result/Option 用の**早期リターン**演算子。`Ok`/`Some` なら中身を取り出して
+先へ進み、`Err`/`None` ならその場で関数を抜けて呼び出し元へ失敗を伝える。
+これは panic（強制終了）ではなく、エラーの**伝播**（ADR-0002）。
 
+```iris
+let value = someResult!   // 成功なら value に中身、失敗ならこの関数を抜けて Err を返す
 ```
-let value = someResult!
-```
 
-`?` は三項演算子として予約されているため、早期リターンには `!` を使う。
+毎回 `match` で成功/失敗を書き分けなくて済むので、エラー処理が一行で済む。
+
+> なぜ `!` なのか：`?` は三項演算子（`cond ? a : b`）として予約済みのため、
+> 早期リターンには `!` を使う（ADR-0002）。
