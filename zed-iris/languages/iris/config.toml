@@ -1,0 +1,23 @@
+name = "Iris"
+grammar = "iris"
+path_suffixes = ["iris"]
+line_comments = ["// "]
+
+[brackets]
+[[brackets.pairs]]
+start = "{"
+end = "}"
+close = true
+newline = true
+
+[[brackets.pairs]]
+start = "("
+end = ")"
+close = true
+newline = true
+
+[[brackets.pairs]]
+start = "["
+end = "]"
+close = true
+newline = false

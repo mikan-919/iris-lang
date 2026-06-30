@@ -1,0 +1,10 @@
+id = "iris"
+name = "Iris"
+version = "0.1.0"
+description = "Iris programming language"
+authors = ["mikan-919"]
+repository = "https://github.com/mikan-919/iris-lang"
+
+[[grammars]]
+name = "iris"
+# ローカル開発では path を指定する
