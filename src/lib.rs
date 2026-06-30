@@ -112,3 +112,132 @@ pub fn compile_ir(name: &str, src: &str) -> Result<String, miette::Report> {
     codegen::emit_module(&program, &resolution, &type_info)
         .map_err(|e| diagnostics::codegen_report(name, src, e))
 }
+
+/// LSP 向けの診断エントリ。オフセットはユーザーソース先頭からのバイト数（プレリュード除く）。
+pub struct LspDiagnostic {
+    pub offset: usize,
+    pub len: usize,
+    pub message: String,
+}
+
+/// ソースを全フェーズで解析し、LSP 向けの診断リストを返す。
+///
+/// - エラーがなければ空ベクタ。
+/// - プレリュード内のエラーは除外する（std のバグはユーザーに見せない）。
+/// - `name` は診断に表示するファイル名（モジュール解決の基準ディレクトリにも使う）。
+pub fn check_diagnostics(name: &str, src: &str) -> Vec<LspDiagnostic> {
+    let prelude_len = PRELUDE.len() + 1; // PRELUDE + "\n"
+    let combined = format!("{PRELUDE}\n{src}");
+    let combined_src = combined.as_str();
+
+    let mut diags: Vec<LspDiagnostic> = Vec::new();
+
+    // --- 字句解析 ---
+    let tokens = match lexer::lex(combined_src) {
+        Ok(t) => t,
+        Err(e) => {
+            if e.offset >= prelude_len {
+                diags.push(LspDiagnostic {
+                    offset: e.offset - prelude_len,
+                    len: 1,
+                    message: e.message,
+                });
+            }
+            return diags;
+        }
+    };
+
+    // --- 構文解析 ---
+    let mut program = match parser::parse(&tokens) {
+        Ok(p) => p,
+        Err(e) => {
+            if e.span.offset >= prelude_len {
+                diags.push(LspDiagnostic {
+                    offset: e.span.offset - prelude_len,
+                    len: e.span.len,
+                    message: e.message,
+                });
+            }
+            return diags;
+        }
+    };
+
+    // --- モジュールロード ---
+    let base_dir = Path::new(name).parent();
+    let use_decls: Vec<UseDecl> = program
+        .items
+        .iter()
+        .filter_map(|i| {
+            if let Item::Use(u) = i {
+                if u.path == ["std", "prelude"] { return None; }
+                Some(u.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let (prepend_items, module_namespaces, _mod_errors) = if use_decls.is_empty() {
+        (Vec::new(), HashMap::new(), Vec::new())
+    } else {
+        let mut loader = module::ModuleLoader::new(base_dir, combined.len());
+        loader.process_use_decls(&use_decls)
+    };
+    // mod_errors は LSP では無視（ファイル未保存 / 解決失敗は silent）
+
+    if !prepend_items.is_empty() {
+        let mut new_items = prepend_items;
+        new_items.extend(program.items);
+        program.items = new_items;
+    }
+
+    // --- 名前解決 ---
+    let resolution = match sema::resolve(&program, module_namespaces) {
+        Ok(r) => r,
+        Err(errors) => {
+            for e in errors {
+                if e.span.offset >= prelude_len {
+                    diags.push(LspDiagnostic {
+                        offset: e.span.offset - prelude_len,
+                        len: e.span.len,
+                        message: e.message,
+                    });
+                }
+            }
+            return diags;
+        }
+    };
+
+    // --- 型検査 ---
+    let type_info = match sema::check(&program, &resolution) {
+        Ok(ti) => ti,
+        Err(errors) => {
+            for e in errors {
+                if e.span.offset >= prelude_len {
+                    diags.push(LspDiagnostic {
+                        offset: e.span.offset - prelude_len,
+                        len: e.span.len,
+                        message: e.message,
+                    });
+                }
+            }
+            return diags;
+        }
+    };
+
+    // --- 所有権検査 ---
+    if let Err(errors) = sema::check_ownership(&program, &resolution, &type_info) {
+        for e in errors {
+            if e.span.offset >= prelude_len {
+                diags.push(LspDiagnostic {
+                    offset: e.span.offset - prelude_len,
+                    len: e.span.len,
+                    message: e.message,
+                });
+            }
+            // secondary span はメモ程度なので LSP では省略
+        }
+    }
+
+    diags
+}

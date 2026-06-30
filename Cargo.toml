@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "iris-lsp"]
+resolver = "2"
+
 [package]
 name = "iris-lang"
 version = "0.1.0"
